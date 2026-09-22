@@ -4,6 +4,7 @@
 [![WeChat 微信交流群](https://img.shields.io/badge/WeChat-64A519?style=flat&logo=wechat&logoColor=07C160)](#parallel-training-system-sig)
 [![小红书 HyperParallel（小红书号：hyperparallel）](https://img.shields.io/badge/%E5%B0%8F%E7%BA%A2%E4%B9%A6-FF2442?style=flat&logo=xiaohongshu&logoColor=white)](#xiaohongshu-qrcode)
 [![Document 文档中心](https://img.shields.io/badge/Document-0088CC?style=flat&logo=readthedocs&logoColor=white)](docs/index.md)
+[![Papers](https://img.shields.io/badge/Papers-red?style=flat)](#technical-reports)
 
   <h3>简化超节点编程 &nbsp;·&nbsp; 释放并行算力</h3>
   <p><sub>昇腾超节点亲和的分布式并行加速库</sub></p>
@@ -14,6 +15,8 @@
     <a href="docs/index.md">文档中心</a>
     &emsp;·&emsp;
     <a href="docs/api/api_reference.md">API 参考</a>
+    &emsp;·&emsp;
+    <a href="#technical-reports">技术报告</a>
   </p>
 </div>
 
@@ -173,6 +176,18 @@ HyperParallel/
 │   └── api/                            # API 参考
 └── tests/                              # models、Core 和后端测试
 ```
+
+---
+
+<a id="technical-reports"></a>
+
+## 📄 技术报告
+
+- HyperParallel-FSDP: Topology-Aware Fully Sharded Training with Layout-Driven Muon on Ascend SuperPods [[paper](https://arxiv.org/abs/2609.21594)]
+- HyperParallel-Mpipe: A Composable Algebra System for Optimizing MLLM Training over Supernode Clusters [[paper](https://arxiv.org/abs/2607.03229)]
+- HyperParallel-MoE: Multi-Core Interleaved Scheduling for Fast MoE Training on Ascend NPUs [[paper](https://arxiv.org/abs/2605.23764)]
+- HyperParallel: A Supernode-Affinity AI Framework [[paper](https://arxiv.org/abs/2603.03731)]
+- HyperOffload: Graph-Driven Hierarchical Memory Management for Large Language Models on SuperNode Architectures [[paper](https://arxiv.org/abs/2602.00748)]
 
 ---
 
