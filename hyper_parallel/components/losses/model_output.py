@@ -14,6 +14,8 @@
 # ============================================================================
 """Loss module that reads the loss produced by a model."""
 
+from __future__ import annotations
+
 from typing import Any, Dict, Optional, Union
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
@@ -55,4 +57,52 @@ class ModelOutputLoss(torch.nn.Module):
         return local_loss
 
 
-__all__ = ["ModelOutputLoss"]
+class ModelComputedLoss(ModelOutputLoss):
+    """Adapt models that already compute a complete objective inside forward.
+
+    Unlike the default causal-LM adapter, this class does not infer shifted
+    targets or zero a combined objective: auxiliary losses may remain valid
+    when all supervised tokens are masked.
+    """
+
+    def __init__(self, *, pass_loss_inputs: bool = False) -> None:
+        """Select whether supervision fields are also model forward arguments.
+
+        Args:
+            pass_loss_inputs: Forward supervision under its public batch names.
+                False preserves the existing model-input dictionary unchanged.
+        """
+        super().__init__()
+        self.pass_loss_inputs = pass_loss_inputs
+
+    def prepare_model_inputs(self, model_inputs: dict, loss_inputs: dict) -> dict:
+        """Pass supervision to model-owned objectives without renaming or shifting.
+
+        Args:
+            model_inputs: Forward fields from the public batch runtime.
+            loss_inputs: Supervision and token-accounting fields from that runtime.
+
+        Returns:
+            A new dictionary preserving each supplied tensor by identity.
+        """
+        result = dict(model_inputs)
+        if self.pass_loss_inputs:
+            for name, value in loss_inputs.items():
+                if name in result and result[name] is not value:
+                    raise ValueError(f"Conflicting model and loss input: {name}")
+                result[name] = value
+        return result
+
+    def forward(self, *, model_output: Any, labels: Optional[torch.Tensor] = None
+                ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Use the model's complete objective without imposing causal label semantics.
+
+        Args:
+            model_output: Output containing the already combined objective.
+            labels: Unused; the model already applied its own target semantics.
+        """
+        del labels
+        return super().forward(model_output=model_output, labels=None)
+
+
+__all__ = ["ModelOutputLoss", "ModelComputedLoss"]

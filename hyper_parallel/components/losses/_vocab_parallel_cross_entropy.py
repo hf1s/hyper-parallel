@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple, TYPE_CHECKING
 
+# AutoModels loss components implement the Torch Trainer contract.
+# pylint: disable=forbidden-backend-import
 import torch
 from torch import Tensor
 
@@ -349,7 +351,11 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
         ctx.vocab_start = vocab_start
         ctx.vocab_end = vocab_end
 
-        return loss
+        # Per-token values belong to one logical loss, just like sum/mean.
+        # Reduce inside this Function so backward differentiates the local
+        # vocabulary slice once, without summing replicated upstream gradients.
+        group = mesh.get_group(mesh_dim)
+        return platform.differentiable_all_reduce(loss, op="sum", group=group)
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[Optional[Tensor], ...]:
