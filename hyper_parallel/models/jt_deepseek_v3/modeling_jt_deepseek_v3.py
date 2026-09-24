@@ -22,7 +22,6 @@ import copy
 import functools
 from typing import Any
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -36,7 +35,10 @@ from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32RotaryEmbedding, DeepseekV32TopkRouter,
 )
 
+from hyper_parallel.components.functional import swiglu
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_interleave
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP
+from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
@@ -47,83 +49,21 @@ from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel
 from hyper_parallel.models.replacement import module_replacement
 
 
-class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
-    """Keep the HF scale and use FP32 reference normalization with an explicit cast."""
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Match the reference fused FP32 norm's output dtype boundary.
-
-        Args:
-            hidden_states: Input hidden states.
-        """
-        if hidden_states.device.type == "npu":
-            normalized = torch_npu.npu_rms_norm(hidden_states.float(), self.weight, self.variance_epsilon)[0]
-        else:
-            values = hidden_states.float()
-            normalized = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + self.variance_epsilon)
-            normalized = normalized * self.weight
-        return normalized.to(hidden_states.dtype)
-
-
-class ReferenceSwiGLU(torch.autograd.Function):
-    """Retain the reference graph's SiLU derivative and BF16 rounding boundaries."""
-
-    @staticmethod
-    def forward(ctx: Any, inputs: torch.Tensor, rounded_up_gradient: bool) -> torch.Tensor:
-        """Save gate/up inputs; MTP materializes SiLU before its up gradient.
-
-        Args:
-            ctx: Autograd context.
-            inputs: Inputs retained for the custom derivative.
-            rounded_up_gradient: Whether to round SiLU before the up-projection gradient.
-        """
-        ctx.save_for_backward(inputs)
-        ctx.rounded_up_gradient = rounded_up_gradient
-        if inputs.device.type == "npu":
-            return torch_npu.npu_swiglu(inputs, dim=-1)
-        gate, up = inputs.float().chunk(2, dim=-1)
-        return (F.silu(gate) * up).to(inputs.dtype)
-
-    @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """Follow the static graph's operation order, including its FP32 divisions.
-
-        Args:
-            ctx: Autograd context.
-            gradient: Upstream gradient.
-        """
-        (inputs,) = ctx.saved_tensors
-        gate, up = inputs.float().chunk(2, dim=-1)
-        denominator = torch.exp(-gate) + 1
-        sigmoid = 1 / denominator
-        silu = gate / denominator
-        derivative = (sigmoid + silu) - sigmoid * silu
-        gate_gradient = (derivative * (up * gradient.float())).to(inputs.dtype)
-        if ctx.rounded_up_gradient:
-            silu = silu.to(inputs.dtype).float()
-        up_gradient = (gradient.float() * silu).to(inputs.dtype)
-        return torch.cat((gate_gradient, up_gradient), dim=-1), None
-
-
 class JTDeepseekV3MLP(DeepseekV32MLP):
-    """Retain HF gate/up/down projections and replace only the SwiGLU computation."""
+    """Retain HF projections while using the public NPU SwiGLU function."""
 
     def __init__(self, config: Any, intermediate_size: int | None = None,
                  rounded_up_gradient: bool = False) -> None:
-        """Construct HF projections with the configured SwiGLU backward boundary."""
+        """Construct HF projections; legacy reference rounding is ignored."""
+        del rounded_up_gradient
         super().__init__(config, intermediate_size=intermediate_size)
-        self.rounded_up_gradient = rounded_up_gradient
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Avoid materializing a rounded SiLU result before the gate/up product.
-
-        Args:
-            x: X.
-        """
+        """Apply the packed gate/up projection and public NPU SwiGLU."""
         weight = torch.stack((self.gate_proj.weight, self.up_proj.weight), dim=1).flatten(0, 1)
         pair = F.linear(x, weight).reshape(*x.shape[:-1], -1, 2)
         values = torch.cat((pair[..., 0], pair[..., 1]), dim=-1)
-        return self.down_proj(ReferenceSwiGLU.apply(values, self.rounded_up_gradient))
+        return self.down_proj(swiglu(values))
 
 
 class JTDeepseekV3Experts(DeepseekV32Experts):
@@ -136,25 +76,7 @@ class JTDeepseekV3Experts(DeepseekV32Experts):
             inputs: Inputs retained for the custom derivative.
             counts: Number of tokens assigned to each expert.
         """
-        return npu_grouped_swiglu(inputs.to(torch.bfloat16), self.gate_up_proj.to(torch.bfloat16),
-                                 self.down_proj.to(torch.bfloat16), counts)
-
-
-class ExplicitFP32RotaryEmbedding(nn.Module):
-    """Preserve separate FP32 products and addition before the BF16 RoPE cast."""
-
-    def forward(self, values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Reorder even/odd channels and rotate using the reference operation sequence.
-
-        Args:
-            values: Values to transform or reduce.
-            cos: Cosine position frequencies.
-            sin: Sine position frequencies.
-        """
-        ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1).float()
-        first, second = ordered.chunk(2, dim=-1)
-        rotated = torch.cat((-second, first), dim=-1)
-        return (ordered * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)).to(values.dtype)
+        return npu_grouped_swiglu(inputs, self.gate_up_proj, self.down_proj, counts)
 
 
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
@@ -214,7 +136,6 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         if not self.linear_qkv.weight.is_meta:
             with torch.no_grad():
                 self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
-        self.explicit_rotary = ExplicitFP32RotaryEmbedding()
         self.key_rope_gather = nn.Identity()
         self.register_buffer("max_logits_val", None, persistent=False)
         self.attention_interface = observed_fusion_attention
@@ -244,9 +165,10 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
         key_rope = key_rope.reshape(batch, 1, sequence, self.qk_rope_head_dim).expand(-1, self.num_heads, -1, -1)
         cos, sin = position_embeddings
-        query = torch.cat((query_pass.transpose(1, 2),
-                           self.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
-        key = torch.cat((key_pass, self.explicit_rotary(key_rope, cos, sin)), dim=-1)
+        query_rot, key_rot = apply_rotary_pos_emb_interleave(
+            query_rope.transpose(1, 2), key_rope, cos, sin)
+        query = torch.cat((query_pass.transpose(1, 2), query_rot), dim=-1)
+        key = torch.cat((key_pass, key_rot), dim=-1)
         return query, key, value
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
@@ -285,14 +207,13 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         self.scaling = self.qk_head_dim ** -0.5
         self.attention_dropout, self.is_causal, self.sliding_window = config.attention_dropout, True, None
         self.q_a_proj = nn.Linear(config.hidden_size, self.q_lora_rank, bias=False)
-        self.q_a_layernorm = JTDeepseekV3RMSNorm(self.q_lora_rank, config.rms_norm_eps)
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
         self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
-        self.kv_a_layernorm = JTDeepseekV3RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
-        self.explicit_rotary = ExplicitFP32RotaryEmbedding()
         self.register_buffer("max_logits_val", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
@@ -315,52 +236,17 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
             batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
         key, value = kv.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
         cos, sin = position_embeddings
-        query = torch.cat((query[..., :self.qk_nope_head_dim],
-                           self.explicit_rotary(query[..., self.qk_nope_head_dim:], cos, sin)), dim=-1)
-        rope = self.explicit_rotary(rope.unsqueeze(1), cos, sin).expand(-1, self.num_heads, -1, -1)
+        query_rot, rope = apply_rotary_pos_emb_interleave(
+            query[..., self.qk_nope_head_dim:],
+            rope.unsqueeze(1).expand(-1, self.num_heads, -1, -1),
+            cos,
+            sin,
+        )
+        query = torch.cat((query[..., :self.qk_nope_head_dim], query_rot), dim=-1)
         key = torch.cat((key, rope), dim=-1)
-        if hidden_states.device.type == "npu":
-            output, _ = observed_fusion_attention(self, query, key, value, attention_mask,
-                                                  scaling=self.scaling, **kwargs)
-        else:
-            output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask,
-                                                    is_causal=attention_mask is None, scale=self.scaling)
-            output = output.transpose(1, 2)
+        output, _ = observed_fusion_attention(self, query, key, value, attention_mask,
+                                              scaling=self.scaling, **kwargs)
         return self.o_proj(output.reshape(batch, sequence, -1)), None
-
-
-class ExpertCombine(torch.autograd.Function):
-    """Match the reference fused forward and BF16 routed-combine backward."""
-
-    @staticmethod
-    def forward(ctx: Any, values: torch.Tensor, probabilities: torch.Tensor,
-                rounded_probability: bool = False) -> torch.Tensor:
-        """Accumulate selected expert outputs in FP32 before the activation cast.
-
-        Args:
-            ctx: Autograd context.
-            values: Values to transform or reduce.
-            probabilities: Selected routing probabilities.
-            rounded_probability: Whether to round probabilities before the value gradient.
-        """
-        ctx.save_for_backward(values, probabilities)
-        ctx.rounded_probability = rounded_probability
-        return (values.float() * probabilities.unsqueeze(-1)).sum(1).to(values.dtype)
-
-    @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
-        """Retain the reference probability cast and product before reduction.
-
-        Args:
-            ctx: Autograd context.
-            gradient: Upstream gradient.
-        """
-        values, probabilities = ctx.saved_tensors
-        gradient = gradient.unsqueeze(1)
-        factor = probabilities.to(values.dtype).float() if ctx.rounded_probability else probabilities
-        value_gradient = (gradient.float() * factor.unsqueeze(-1)).to(values.dtype)
-        probability_gradient = (gradient * values).sum(-1).to(probabilities.dtype)
-        return value_gradient, probability_gradient, None
 
 
 class RoutingProbabilities(torch.autograd.Function):
@@ -445,21 +331,20 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         group, world, padding = self.ep_group, self.ep_world, self.padding
         config = self.config
         hidden = hidden[:, padding:]
-        with torch.autocast(hidden.device.type, enabled=False):
-            logits = F.linear(hidden.reshape(-1, hidden.shape[-1]).float(), self.gate.weight)
-            scores = logits.sigmoid()
-            selection = scores + self.gate.e_score_correction_bias
-            indices = selection.topk(config.num_experts_per_tok, dim=-1).indices
-            frequency = torch.bincount(indices.flatten(), minlength=config.n_routed_experts).float()
-            frequency = frequency / indices.numel()
-            if group is not None:
-                dist.all_reduce(frequency, group=group)
-            frequency = frequency / world
-            self.expert_load = frequency.detach()
-            selected, auxiliary = RoutingProbabilities.apply(
-                logits, indices, frequency, config.routed_scaling_factor, config.moe_aux_loss_coeff,
-                config.norm_topk_prob and config.num_experts_per_tok > 1)
-            self.auxiliary_loss = auxiliary
+        logits = F.linear(hidden.reshape(-1, hidden.shape[-1]), self.gate.weight)
+        scores = logits.sigmoid()
+        selection = scores + self.gate.e_score_correction_bias
+        indices = selection.topk(config.num_experts_per_tok, dim=-1).indices
+        frequency = torch.bincount(indices.flatten(), minlength=config.n_routed_experts)
+        frequency = frequency / indices.numel()
+        if group is not None:
+            dist.all_reduce(frequency, group=group)
+        frequency = frequency / world
+        self.expert_load = frequency.detach()
+        selected, auxiliary = RoutingProbabilities.apply(
+            logits, indices, frequency, config.routed_scaling_factor, config.moe_aux_loss_coeff,
+            config.norm_topk_prob and config.num_experts_per_tok > 1)
+        self.auxiliary_loss = auxiliary
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
@@ -482,8 +367,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         token_count = shape[0] * shape[1]
         values = outputs[order.argsort()].reshape(-1, token_count, shape[-1]).transpose(0, 1)
         probabilities = weights.reshape(-1, token_count).T
-        result = ExpertCombine.apply(values, probabilities, self.reference_is_mtp)
-        return result.reshape(shape)
+        return (values * probabilities.unsqueeze(-1)).sum(1).reshape(shape)
 
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Execute the same router and ordered combine without distributed setup.
@@ -492,15 +376,15 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             hidden: Hidden states.
         """
         indices, probabilities = self.route(hidden)
-        flat = hidden.reshape(-1, hidden.shape[-1]).to(torch.bfloat16)
+        flat = hidden.reshape(-1, hidden.shape[-1])
         outputs = flat.new_zeros(indices.shape[0], indices.shape[1], flat.shape[-1])
         for expert in range(self.experts.num_experts):
             tokens, slots = torch.where(indices == expert)
-            pair = F.linear(flat[tokens], self.experts.gate_up_proj[expert].to(flat.dtype))
-            values = ReferenceSwiGLU.apply(pair, False)
-            values = F.linear(values, self.experts.down_proj[expert].to(flat.dtype))
+            pair = F.linear(flat[tokens], self.experts.gate_up_proj[expert])
+            values = swiglu(pair)
+            values = F.linear(values, self.experts.down_proj[expert])
             outputs = outputs.index_put((tokens, slots), values)
-        return ExpertCombine.apply(outputs, probabilities, self.reference_is_mtp).reshape(hidden.shape).float()
+        return (outputs * probabilities.unsqueeze(-1)).sum(1).reshape(hidden.shape)
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
@@ -512,7 +396,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             routed: Routed expert outputs.
         """
         del owner, hidden
-        return routed.float()
+        return routed
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run complete MoE semantics using the selected local or EP executor.
@@ -520,11 +404,11 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         Args:
             hidden_states: Input hidden states.
         """
-        hidden = hidden_states.float()
+        hidden = hidden_states
         if self.padding:
             hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
         routed = self.ep_compute(hidden)
-        return routed[:, self.padding:] + self.shared_experts(hidden_states).float()
+        return routed[:, self.padding:] + self.shared_experts(hidden_states)
 
 
 class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
@@ -537,8 +421,8 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         self.self_attn = JTDeepseekV3Attention(config, layer_idx)
         self.mlp = (JTDeepseekV3MoE(config, is_mtp=is_mtp)
                     if config.mlp_layer_types[layer_idx] == "sparse" else JTDeepseekV3MLP(config))
-        self.input_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: Any = None,
                 position_ids: Any = None, past_key_values: Any = None, use_cache: bool = False,
@@ -555,15 +439,13 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         """
         if past_key_values is not None or use_cache:
             raise ValueError("DeepSeek V3.2 JT does not support cached decoding")
-        residual = hidden_states.float()
         branch, _ = self.self_attn(
-            self.input_layernorm(residual).to(torch.bfloat16), attention_mask=attention_mask,
+            self.input_layernorm(hidden_states), attention_mask=attention_mask,
             position_ids=position_ids, position_embeddings=position_embeddings, **kwargs,
         )
-        hidden_states = (residual + branch.float()).to(torch.bfloat16)
-        residual = hidden_states.float()
-        branch = self.mlp(self.post_attention_layernorm(residual).to(torch.bfloat16))
-        return (residual + branch.float()).to(torch.bfloat16)
+        hidden_states = hidden_states + branch
+        branch = self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states + branch
 
 
 class JTDeepseekV3Model(DeepseekV32Model):
@@ -575,29 +457,15 @@ class JTDeepseekV3Model(DeepseekV32Model):
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
-        self.norm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()
 
 
 def reference_sequence_sum(values: torch.Tensor) -> torch.Tensor:
-    """Use the reference 256K graph's forty-tile FP32 reduction boundary.
-
-    The graph partitions the sequence into 6560-element tiles, pads the final
-    tile, then joins their sums in order. A flat device reduction reassociates
-    these additions and can change the reported loss even with identical logits.
-
-    Args:
-        values: Values to transform or reduce.
-    """
-    if values.numel() != 262144:
-        return values.sum()
-    partials = F.pad(values.flatten(), (0, 40 * 6560 - values.numel())).reshape(40, 6560).sum(-1)
-    total = torch.zeros((), device=values.device, dtype=torch.float32)
-    for partial in partials:
-        total = total + partial
-    return total
+    """Compatibility wrapper for the standard reduction."""
+    return values.sum()
 
 
 def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
@@ -622,7 +490,7 @@ def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
         token_loss = vocab_parallel_cross_entropy_local(
             values, targets.reshape(-1), vocab_size=vocab_size, mesh=mesh,
             ignore_index=-100, reduction="none")
-    return reference_sequence_sum(token_loss.reshape_as(weights) * weights) / (reference_sequence_sum(weights) + 1e-8)
+    return token_loss.reshape_as(weights).sum() / (weights.sum() + 1e-8)
 
 
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
@@ -652,8 +520,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.mtp = DeepseekV3MTP(
             hidden_size=config.hidden_size, num_layers=depth,
             decoder_factory=lambda index: JTDeepseekV3Decoder(mtp_config, index, is_mtp=True),
-            norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
-            output_norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
+            norm_factory=lambda size: RMSNorm(size, eps=config.rms_norm_eps),
+            output_norm_factory=lambda size: RMSNorm(size, eps=config.rms_norm_eps),
         )
         self.loss_group = None
         self._step_loss_metrics = None
@@ -687,8 +555,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT input_ids, shift_labels and loss_mask must have matching shapes")
         if use_cache:
             raise ValueError("JT does not support cached decoding")
-        with torch.autocast(input_ids.device.type, dtype=torch.bfloat16, cache_enabled=False):
-            losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
+        losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
         metrics = torch.stack([losses[name].detach() for name in ("lm_loss", "mtp_loss", "aux_loss")])
         self._step_loss_metrics = metrics if self._step_loss_metrics is None else self._step_loss_metrics + metrics
         self._metric_micro_batches += 1
@@ -733,8 +600,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         if labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
             raise ValueError("Tokens, pre-shifted labels and loss mask must have identical shapes")
         dim = cfg.qk_rope_head_dim
-        inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
-        inverse = torch.from_numpy(inverse.astype(np.float32)).to(input_ids.device)
+        inverse = torch.arange(0, dim, 2, device=input_ids.device, dtype=torch.float32)
+        inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (inverse / dim))
         if position_ids is None:
             position_ids = torch.arange(sequence_length, device=input_ids.device).unsqueeze(0)
         if position_ids.shape != input_ids.shape:
@@ -743,15 +610,14 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         frequency = torch.cat((frequency, frequency), dim=-1)
         attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()),
                             "actual_seq_len": (sequence_length,)}
-        hidden = self.model.embed_tokens(input_ids).to(torch.bfloat16)
-        auxiliary = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        hidden = self.model.embed_tokens(input_ids)
+        auxiliary = hidden.new_zeros(())
         for layer in self.model.layers:
             hidden = layer(hidden, **attention_kwargs)
             if hasattr(layer.mlp, "auxiliary_loss"):
                 auxiliary = auxiliary + layer.mlp.auxiliary_loss
-        hidden = hidden.float()
         lm_loss = masked_vocab_parallel_loss(
-            self.lm_head(self.model.norm(hidden).to(torch.bfloat16)), labels, loss_mask,
+            self.lm_head(self.model.norm(hidden)), labels, loss_mask,
             vocab_size=self.config.vocab_size)
         mtp_output = self.mtp(
             hidden, input_ids, embedding=self.model.embed_tokens, head=self.lm_head,
