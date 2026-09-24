@@ -463,9 +463,6 @@ class JTDeepseekV3Model(DeepseekV32Model):
         self.post_init()
 
 
-def reference_sequence_sum(values: torch.Tensor) -> torch.Tensor:
-    """Compatibility wrapper for the standard reduction."""
-    return values.sum()
 
 
 def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,

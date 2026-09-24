@@ -75,7 +75,7 @@ class TestVocabularyCrossEntropy(unittest.TestCase):
         Expectation: Every token contributes one to the sum and gradient.
         """
         values = torch.ones(262144, requires_grad=True)
-        result = loss.reference_sequence_sum(values)
+        result = values.sum()
         result.backward()
         self.assertEqual(result.item(), 262144)
         self.assertTrue(torch.equal(values.grad, torch.ones_like(values)))
