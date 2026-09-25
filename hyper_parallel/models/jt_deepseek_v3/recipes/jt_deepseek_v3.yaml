@@ -64,6 +64,9 @@ plan_overrides:
     exact_type: true
     replace_module:
       _target_: hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp.JTDeepseekV3MTPExecution
+  - match: "mtp.layers.*.eh_proj"
+    params:
+      weight: {tp: replicate}
   - match: "mtp.layers.*.transformer_layer.mlp"
     when: ep
     region_dispatch: false
