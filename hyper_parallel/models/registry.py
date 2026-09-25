@@ -38,9 +38,10 @@ lookup.
 import importlib
 import logging
 from collections import OrderedDict
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 
@@ -207,3 +208,22 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
             if canonical is not None:
                 spec = MODEL_ADAPTER_REGISTRY.get(canonical)
     return spec
+
+
+def get_step_metrics_provider(model: Any) -> Optional[Callable[..., Mapping[str, Any]]]:
+    """Return the metrics provider the model's family declares, or ``None``.
+
+    The provider accepts the built model and returns that step's detached,
+    namespaced observations. Families that declare none keep the plain shared
+    metric path.
+    """
+    config = model.config
+    identities = [getattr(config, "model_type", None)]
+    identities.extend(getattr(config, "architectures", None) or ())
+    for identity in identities:
+        if not identity:
+            continue
+        adapter_spec = get_model_adapter(identity)
+        if adapter_spec is not None:
+            return adapter_spec.step_metrics
+    return None

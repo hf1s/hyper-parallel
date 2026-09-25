@@ -87,13 +87,6 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
                 module.expert_load.zero_()
 
 
-def _take_metrics(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Return QK clipping metrics collected after the previous optimizer step."""
-    result = model.jt_optimizer_metrics
-    model.jt_optimizer_metrics = {}
-    return result
-
-
 def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
     """Build public Muon/AdamW and attach the JT-specific post-update hooks.
 
@@ -113,6 +106,4 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     })
     optimizer = builder.get_optimizer()
     optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
-    model.jt_optimizer_metrics = {}
-    optimizer.get_logging_metrics = partial(_take_metrics, model)
     return builder

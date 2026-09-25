@@ -73,13 +73,13 @@ class TestCompleteModel(unittest.TestCase):
         tokens = torch.arange(8).unsqueeze(0)
         output = model(tokens, (tokens + 1) % 32, torch.ones(1, 8))
         self.assertTrue(torch.isfinite(output.loss))
-        metrics = model.get_logging_metrics()
+        metrics = model.collect_step_metrics()
         self.assertEqual(set(metrics), {"training/lm_loss", "training/mtp_loss", "training/aux_loss",
                                        "training/load_balancing_loss"})
         combined = (metrics["training/lm_loss"] + metrics["training/aux_loss"]) + metrics["training/mtp_loss"]
         self.assertTrue(torch.equal(output.loss.detach(), combined))
         self.assertTrue(all(not value.requires_grad for value in metrics.values()))
-        self.assertEqual(model.get_logging_metrics(), {})
+        self.assertEqual(model.collect_step_metrics(), {})
         output.loss.backward()
         for name in ["model.embed_tokens.weight", "model.layers.1.mlp.gate.weight", "mtp.layers.0.eh_proj.weight"]:
             gradient = dict(model.named_parameters())[name].grad
@@ -210,14 +210,26 @@ class TestCompleteModel(unittest.TestCase):
         model = JTDeepseekV3ForCausalLM(config)
         model._step_loss_metrics = torch.tensor([2.0, 0.3, 0.06])
         model._metric_micro_batches = 1
-        metrics = model.get_logging_metrics()
+        metrics = model.collect_step_metrics()
         torch.testing.assert_close(metrics["training/load_balancing_loss"], torch.tensor(3.0))
-        self.assertEqual(model.get_logging_metrics(), {})
+        self.assertEqual(model.collect_step_metrics(), {})
         config.moe_aux_loss_coeff = 0.0
         model = JTDeepseekV3ForCausalLM(config)
         model._step_loss_metrics = torch.tensor([2.0, 0.3, 0.0])
         model._metric_micro_batches = 1
-        self.assertEqual(model.get_logging_metrics()["training/load_balancing_loss"].item(), 0.0)
+        self.assertEqual(model.collect_step_metrics()["training/load_balancing_loss"].item(), 0.0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_optimizer_metrics_survive_consumed_loss_metrics(self):
+        """Feature: Step metrics provider.
+
+        Description: Publish post-update QK statistics after the loss accumulators were drained.
+        Expectation: The provider returns them instead of an empty mapping.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        model.jt_optimizer_metrics = {"optimizer/qkclip_maxlogits": torch.tensor(2.0)}
+        self.assertEqual(set(model.collect_step_metrics()), {"optimizer/qkclip_maxlogits"})
+        self.assertEqual(model.collect_step_metrics(), {})
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_public_batch_fields_reach_model_without_mapping(self):

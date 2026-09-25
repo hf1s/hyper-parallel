@@ -94,6 +94,9 @@ class ModelAdapterSpec:
             validation-only dependencies therefore stay outside import paths.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
+        step_metrics: provider accepting the built model and returning this
+            step's detached, namespaced observation metrics. Observation
+            logging only; the Trainer never calls it during forward or backward.
     """
 
     architecture: str
@@ -111,3 +114,4 @@ class ModelAdapterSpec:
     recompute: Optional[Callable[..., RecomputePolicy]] = None
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
+    step_metrics: Optional[Callable[..., Any]] = None

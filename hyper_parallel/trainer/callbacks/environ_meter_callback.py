@@ -18,6 +18,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from hyper_parallel.models.registry import get_step_metrics_provider
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -48,6 +49,7 @@ class EnvironMeterCallback(Callback):
         self._consumed_samples = 0
         self.trainer.step_train_metrics = {}
         self.trainer.step_env_metrics = {}
+        self._step_metrics_provider = get_step_metrics_provider(trainer.model)
 
     @staticmethod
     def _scalar(value: Any, name: str) -> float:
@@ -241,7 +243,12 @@ class EnvironMeterCallback(Callback):
         grad_norm: float,
         **kwargs: Any,
     ) -> None:
-        """Reduce and publish metrics for one completed optimizer step."""
+        """Reduce and publish metrics for one completed optimizer step.
+
+        The model family's declared step-metrics source contributes detached,
+        namespaced observations here, on every rank and every step, before any
+        presentation callback consumes the published dictionaries.
+        """
         del state, kwargs
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
         global_step_time = self._reduce(step_time, op="max")
@@ -258,6 +265,9 @@ class EnvironMeterCallback(Callback):
         for name, value in sorted((loss_dict or {}).items()):
             metric_name = name if name.startswith("training/") else f"training/{name}"
             train_metrics[metric_name] = self._reduce(self._scalar(value, name), op="mean")
+
+        if self._step_metrics_provider is not None:
+            train_metrics.update(self._step_metrics_provider(self.trainer.model))
 
         tokens_per_second = global_tokens / global_step_time if global_step_time > 0 else 0.0
         env_metrics = {

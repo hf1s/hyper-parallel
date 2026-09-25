@@ -14,9 +14,17 @@
 # ============================================================================
 """Lazy registration of the independently constructed JT family."""
 
+from collections.abc import Mapping
+from typing import Any
+
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.jt_deepseek_v3.adapter.policies.sharding import build_parameter_sharding_rules
 from hyper_parallel.models.registry import register_custom_model, register_model_adapter
+
+
+def _jt_step_metrics(model: Any) -> Mapping[str, Any]:
+    """Return the model's per-step observation metrics."""
+    return model.collect_step_metrics()
 
 
 JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
@@ -26,6 +34,7 @@ JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     fsdp_wrap_modules=lambda model: tuple(
         f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers))
     ),
+    step_metrics=_jt_step_metrics,
 )
 register_model_adapter(JT_DEEPSEEK_V3_ADAPTER_SPEC)
 register_custom_model(
