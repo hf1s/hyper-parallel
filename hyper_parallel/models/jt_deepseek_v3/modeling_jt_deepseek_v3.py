@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import functools
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -29,7 +30,7 @@ import torch_npu
 from torch import nn
 from torch.nn import functional as F
 from transformers import DeepseekV32Config, DeepseekV32ForCausalLM
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.utils import ModelOutput
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32Attention, DeepseekV32DecoderLayer, DeepseekV32Experts, DeepseekV32MLP,
     DeepseekV32MoE, DeepseekV32Model, DeepseekV32PreTrainedModel, DeepseekV32RMSNorm,
@@ -46,6 +47,17 @@ from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
+
+
+
+@dataclass
+class JTDeepseekV3Output(ModelOutput):
+    """Model output carrying named JT losses without HF first-field remapping."""
+
+    # Keep logits first and optional so ModelOutput preserves the named loss
+    # mapping instead of interpreting it as a field iterator.
+    logits: torch.Tensor | None = None
+    loss: dict[str, torch.Tensor] | None = None
 
 
 class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
@@ -624,17 +636,12 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             output_norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
         )
         self.loss_group = None
-        self._step_loss_metrics = None
-        self._metric_micro_batches = 0
-        # The monitoring denominator counts trunk MoE layers, excluding MTP.
-        moe_layers = sum(isinstance(layer.mlp, JTDeepseekV3MoE) for layer in self.model.layers)
-        self._aux_loss_monitor_scale = moe_layers * config.moe_aux_loss_coeff
         self.post_init()
 
     def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None,
                 loss_mask: torch.Tensor | None = None, *, labels: torch.Tensor | None = None,
                 position_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None,
-                use_cache: bool = False) -> CausalLMOutputWithPast:
+                use_cache: bool = False) -> JTDeepseekV3Output:
         """Use the same JT semantics for evaluation and Trainer backward.
 
         Args:
@@ -657,30 +664,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT does not support cached decoding")
         with torch.autocast(input_ids.device.type, dtype=torch.bfloat16, cache_enabled=False):
             losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
-        metrics = torch.stack([losses[name].detach() for name in ("lm_loss", "mtp_loss", "aux_loss")])
-        self._step_loss_metrics = metrics if self._step_loss_metrics is None else self._step_loss_metrics + metrics
-        self._metric_micro_batches += 1
-        return CausalLMOutputWithPast(loss=losses["loss"])
-
-    def get_logging_metrics(self) -> dict[str, torch.Tensor]:
-        """Consume detached per-microbatch mean losses for the current TP-replicated JT objective.
-
-        MTP and auxiliary values include their configured coefficients. The
-        load-balancing monitor removes the coefficient times trunk MoE count.
-        Its denominator intentionally excludes MTP, matching the JT callback.
-        This is
-        observation only: the combined objective remains the sole backward loss.
-        The supported JT recipe has DP1/CP1 and one microbatch per optimizer step.
-        """
-        if self._step_loss_metrics is None:
-            return {}
-        values = self._step_loss_metrics / self._metric_micro_batches
-        self._step_loss_metrics = None
-        self._metric_micro_batches = 0
-        metrics = dict(zip(("training/lm_loss", "training/mtp_loss", "training/aux_loss"), values.unbind()))
-        metrics["training/load_balancing_loss"] = (
-            values[2] / self._aux_loss_monitor_scale if self._aux_loss_monitor_scale > 0 else values[2].new_zeros(()))
-        return metrics
+        return JTDeepseekV3Output(loss={
+            "foundation/lm_loss": losses["lm_loss"],
+            "foundation/mtp_loss": losses["mtp_loss"],
+            "foundation/aux_loss": losses["aux_loss"],
+        })
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                          loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None
