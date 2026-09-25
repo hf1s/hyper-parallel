@@ -64,51 +64,6 @@ plan_overrides:
     exact_type: true
     replace_module:
       _target_: hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp.JTDeepseekV3MTPExecution
-  - match: "*.self_attn"
-    params:
-      linear_qkv.weight: {tp: replicate}
-      q_b_proj.weight: {tp: "shard(0)"}
-      kv_b_proj.weight: {tp: "shard(0)"}
-      o_proj.weight: {tp: "shard(1)"}
-    region_dispatch: false
-    in_src:
-      hidden_states: {tp: "shard(1)"}
-    in_dst:
-      hidden_states: {tp: "shard(1)"}
-  - match: "*.self_attn.*_layernorm"
-    in_src:
-      hidden_states: {tp: "shard(1)"}
-    in_dst:
-      hidden_states: {tp: "shard(1)"}
-    out_src: {tp: "shard(1)"}
-    out_dst: {tp: replicate}
-  - match: "*.self_attn.key_rope_gather"
-    in_src:
-      input: {tp: "shard(1)"}
-    in_dst:
-      input: {tp: "shard(1)"}
-    out_src: {tp: "shard(1)"}
-    out_dst: {tp: replicate}
-  - match: "*.mlp.shared_experts"
-    params:
-      gate_proj.weight: {tp: replicate}
-      up_proj.weight: {tp: replicate}
-      down_proj.weight: {tp: replicate}
-    in_src:
-      x: {tp: "shard(1)"}
-    in_dst:
-      x: {tp: "shard(1)"}
-    out_src: {tp: "shard(1)"}
-    out_dst: {tp: "shard(1)"}
-  - match: "mtp.layers.*.eh_proj"
-    params:
-      weight: {tp: replicate}
-    in_src:
-      input: {tp: "shard(1)"}
-    in_dst:
-      input: {tp: "shard(1)"}
-    out_src: {tp: "shard(1)"}
-    out_dst: {tp: "shard(1)"}
   - match: "mtp.layers.*.transformer_layer.mlp"
     when: ep
     region_dispatch: false

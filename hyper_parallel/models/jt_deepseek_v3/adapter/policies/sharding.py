@@ -18,13 +18,13 @@ from typing import Any
 
 
 def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
-    """Return MLA parameter roles not covered by generic naming rules."""
+    """Return JT-specific parameter roles not covered by generic naming rules."""
     from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
         ParamRole,
     )
 
     return [
-        (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
+        (["q_a_proj", "kv_a_proj_with_mqa", "linear_qkv"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
     ]
 
