@@ -116,14 +116,21 @@ def _build_jt_mla_ns_transform(config: Any):
                     "JT Muon linear_qkv split expects "
                     f"{qkv_rows} rows, got {tuple(update.shape)}"
                 )
-            q_update = update[:q_lora_rank]
-            kv_update = update[q_lora_rank:]
+            q_end = q_lora_rank
+            kv_end = q_end + kv_lora_rank
+            q_update = update[:q_end]
+            kv_update = update[q_end:kv_end]
+            rope_update = update[kv_end:]
 
             def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
-                output[:q_lora_rank].copy_(updates[0])
-                output[q_lora_rank:].copy_(updates[1])
+                output[:q_end].copy_(updates[0])
+                output[q_end:kv_end].copy_(updates[1])
+                output[kv_end:].copy_(updates[2])
 
-            return NSInputTransform(tensors=[q_update, kv_update], restore=restore)
+            return NSInputTransform(
+                tensors=[q_update, kv_update, rope_update],
+                restore=restore,
+            )
 
         if parameter_name.endswith(".q_b_proj.weight"):
             return _periodic_muon_transform(
