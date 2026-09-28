@@ -549,35 +549,10 @@ class JTDeepseekV3Model(DeepseekV32Model):
         self.post_init()
 
 
-def reference_sequence_sum(values: torch.Tensor) -> torch.Tensor:
-    """Use the reference 256K graph's forty-tile FP32 reduction boundary.
-
-    The graph partitions the sequence into 6560-element tiles, pads the final
-    tile, then joins their sums in order. A flat device reduction reassociates
-    these additions and can change the reported loss even with identical logits.
-
-    Args:
-        values: Values to transform or reduce.
-    """
-    if values.numel() != 262144:
-        return values.sum()
-    partials = F.pad(values.flatten(), (0, 40 * 6560 - values.numel())).reshape(40, 6560).sum(-1)
-    total = torch.zeros((), device=values.device, dtype=torch.float32)
-    for partial in partials:
-        total = total + partial
-    return total
-
 
 def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
                                mask: torch.Tensor, *, vocab_size: int) -> torch.Tensor:
-    """Use public CE gradients and retain only JT's masked reduction order.
-
-    Args:
-        logits: Full or vocabulary-sharded logits.
-        labels: Already-shifted targets, including negative ignored positions.
-        mask: Explicit supervision weights for the targets.
-        vocab_size: Logical global vocabulary size.
-    """
+    """Compute the masked token mean from the public vocab-parallel CE."""
     mesh = _get_loss_parallel_mesh()
     targets = labels.masked_fill(labels < 0, -100)
     weights = mask.masked_fill(labels < 0, 0)
@@ -590,7 +565,8 @@ def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
         token_loss = vocab_parallel_cross_entropy_local(
             values, targets.reshape(-1), vocab_size=vocab_size, mesh=mesh,
             ignore_index=-100, reduction="none")
-    return reference_sequence_sum(token_loss.reshape_as(weights) * weights) / (reference_sequence_sum(weights) + 1e-8)
+    weighted_loss = token_loss.reshape_as(weights) * weights
+    return weighted_loss.sum() / (weights.sum() + 1e-8)
 
 
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
