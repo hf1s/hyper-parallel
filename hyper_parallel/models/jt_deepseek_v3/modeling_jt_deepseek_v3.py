@@ -608,6 +608,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             loss_fn=functools.partial(masked_vocab_parallel_loss, vocab_size=self.config.vocab_size),
             auxiliary_loss=auxiliary, auxiliary_fn=lambda decoder: decoder.mlp.auxiliary_loss,
         )
+        mtp_loss, auxiliary = mtp_output.loss, mtp_output.auxiliary_loss
         losses = {"loss": (lm_loss + auxiliary) + mtp_loss, "lm_loss": lm_loss,
                   "mtp_loss": mtp_loss, "aux_loss": auxiliary}
         if os.getenv("JT_LOSS_TRACE") == "1":
