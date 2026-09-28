@@ -16,6 +16,8 @@
 """Muon optimizer with HSDP shard-group-aware communication."""
 
 import math
+import os
+from pathlib import Path
 from collections.abc import Callable, Iterable
 from collections import defaultdict
 from dataclasses import dataclass
@@ -39,6 +41,30 @@ from hyper_parallel.core.optimizer.muon_shard import (
     chunk_update_by_layout,
     fused_allgather_dtensor_params,
 )
+def _dump_muon_ns_trace(
+        parameter_name: str,
+        ns_output: torch.Tensor,
+        scaled_update: torch.Tensor,
+) -> None:
+    """Persist one first-step NS record when diagnostic tracing is enabled."""
+    trace_dir = os.getenv("JT_MUON_NS_TRACE_DIR")
+    if not trace_dir:
+        return
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    rank_dir = Path(trace_dir) / f"rank_{rank}"
+    safe_name = parameter_name.replace("/", "_")
+    path = rank_dir / f"{safe_name}.pt"
+    if path.exists():
+        return
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "parameter_name": parameter_name,
+            "ns_output": ns_output.detach().cpu(),
+            "scaled_update": scaled_update.detach().cpu(),
+        },
+        path,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -926,6 +952,7 @@ class Muon(BaseDistributedOptimizer):
         reshape_groups: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
         origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
         working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
+        trace_owners: Dict[int, Tuple[torch.nn.Parameter, int]] = {}
 
         for param in p_list:
             local_shape = getattr(param, "local_shape", None)
@@ -939,6 +966,7 @@ class Muon(BaseDistributedOptimizer):
             for reshaped_input in reshaped_inputs:
                 core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
                 reshape_groups[core_shape].append(reshaped_input)
+                trace_owners[id(reshaped_input)] = (param, len(reshaped_inputs) - 1)
 
         for tensor_list in reshape_groups.values():
             reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
@@ -949,6 +977,8 @@ class Muon(BaseDistributedOptimizer):
                 ns_epsilon=group["ns_epsilon"],
             )
             for reshaped_input, reshaped_update in zip(tensor_list, reshaped_updates):
+                trace_enabled = bool(os.getenv("JT_MUON_NS_TRACE_DIR"))
+                ns_output = reshaped_update.detach().clone() if trace_enabled else None
                 slice_scale = compute_muon_slice_scale(
                     reshaped_update,
                     group["matched_adamw_rms"],
@@ -957,6 +987,13 @@ class Muon(BaseDistributedOptimizer):
                 if group["apply_lr_in_update"]:
                     slice_scale *= -group["lr"]
                 reshaped_update.mul_(slice_scale)
+                if trace_enabled:
+                    owner, _ = trace_owners[id(reshaped_input)]
+                    _dump_muon_ns_trace(
+                        getattr(owner, "model_name", repr(owner)),
+                        ns_output,
+                        reshaped_update,
+                    )
                 reshaped_input.copy_(reshaped_update.contiguous().view_as(reshaped_input))
 
         for param in p_list:
