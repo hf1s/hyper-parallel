@@ -21,9 +21,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from fnmatch import fnmatchcase
-from functools import partial
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import torch
@@ -32,7 +31,6 @@ from transformers import DeepseekV32Config, PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, local_compute
-from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
@@ -43,23 +41,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
-
-
-@local_compute
-def build_jt_ep(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any) -> Callable:
-    """Bind public EP execution using the model's routing and loss contract."""
-    del mesh, tp_mesh, cp_mesh
-    if ep_mesh is None:
-        raise ValueError("JT requires an EP mesh")
-    module.ep_group = ep_mesh.get_group("ep")
-    module.ep_world = ep_mesh["ep"].size()
-    executor = build_ep_compute(
-        module, ep_mesh, router_fn=type(module).route, archetype_key="jt_deepseek_v3_hf",
-        expected_attrs=["gate", "experts", "shared_experts", "config"],
-        combine=module.combine_routed, use_grouped_gemm=True)
-    module.ep_compute = partial(executor, module)
-    return type(module).forward
-
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.expert_parallel import build_jt_ep
 
 def _configured_moe_fqns(config: DeepseekV32Config) -> tuple[str, ...]:
     """Return the configured routed-MoE parents, excluding dense trunk layers."""
@@ -144,15 +126,17 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
     torch_npu.npu.set_compile_mode(jit_compile=False)
     torch.use_deterministic_algorithms(True)
     config = DeepseekV32Config(**config)
-    with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
-        arrays = {name: archive[name] for name in archive.files}
     setup = _with_model_ep_overrides(distributed_setup, config)
     mesh = setup.mesh_context
     if (mesh.tp_size, mesh.ep_size, mesh.cp_size, mesh.dp_size, mesh.pp_size) != (8, 8, 1, 1, 1):
         raise ValueError("JT recipe requires TP8/EP8 and DP/CP/PP1")
     if not mesh.sequence_parallel or not mesh.loss_parallel:
         raise ValueError("JT recipe requires sequence_parallel and loss_parallel")
-
+    # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
+    framework_setup = replace(
+        setup, module_replacements=(), strategy_config=setup.strategy_config or FSDP2Config(),
+    )
+    planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
     with torch.device("meta"):
         model = JTDeepseekV3ForCausalLM(config)
         model, _ = _apply_module_replacement_actions(
@@ -161,19 +145,13 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
             weights_mapping=get_model_conversion_mapping(model),
             context=_build_replacement_context(setup, None),
         )
-    model.to_empty(device="cpu")
     # Rotary buffers are nonpersistent; restore their deterministic reference state after to_empty().
     model.model.rotary_emb = type(model.model.rotary_emb)(config)
+    with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
+        arrays = {name: archive[name] for name in archive.files}
 
     expected = _load_reference_state(model, arrays)
 
-    # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
-    framework_setup = replace(
-        setup, module_replacements=(), strategy_config=setup.strategy_config or FSDP2Config(),
-    )
-
-    # Replacements have already shaped the reference state, so do not apply them a second time.
-    planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
     device = torch.device(mesh.device_mesh.device_type, torch.distributed.get_rank() % mesh.tp_size)
     model.to(device)
     model.loss_group = mesh.device_mesh["tp"].get_group()
