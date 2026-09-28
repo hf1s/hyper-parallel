@@ -18,7 +18,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 import torch_npu
 
 from hyper_parallel.components.checkpoint.conversion_ops import Split
@@ -96,16 +95,11 @@ class JTDeepseekV3FusedMLAAttention(nn.Module):
 
     def _project_attention_inputs(self, hidden_states: torch.Tensor, position_embeddings: Any,
                                   past_key_values: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run one fused latent projection while retaining canonical parameters."""
+        """Run canonical latent projections to isolate fusion-induced numerical drift."""
         if past_key_values is not None or position_embeddings is None:
             raise ValueError("Reference MLA requires explicit positions and no KV cache")
-        fused_weight = torch.cat(
-            (self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight),
-            dim=0,
-        )
-        latent_states = F.linear(hidden_states, fused_weight)
-        query_local, kv_local = latent_states.split(
-            (self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim), dim=-1)
+        query_local = self.q_a_proj(hidden_states)
+        kv_local = self.kv_a_proj_with_mqa(hidden_states)
         kv_local, rope_local = kv_local.split((self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
         query_latent = self.q_a_layernorm(query_local)
         kv_latent = self.kv_a_layernorm(kv_local)
