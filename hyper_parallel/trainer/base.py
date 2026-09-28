@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
