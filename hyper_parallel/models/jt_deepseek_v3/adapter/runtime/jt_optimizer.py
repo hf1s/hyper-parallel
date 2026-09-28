@@ -22,9 +22,76 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.core.optimizer.muon import NSInputTransform
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.mla_attention import (
     JTDeepseekV3FusedMLAAttention,
 )
+
+
+def _periodic_muon_transform(
+        update: torch.Tensor,
+        first_size: int,
+        second_size: int,
+) -> NSInputTransform:
+    """Split interleaved per-head rows into reference Muon matrices."""
+    section_size = first_size + second_size
+    if update.ndim != 2 or update.shape[0] % section_size:
+        raise ValueError(
+            "JT Muon periodic split expects a 2D matrix whose row count is "
+            f"divisible by {section_size}, got {tuple(update.shape)}"
+        )
+    blocks = update.shape[0] // section_size
+    hidden_size = update.shape[1]
+    grouped = update.view(blocks, section_size, hidden_size)
+    first = grouped[:, :first_size, :].reshape(-1, hidden_size).contiguous()
+    second = grouped[:, first_size:, :].reshape(-1, hidden_size).contiguous()
+
+    def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+        """Restore the separately orthogonalized blocks."""
+        target = output.view(blocks, section_size, hidden_size)
+        target[:, :first_size, :].copy_(updates[0].view(blocks, first_size, hidden_size))
+        target[:, first_size:, :].copy_(updates[1].view(blocks, second_size, hidden_size))
+
+    return NSInputTransform(tensors=[first, second], restore=restore)
+
+
+def _build_jt_mla_ns_transform(config: Any):
+    """Restore JT's logical MLA Muon splits on canonical parameter names."""
+    kv_lora_rank = int(config.kv_lora_rank)
+    qk_rope_head_dim = int(config.qk_rope_head_dim)
+    qk_nope_head_dim = int(config.qk_nope_head_dim)
+    v_head_dim = int(config.v_head_dim)
+
+    def transform(parameter_name: str, update: torch.Tensor) -> NSInputTransform | None:
+        if parameter_name.endswith(".kv_a_proj_with_mqa.weight"):
+            expected_rows = kv_lora_rank + qk_rope_head_dim
+            if update.ndim != 2 or update.shape[0] != expected_rows:
+                raise ValueError(
+                    "JT Muon kv_a split expects "
+                    f"{expected_rows} rows, got {tuple(update.shape)}"
+                )
+            kv_update = update[:kv_lora_rank]
+            rope_update = update[kv_lora_rank:]
+
+            def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+                """Restore latent and rotary updates into the canonical matrix."""
+                output[:kv_lora_rank].copy_(updates[0])
+                output[kv_lora_rank:].copy_(updates[1])
+
+            return NSInputTransform(
+                tensors=[kv_update, rope_update],
+                restore=restore,
+            )
+
+        if parameter_name.endswith(".q_b_proj.weight"):
+            return _periodic_muon_transform(update, qk_nope_head_dim, qk_rope_head_dim)
+
+        if parameter_name.endswith(".kv_b_proj.weight"):
+            return _periodic_muon_transform(update, qk_nope_head_dim, v_head_dim)
+
+        return None
+
+    return transform
 
 
 @torch.no_grad()
@@ -92,6 +159,7 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
         raise ValueError("qk_clip_threshold must be finite and positive")
     muon_config = dict(kwargs["muon_config"])
+    muon_config["ns_transform_fn"] = _build_jt_mla_ns_transform(model.config)
     builder = Muon(model=model, muon_config=muon_config, **{
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
