@@ -93,6 +93,20 @@ def _build_jt_mla_ns_transform(config: Any):
 
     return transform
 
+def _reshape_jt_expert_projection(
+        parameter_name: str,
+        update: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Match the old gate/up expert Muon matrix orientation."""
+    if parameter_name.endswith((
+            ".experts.gate_proj",
+            ".experts.up_proj",
+            ".experts.gate_proj.weight",
+            ".experts.up_proj.weight",
+    )):
+        return [update.mT]
+    return [update]
+
 
 @torch.no_grad()
 def clip_qk(model: torch.nn.Module, threshold: float) -> dict[str, torch.Tensor]:
@@ -160,6 +174,7 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
         raise ValueError("qk_clip_threshold must be finite and positive")
     muon_config = dict(kwargs["muon_config"])
     muon_config["ns_transform_fn"] = _build_jt_mla_ns_transform(model.config)
+    muon_config["reshape_fn"] = _reshape_jt_expert_projection
     builder = Muon(model=model, muon_config=muon_config, **{
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
