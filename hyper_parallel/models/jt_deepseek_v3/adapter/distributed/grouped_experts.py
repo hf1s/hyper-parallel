@@ -17,6 +17,7 @@
 from typing import Any
 
 import torch
+from torch import nn
 from hyper_parallel.components.checkpoint.conversion_ops import Split
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
