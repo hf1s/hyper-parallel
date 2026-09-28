@@ -123,6 +123,28 @@ class JTDeepseekV3FusedMLAAttention(nn.Module):
                            self.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
         key = torch.cat((key_pass, self.explicit_rotary(key_rope, cos, sin)), dim=-1)
         return query, key, value
+    def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
+                past_key_values: Any = None, attention_mask: Any = None, **kwargs: Any) -> tuple:
+        """Run fused attention with the canonical module's call contract."""
+        query, key, value = self._project_attention_inputs(
+            hidden_states,
+            position_embeddings,
+            past_key_values,
+        )
+        attn_output, attn_weights = self.attention_interface(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+        batch, sequence = hidden_states.shape[:2]
+        attn_output = attn_output.reshape(batch, sequence, -1).contiguous()
+        return self.o_proj(attn_output), attn_weights
 
     def make_transforms(self) -> list[WeightConverter]:
         """Split legacy fused checkpoint weights into canonical target parameters."""
