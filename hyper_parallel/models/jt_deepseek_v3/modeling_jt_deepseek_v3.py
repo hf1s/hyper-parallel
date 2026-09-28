@@ -115,10 +115,10 @@ class JTDeepseekV3MLP(DeepseekV32MLP):
         Args:
             x: X.
         """
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        values = ReferenceSwiGLU.apply(torch.cat((gate, up), dim=-1), self.rounded_up_gradient)
-        return self.down_proj(values)
+        weight = torch.stack((self.gate_proj.weight, self.up_proj.weight), dim=1).flatten(0, 1)
+        pair = F.linear(x, weight).reshape(*x.shape[:-1], -1, 2)
+        values = torch.cat((pair[..., 0], pair[..., 1]), dim=-1)
+        return self.down_proj(ReferenceSwiGLU.apply(values, self.rounded_up_gradient))
 
 
 class JTDeepseekV3Experts(nn.Module):
