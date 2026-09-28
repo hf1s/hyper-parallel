@@ -14,7 +14,10 @@
 # ============================================================================
 """JT model hooks around the public Muon optimizer."""
 
+import json
+import logging
 import math
+import os
 from functools import partial
 from typing import Any
 
@@ -26,6 +29,128 @@ from hyper_parallel.core.optimizer.muon import NSInputTransform
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.mla_attention import (
     JTDeepseekV3FusedMLAAttention,
 )
+logger = logging.getLogger(__name__)
+
+
+def _trace_category(parameter_name: str, parameter: torch.Tensor) -> str | None:
+    """Assign first-step optimizer tracing to a semantic matrix family."""
+    if parameter.ndim < 2:
+        return None
+    if ".self_attn." in parameter_name:
+        for projection in ("q_a_proj", "kv_a_proj_with_mqa", "linear_qkv",
+                           "q_b_proj", "kv_b_proj", "o_proj"):
+            if f".{projection}." in parameter_name:
+                return f"attention/{projection}"
+    if ".shared_experts." in parameter_name:
+        return "shared_expert"
+    if ".mlp.experts." in parameter_name:
+        return "routed_expert"
+    if ".mlp." in parameter_name:
+        return "mlp"
+    return "other_matrix"
+
+
+def _trace_local(value: torch.Tensor) -> torch.Tensor:
+    """Use local storage for DTensor-compatible diagnostic norms."""
+    to_local = getattr(value, "to_local", None)
+    return to_local() if callable(to_local) else value
+
+
+def _trace_norm_sq(value: torch.Tensor) -> float:
+    """Return a local squared L2 norm without changing training tensors."""
+    local = _trace_local(value.detach())
+    return float(local.float().square().sum().item())
+
+
+def _trace_before_step(model: torch.nn.Module, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Capture first-step gradients and parameter storage before Muon."""
+    del optimizer, args, kwargs
+    if getattr(model, "_jt_trace_started", False):
+        return
+    parameters = {}
+    snapshots = {}
+    gradient_norms: dict[str, float] = {}
+    for name, parameter in model.named_parameters():
+        category = _trace_category(name, parameter)
+        if category is None or parameter.grad is None:
+            continue
+        parameters[name] = parameter
+        snapshots[name] = _trace_local(parameter.detach()).clone()
+        gradient_norms[category] = (
+            gradient_norms.get(category, 0.0)
+            + _trace_norm_sq(parameter.grad)
+        )
+    model._jt_trace_started = True
+    model._jt_trace_parameters = parameters
+    model._jt_trace_snapshots = snapshots
+    model._jt_trace_gradient_norms = gradient_norms
+
+
+def _trace_emit(model: torch.nn.Module, stage: str) -> None:
+    """Emit first-step gradient/update norms around the QK clip hook."""
+    snapshots = getattr(model, "_jt_trace_snapshots", {})
+    parameters = getattr(model, "_jt_trace_parameters", {})
+    if not snapshots:
+        return
+    current_by_name = {
+        name: _trace_local(parameter.detach())
+        for name, parameter in parameters.items()
+    }
+    if stage == "muon":
+        update_norms: dict[str, float] = {}
+        after_muon = {}
+        for name, before in snapshots.items():
+            current = current_by_name[name]
+            after_muon[name] = current.clone()
+            category = _trace_category(name, parameters[name])
+            update = current - before
+            update_norms[category] = update_norms.get(category, 0.0) + _trace_norm_sq(update)
+        model._jt_trace_after_muon = after_muon
+        payload = {
+            "stage": stage,
+            "gradient_norm": {
+                key: math.sqrt(value)
+                for key, value in model._jt_trace_gradient_norms.items()
+            },
+            "muon_delta_norm": {
+                key: math.sqrt(value)
+                for key, value in update_norms.items()
+            },
+        }
+    else:
+        after_muon = getattr(model, "_jt_trace_after_muon", {})
+        clip_norms: dict[str, float] = {}
+        total_norms: dict[str, float] = {}
+        for name, before in snapshots.items():
+            category = _trace_category(name, parameters[name])
+            current = current_by_name[name]
+            clip_delta = current - after_muon[name]
+            total_delta = current - before
+            clip_norms[category] = clip_norms.get(category, 0.0) + _trace_norm_sq(clip_delta)
+            total_norms[category] = total_norms.get(category, 0.0) + _trace_norm_sq(total_delta)
+        payload = {
+            "stage": stage,
+            "qk_clip_delta_norm": {
+                key: math.sqrt(value) for key, value in clip_norms.items()
+            },
+            "total_delta_norm": {
+                key: math.sqrt(value) for key, value in total_norms.items()
+            },
+        }
+    rank_logger = getattr(logger, "info_rank0", logger.info)
+    rank_logger("[JT_MUON_TRACE] %s", json.dumps(payload, sort_keys=True))
+
+
+def _trace_after_muon(model: torch.nn.Module, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Trace the core optimizer update before model-owned postprocessing."""
+    del optimizer, args, kwargs
+    _trace_emit(model, "muon")
+
+
+def _trace_after_clip(model: torch.nn.Module, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Trace the final first-step delta after model-owned postprocessing."""
+    del optimizer, args, kwargs
+    _trace_emit(model, "post_clip")
 
 
 def _periodic_muon_transform(
@@ -164,7 +289,14 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
     optimizer = builder.get_optimizer()
-    optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
+    core_optimizer = optimizer.chained_optimizers[-1]
+    trace_enabled = os.getenv("JT_MUON_TRACE_FIRST_STEP") == "1"
+    if trace_enabled:
+        core_optimizer.register_step_pre_hook(partial(_trace_before_step, model))
+        core_optimizer.register_step_post_hook(partial(_trace_after_muon, model))
+    core_optimizer.register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
+    if trace_enabled:
+        core_optimizer.register_step_post_hook(partial(_trace_after_clip, model))
     model.jt_optimizer_metrics = {}
     optimizer.get_logging_metrics = partial(_take_metrics, model)
     return builder
