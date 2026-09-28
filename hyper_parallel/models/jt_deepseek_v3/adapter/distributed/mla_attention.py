@@ -111,13 +111,13 @@ class JTDeepseekV3FusedMLAAttention(nn.Module):
         kv_latent = self.kv_a_layernorm(kv_local)
         key_rope = self.key_rope_gather(rope_local)
         batch, sequence = query_latent.shape[:2]
-        query = self.q_b_proj(query_latent).reshape(batch, sequence, self.num_heads, self.qk_head_dim)
+        query = self.q_b_proj(query_latent).reshape(batch, sequence, -1, self.qk_head_dim)
         query_pass, query_rope = query.split((self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
         kv_latent = kv_latent.reshape(batch, 1, sequence, self.kv_lora_rank)
         kv_states = self.kv_b_proj(kv_latent).view(
-            batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
+            batch, sequence, query.shape[2], self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
         key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
-        key_rope = key_rope.reshape(batch, 1, sequence, self.qk_rope_head_dim).expand(-1, self.num_heads, -1, -1)
+        key_rope = key_rope.reshape(batch, 1, sequence, self.qk_rope_head_dim).expand(-1, query.shape[2], -1, -1)
         cos, sin = position_embeddings
         query = torch.cat((query_pass.transpose(1, 2),
                            self.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
