@@ -693,9 +693,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             hidden = layer(hidden, **attention_kwargs)
             if hasattr(layer.mlp, "auxiliary_loss"):
                 auxiliary = auxiliary + layer.mlp.auxiliary_loss
-        hidden = hidden.float()
         lm_loss = masked_vocab_parallel_loss(
-            self.lm_head(self.model.norm(hidden).to(torch.bfloat16)), labels, loss_mask,
+            self.lm_head(self.model.norm(hidden)), labels, loss_mask,
             vocab_size=self.config.vocab_size)
         mtp_output = self.mtp(
             hidden, input_ids, embedding=self.model.embed_tokens, head=self.lm_head,
