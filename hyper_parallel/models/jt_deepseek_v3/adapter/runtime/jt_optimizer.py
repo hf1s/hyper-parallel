@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.core.optimizer.muon import NSInputTransform
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3MLAAttention
 
 
@@ -73,6 +74,72 @@ def reshape_gate_up_projection(parameter_name: str, update: torch.Tensor) -> lis
     return [update]
 
 
+def _periodic_muon_transform(
+        update: torch.Tensor,
+        first_size: int,
+        second_size: int,
+        blocks: int,
+) -> NSInputTransform:
+    """Split interleaved per-head rows into reference Muon matrices."""
+    if update.ndim != 2 or update.shape[0] != blocks * (first_size + second_size):
+        raise ValueError(
+            "JT Muon periodic split expects a 2D full matrix with "
+            f"{blocks * (first_size + second_size)} rows, got {tuple(update.shape)}"
+        )
+    hidden_size = update.shape[1]
+    grouped = update.view(blocks, first_size + second_size, hidden_size)
+    first = grouped[:, :first_size, :].reshape(-1, hidden_size).contiguous()
+    second = grouped[:, first_size:, :].reshape(-1, hidden_size).contiguous()
+
+    def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+        target = output.view(blocks, first_size + second_size, hidden_size)
+        target[:, :first_size, :].copy_(updates[0].view(blocks, first_size, hidden_size))
+        target[:, first_size:, :].copy_(updates[1].view(blocks, second_size, hidden_size))
+
+    return NSInputTransform(tensors=[first, second], restore=restore)
+
+
+def _build_jt_mla_ns_transform(config: Any):
+    """Build JT MLA logical Muon splits without changing model arithmetic."""
+    q_lora_rank = int(config.q_lora_rank)
+    kv_lora_rank = int(config.kv_lora_rank)
+    qk_rope_head_dim = int(config.qk_rope_head_dim)
+    qk_nope_head_dim = int(config.qk_nope_head_dim)
+    v_head_dim = int(config.v_head_dim)
+    num_heads = int(config.num_attention_heads)
+
+    def transform(parameter_name: str, update: torch.Tensor) -> NSInputTransform | None:
+        if parameter_name.endswith(".linear_qkv.weight"):
+            qkv_rows = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+            if update.ndim != 2 or update.shape[0] != qkv_rows:
+                raise ValueError(
+                    "JT Muon linear_qkv split expects "
+                    f"{qkv_rows} rows, got {tuple(update.shape)}"
+                )
+            q_update = update[:q_lora_rank]
+            kv_update = update[q_lora_rank:]
+
+            def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+                output[:q_lora_rank].copy_(updates[0])
+                output[q_lora_rank:].copy_(updates[1])
+
+            return NSInputTransform(tensors=[q_update, kv_update], restore=restore)
+
+        if parameter_name.endswith(".q_b_proj.weight"):
+            return _periodic_muon_transform(
+                update, qk_nope_head_dim, qk_rope_head_dim, num_heads,
+            )
+
+        if parameter_name.endswith(".kv_b_proj.weight"):
+            return _periodic_muon_transform(
+                update, qk_nope_head_dim, v_head_dim, num_heads,
+            )
+
+        return None
+
+    return transform
+
+
 @torch.no_grad()
 def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
     """Apply model-owned updates after all public optimizer leaves complete."""
@@ -107,7 +174,11 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     """
     if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
         raise ValueError("qk_clip_threshold must be finite and positive")
-    muon_config = {**kwargs["muon_config"], "reshape_fn": reshape_gate_up_projection}
+    muon_config = {
+        **kwargs["muon_config"],
+        "reshape_fn": reshape_gate_up_projection,
+        "ns_transform_fn": _build_jt_mla_ns_transform(model.config),
+    }
     builder = Muon(model=model, muon_config=muon_config, **{
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
