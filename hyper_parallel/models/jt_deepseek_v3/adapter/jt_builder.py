@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +29,6 @@ import torch_npu
 from transformers import DeepseekV32Config, PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
-from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, local_compute
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
@@ -41,55 +39,38 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
-from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.expert_parallel import build_jt_ep
-
-def _configured_moe_fqns(config: DeepseekV32Config) -> tuple[str, ...]:
-    """Return the configured routed-MoE parents, excluding dense trunk layers."""
-    trunk = tuple(
-        f"model.layers.{index}.mlp"
-        for index, layer_type in enumerate(config.mlp_layer_types) if layer_type == "sparse"
-    )
-    mtp = tuple(
-        f"mtp.layers.{index}.transformer_layer.mlp"
-        for index in range(config.num_nextn_predict_layers)
-    )
-    return trunk + mtp
 
 
-def _has_explicit_ep_override(overrides: dict[str, Any], fqn: str) -> bool:
-    """Let a user-selected EP compute factory win over the reference default."""
-    return any(
-        (key == fqn or (any(char in key for char in "*?[") and fnmatchcase(fqn, key)))
-        and getattr(spec, "local_compute_fn", None) is not None
-        for key, spec in overrides.items()
-    )
 
-
-def _with_model_ep_overrides(distributed_setup: Any, config: DeepseekV32Config) -> Any:
-    """Add only missing configured MoE EP factories as explicit model FQNs."""
-    overrides = dict(getattr(distributed_setup, "plan_overrides", None) or {})
-    for fqn in _configured_moe_fqns(config):
-        if _has_explicit_ep_override(overrides, fqn):
-            continue
-        if fqn in overrides:
-            overrides[fqn] = replace(
-                overrides[fqn],
-                local_compute_fn=build_jt_ep,
-                region_dispatch=(
-                    False if overrides[fqn].region_dispatch is None
-                    else overrides[fqn].region_dispatch
-                ),
-            )
-            continue
-        overrides[fqn] = ModuleShardingSpec(
-            local_compute_fn=build_jt_ep,
-            region_dispatch=False,
-        )
-    return replace(distributed_setup, plan_overrides=overrides)
+def _canonicalize_reference_arrays(
+        arrays: dict[str, np.ndarray],
+        config: DeepseekV32Config,
+) -> dict[str, np.ndarray]:
+    """Expand fused reference tensors into the canonical JT parameter tree."""
+    normalized = dict(arrays)
+    q_lora_rank = int(config.q_lora_rank)
+    for name in tuple(normalized):
+        if name.endswith(".linear_qkv.weight"):
+            fused = normalized.pop(name)
+            if fused.ndim != 2 or fused.shape[0] <= q_lora_rank:
+                raise ValueError(f"Invalid fused MLA weight shape for {name}: {fused.shape}")
+            prefix = name[: -len("linear_qkv.weight")]
+            normalized[prefix + "q_a_proj.weight"] = fused[:q_lora_rank].copy()
+            normalized[prefix + "kv_a_proj_with_mqa.weight"] = fused[q_lora_rank:].copy()
+        elif name.endswith(".experts.gate_up_proj"):
+            fused = normalized.pop(name)
+            if fused.ndim != 3 or fused.shape[1] % 2:
+                raise ValueError(f"Invalid fused expert weight shape for {name}: {fused.shape}")
+            prefix = name[: -len("experts.gate_up_proj")]
+            midpoint = fused.shape[1] // 2
+            normalized[prefix + "experts.gate_proj"] = fused[:, :midpoint].copy()
+            normalized[prefix + "experts.up_proj"] = fused[:, midpoint:].copy()
+    return normalized
 
 
 def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray]) -> dict:
-    """Load already-converted recipe weights without renaming or reshaping tensors."""
+    """Load the offline artifact after expanding its fused tensors canonically."""
+    arrays = _canonicalize_reference_arrays(arrays, model.config)
     expected = model.state_dict()
     if set(expected) != set(arrays):
         raise ValueError(
@@ -126,7 +107,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
     torch_npu.npu.set_compile_mode(jit_compile=False)
     torch.use_deterministic_algorithms(True)
     config = DeepseekV32Config(**config)
-    setup = _with_model_ep_overrides(distributed_setup, config)
+    setup = distributed_setup
     mesh = setup.mesh_context
     if (mesh.tp_size, mesh.ep_size, mesh.cp_size, mesh.dp_size, mesh.pp_size) != (8, 8, 1, 1, 1):
         raise ValueError("JT recipe requires TP8/EP8 and DP/CP/PP1")

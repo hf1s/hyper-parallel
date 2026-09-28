@@ -31,20 +31,14 @@ from torch.nn import functional as F
 from transformers import DeepseekV32Config, DeepseekV32ForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
-    DeepseekV32Attention, DeepseekV32DecoderLayer, DeepseekV32Experts, DeepseekV32MLP,
+    DeepseekV32Attention, DeepseekV32DecoderLayer, DeepseekV32MLP,
     DeepseekV32MoE, DeepseekV32Model, DeepseekV32PreTrainedModel, DeepseekV32RMSNorm,
     DeepseekV32RotaryEmbedding, DeepseekV32TopkRouter,
 )
 
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP
-from hyper_parallel.components.modules.mla_attention import MLAAttention
-from hyper_parallel.components.functional.npu_fusion_attention import (
-    _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
-)
-from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab_parallel_cross_entropy_local
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
-from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
 
@@ -121,24 +115,32 @@ class JTDeepseekV3MLP(DeepseekV32MLP):
         Args:
             x: X.
         """
-        weight = torch.stack((self.gate_proj.weight, self.up_proj.weight), dim=1).flatten(0, 1)
-        pair = F.linear(x, weight).reshape(*x.shape[:-1], -1, 2)
-        values = torch.cat((pair[..., 0], pair[..., 1]), dim=-1)
-        return self.down_proj(ReferenceSwiGLU.apply(values, self.rounded_up_gradient))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        values = ReferenceSwiGLU.apply(torch.cat((gate, up), dim=-1), self.rounded_up_gradient)
+        return self.down_proj(values)
 
 
-class JTDeepseekV3Experts(DeepseekV32Experts):
-    """Keep HF packed expert tensors and expose Hyper's grouped-compute hook."""
+class JTDeepseekV3Experts(nn.Module):
+    """Keep routed expert parameters canonical while retaining grouped execution."""
 
-    def forward_expert_major(self, inputs: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        """Use Hyper grouped SwiGLU with BF16 compute and FP32 master parameters.
+    def __init__(self, config: Any) -> None:
+        """Create separate gate, up, and down expert parameter tensors."""
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim)
+        )
+        self.up_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
+        )
+        self.act_fn = F.silu
 
-        Args:
-            inputs: Inputs retained for the custom derivative.
-            counts: Number of tokens assigned to each expert.
-        """
-        return npu_grouped_swiglu(inputs.to(torch.bfloat16), self.gate_up_proj.to(torch.bfloat16),
-                                 self.down_proj.to(torch.bfloat16), counts)
 
 
 class ExplicitFP32RotaryEmbedding(nn.Module):
@@ -158,117 +160,8 @@ class ExplicitFP32RotaryEmbedding(nn.Module):
         return (ordered * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)).to(values.dtype)
 
 
-def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
-                              value: torch.Tensor, attention_mask: Any, dropout: float = 0.0,
-                              scaling: float | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
-    """Retain Hyper's NPU attention preparation and collect per-head QK maxima.
-
-    Reuse the upstream packed-length, option and mask preparation helpers.
-    The observed kernel outputs also supply the QK clipping statistics.
-
-    Args:
-        module: Attention module owning kernel settings.
-        query: Projected query states.
-        key: Projected key states.
-        value: Projected value states.
-        attention_mask: Optional attention mask.
-        dropout: Attention dropout probability.
-        scaling: Attention score scaling factor.
-    """
-    batch_size, _, query_length, head_dim = query.shape
-    query_lengths, key_lengths = resolve_packed_sequence_lengths(
-        kwargs, batch_size * query_length, key.shape[0] * key.shape[2])
-    pre_tokens, next_tokens, sparse_mode, window, causal = _attention_options(module, kwargs)
-    query, key, value, layout, mask, sparse_mode = _prepare_attention_inputs(
-        query, key, value, attention_mask, is_packed=query_lengths is not None,
-        is_causal=causal, sliding_window=window, sparse_mode=sparse_mode)
-    result = torch_npu.npu_fusion_attention(
-        query, key, value, query.shape[1], layout,
-        pse=None, padding_mask=None, atten_mask=mask,
-        scale=head_dim**-0.5 if scaling is None else scaling,
-        pre_tockens=pre_tokens, next_tockens=next_tokens,
-        keep_prob=1.0 - dropout, inner_precise=0, sparse_mode=sparse_mode,
-        actual_seq_qlen=query_lengths, actual_seq_kvlen=key_lengths)
-    with torch.no_grad():
-        maximum = result[1].amax(dim=(0, 2))
-        if module.max_logits_val is None:
-            module.max_logits_val = torch.zeros_like(maximum)
-        module.max_logits_val.copy_(torch.maximum(module.max_logits_val, maximum))
-    if query_lengths is not None:
-        return result[0].reshape(batch_size, query_length, *result[0].shape[1:]), None
-    return result[0].transpose(1, 2), None
 
 
-@module_replacement
-class JTDeepseekV3MLAAttention(MLAAttention):
-    """Reuse Hyper MLA parameters and projections with reference SP and RoPE boundaries."""
-
-    def __init__(self, *, module: nn.Module, module_fqn: str = "", context: Any = None) -> None:
-        """Initialize the configured components and retained parameter state.
-
-        Args:
-            module: Module.
-            module_fqn: Module fqn.
-            context: Context.
-        """
-        super().__init__(module=module, module_fqn=module_fqn, context=context)
-        if not self.linear_qkv.weight.is_meta:
-            with torch.no_grad():
-                self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
-        self.explicit_rotary = ExplicitFP32RotaryEmbedding()
-        self.key_rope_gather = nn.Identity()
-        self.register_buffer("max_logits_val", None, persistent=False)
-        self.attention_interface = observed_fusion_attention
-
-    def _project_attention_inputs(self, hidden_states: torch.Tensor, position_embeddings: Any,
-                                  past_key_values: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project shared MLA children with the JT SP and rotary boundaries.
-
-        Separate down projections retain the two input-gradient GEMMs. The
-        current upstream MLA has no split latent-projection extension point.
-        """
-        if past_key_values is not None or position_embeddings is None:
-            raise ValueError("Reference MLA requires explicit positions and no KV cache")
-        weight = self.linear_qkv.weight
-        query_local = F.linear(hidden_states, weight[:self.q_lora_rank])
-        kv_local = F.linear(hidden_states, weight[self.q_lora_rank:])
-        kv_local, rope_local = kv_local.split((self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
-        query_latent = self.q_a_layernorm(query_local)
-        kv_latent = self.kv_a_layernorm(kv_local)
-        key_rope = self.key_rope_gather(rope_local)
-        batch, sequence = query_latent.shape[:2]
-        query = self.q_b_proj(query_latent).reshape(batch, sequence, self.num_heads, self.qk_head_dim)
-        query_pass, query_rope = query.split((self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
-        kv_latent = kv_latent.reshape(batch, 1, sequence, self.kv_lora_rank)
-        kv_states = self.kv_b_proj(kv_latent).view(
-            batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
-        key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
-        key_rope = key_rope.reshape(batch, 1, sequence, self.qk_rope_head_dim).expand(-1, self.num_heads, -1, -1)
-        cos, sin = position_embeddings
-        query = torch.cat((query_pass.transpose(1, 2),
-                           self.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
-        key = torch.cat((key_pass, self.explicit_rotary(key_rope, cos, sin)), dim=-1)
-        return query, key, value
-
-    def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
-                attention_mask: Any = None, past_key_values: Any = None,
-                actual_seq_len: Any = None, **kwargs: Any) -> tuple[torch.Tensor, Any]:
-        """Use global projected sequence length with Hyper's MLA children and TP output.
-
-        Args:
-            hidden_states: Input hidden states.
-            position_embeddings: Explicit rotary frequencies.
-            attention_mask: Optional attention mask.
-            past_key_values: Unsupported cached decoding state.
-            actual_seq_len: Packed sequence lengths.
-        """
-        query, key, value = self._project_attention_inputs(hidden_states, position_embeddings, past_key_values)
-        output, weights = self.attention_interface(
-            self, query, key, value, attention_mask,
-            dropout=self.attention_dropout if self.training else 0.0, scaling=self.scaling,
-            sliding_window=self.sliding_window, actual_seq_len=actual_seq_len, **kwargs)
-        output = output.reshape(query.shape[0], query.shape[2], -1).contiguous()
-        return self.o_proj(output), weights
 
 
 class JTDeepseekV3Attention(DeepseekV32Attention):
@@ -294,6 +187,7 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
             self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
         self.explicit_rotary = ExplicitFP32RotaryEmbedding()
+        self.key_rope_gather = nn.Identity()
         self.register_buffer("max_logits_val", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
@@ -312,6 +206,7 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         query = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         query = query.reshape(batch, sequence, self.num_heads, self.qk_head_dim).transpose(1, 2)
         kv, rope = self.kv_a_proj_with_mqa(hidden_states).split((self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
+        rope = self.key_rope_gather(rope)
         kv = self.kv_b_proj(self.kv_a_layernorm(kv)).reshape(
             batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
         key, value = kv.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
@@ -320,13 +215,10 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
                            self.explicit_rotary(query[..., self.qk_nope_head_dim:], cos, sin)), dim=-1)
         rope = self.explicit_rotary(rope.unsqueeze(1), cos, sin).expand(-1, self.num_heads, -1, -1)
         key = torch.cat((key, rope), dim=-1)
-        if hidden_states.device.type == "npu":
-            output, _ = observed_fusion_attention(self, query, key, value, attention_mask,
-                                                  scaling=self.scaling, **kwargs)
-        else:
-            output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask,
-                                                    is_causal=attention_mask is None, scale=self.scaling)
-            output = output.transpose(1, 2)
+        output = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask,
+            is_causal=attention_mask is None, scale=self.scaling)
+        output = output.transpose(1, 2)
         return self.o_proj(output.reshape(batch, sequence, -1)), None
 
 
@@ -464,8 +356,9 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         outputs = flat.new_zeros(indices.shape[0], indices.shape[1], flat.shape[-1])
         for expert in range(self.experts.num_experts):
             tokens, slots = torch.where(indices == expert)
-            pair = F.linear(flat[tokens], self.experts.gate_up_proj[expert].to(flat.dtype))
-            values = ReferenceSwiGLU.apply(pair, False)
+            gate = F.linear(flat[tokens], self.experts.gate_proj[expert].to(flat.dtype))
+            up = F.linear(flat[tokens], self.experts.up_proj[expert].to(flat.dtype))
+            values = ReferenceSwiGLU.apply(torch.cat((gate, up), dim=-1), False)
             values = F.linear(values, self.experts.down_proj[expert].to(flat.dtype))
             outputs = outputs.index_put((tokens, slots), values)
         return ExpertCombine.apply(outputs, probabilities, self.reference_is_mtp).reshape(hidden.shape).float()
@@ -573,6 +466,16 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     """Reuse HF construction and children; override the reference training orchestration."""
 
     config_class = DeepseekV32Config
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        """Initialize canonical routed-expert parameters."""
+        super()._init_weights(module)
+        if isinstance(module, JTDeepseekV3Experts):
+            std = self.config.initializer_range
+            nn.init.normal_(module.gate_proj, mean=0.0, std=std)
+            nn.init.normal_(module.up_proj, mean=0.0, std=std)
+            nn.init.normal_(module.down_proj, mean=0.0, std=std)
 
     def __init__(self, config: Any) -> None:
         """Construct the HF skeleton with complete, unconditional JT adapters.
