@@ -14,8 +14,11 @@
 # ============================================================================
 """JT model hooks around the public Muon optimizer."""
 
+import logging
 import math
+import os
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -25,6 +28,94 @@ from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.mla_attention import (
     JTDeepseekV3FusedMLAAttention,
 )
+logger = logging.getLogger(__name__)
+
+
+def _vector_trace_category(parameter_name: str, parameter: torch.Tensor) -> str | None:
+    """Classify matrix parameters for cross-branch first-step comparison."""
+    if parameter.ndim < 2:
+        return None
+    if ".self_attn." in parameter_name:
+        for projection in ("q_a_proj", "kv_a_proj_with_mqa", "linear_qkv",
+                           "q_b_proj", "kv_b_proj", "o_proj"):
+            if f".{projection}." in parameter_name:
+                return f"attention/{projection}"
+    if ".shared_experts." in parameter_name:
+        return "shared_expert"
+    if ".mlp.experts." in parameter_name:
+        return "routed_expert"
+    if ".mlp." in parameter_name:
+        return "mlp"
+    return "other_matrix"
+
+
+def _vector_trace_local(value: torch.Tensor) -> torch.Tensor:
+    """Read local storage from a DTensor without changing the parameter."""
+    to_local = getattr(value, "to_local", None)
+    return to_local() if callable(to_local) else value
+
+
+def _vector_trace_before_step(
+        model: torch.nn.Module,
+        optimizer: Any,
+        args: tuple,
+        kwargs: dict,
+) -> None:
+    """Capture first-step gradients and parameter snapshots."""
+    del optimizer, args, kwargs
+    if getattr(model, "_jt_vector_trace_started", False):
+        return
+    parameters = {}
+    gradients = {}
+    snapshots = {}
+    categories = {}
+    for name, parameter in model.named_parameters():
+        category = _vector_trace_category(name, parameter)
+        if category is None or parameter.grad is None:
+            continue
+        parameters[name] = parameter
+        categories[name] = category
+        gradients[name] = _vector_trace_local(parameter.grad.detach()).cpu().clone()
+        snapshots[name] = _vector_trace_local(parameter.detach()).clone()
+    model._jt_vector_trace_started = True
+    model._jt_vector_trace_parameters = parameters
+    model._jt_vector_trace_categories = categories
+    model._jt_vector_trace_gradients = gradients
+    model._jt_vector_trace_snapshots = snapshots
+
+
+@torch.no_grad()
+def _vector_trace_after_muon(
+        model: torch.nn.Module,
+        optimizer: Any,
+        args: tuple,
+        kwargs: dict,
+) -> None:
+    """Persist first-step gradients and pre-post-hook Muon updates."""
+    del optimizer, args, kwargs
+    output_path = os.getenv("JT_MUON_VECTOR_TRACE_PATH")
+    snapshots = getattr(model, "_jt_vector_trace_snapshots", {})
+    parameters = getattr(model, "_jt_vector_trace_parameters", {})
+    if not output_path or not snapshots:
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    payload = {
+        "stage": "muon",
+        "parameters": {},
+    }
+    for name, before in snapshots.items():
+        current = _vector_trace_local(parameters[name].detach())
+        payload["parameters"][name] = {
+            "category": model._jt_vector_trace_categories[name],
+            "gradient": model._jt_vector_trace_gradients[name],
+            "muon_delta": (current - before).cpu(),
+        }
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    rank_logger = getattr(logger, "info_rank0", logger.info)
+    rank_logger("[JT_MUON_VECTOR_TRACE] wrote %s", str(path))
 
 
 @torch.no_grad()
@@ -96,7 +187,12 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
     optimizer = builder.get_optimizer()
-    optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
+    core_optimizer = optimizer.chained_optimizers[-1]
+    vector_trace_path = os.getenv("JT_MUON_VECTOR_TRACE_PATH")
+    if vector_trace_path:
+        core_optimizer.register_step_pre_hook(partial(_vector_trace_before_step, model))
+        core_optimizer.register_step_post_hook(partial(_vector_trace_after_muon, model))
+    core_optimizer.register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
     model.jt_optimizer_metrics = {}
     optimizer.get_logging_metrics = partial(_take_metrics, model)
     return builder
