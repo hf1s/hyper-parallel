@@ -573,6 +573,17 @@ class Muon(BaseDistributedOptimizer):
 
                 local_params = [to_local_if_dtensor(p.data) for p in sub_batch]
                 local_updates = [updates_dict[p].view(lp.shape) for p, lp in zip(sub_batch, local_params)]
+                trace_raw = getattr(self, "_jt_muon_ns_raw_updates", {})
+                if trace_raw:
+                    for parameter, local_update, local_param in zip(
+                            sub_batch, local_updates, local_params):
+                        raw_update = trace_raw.pop(parameter, None)
+                        if raw_update is not None:
+                            _dump_muon_ns_trace(
+                                getattr(parameter, "model_name", repr(parameter)),
+                                raw_update.view(local_param.shape),
+                                local_update.view(local_param.shape),
+                            )
 
                 if weight_decay != 0.0:
                     # pylint: disable=protected-access
@@ -953,6 +964,7 @@ class Muon(BaseDistributedOptimizer):
         origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
         working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
         trace_owners: Dict[int, Tuple[torch.nn.Parameter, int]] = {}
+        trace_raw_updates: Dict[torch.nn.Parameter, torch.Tensor] = {}
 
         for param in p_list:
             local_shape = getattr(param, "local_shape", None)
@@ -989,11 +1001,7 @@ class Muon(BaseDistributedOptimizer):
                 reshaped_update.mul_(slice_scale)
                 if trace_enabled:
                     owner, _ = trace_owners[id(reshaped_input)]
-                    _dump_muon_ns_trace(
-                        getattr(owner, "model_name", repr(owner)),
-                        ns_output,
-                        reshaped_update,
-                    )
+                    trace_raw_updates[owner] = ns_output
                 reshaped_input.copy_(reshaped_update.contiguous().view_as(reshaped_input))
 
         for param in p_list:
@@ -1002,6 +1010,10 @@ class Muon(BaseDistributedOptimizer):
             if working_input.untyped_storage().data_ptr() != ns_input.untyped_storage().data_ptr():
                 ns_input.copy_(working_input)
             updates_dict[param] = ns_input
+        if trace_raw_updates:
+            pending = getattr(self, "_jt_muon_ns_raw_updates", {})
+            pending.update(trace_raw_updates)
+            self._jt_muon_ns_raw_updates = pending
         return updates_dict
 
     def _compute_batched_ns_updates_with_transform(
@@ -1155,6 +1167,20 @@ class Muon(BaseDistributedOptimizer):
                     layout_spec,
                     self._param_shard_metadata.get(p),
                 )
+                raw_updates = getattr(self, "_jt_muon_ns_raw_updates", {})
+                raw_full = raw_updates.pop(p, None)
+                if raw_full is not None:
+                    raw_local = chunk_update_by_layout(
+                        raw_full,
+                        p,
+                        layout_spec,
+                        self._param_shard_metadata.get(p),
+                    )
+                    _dump_muon_ns_trace(
+                        getattr(p, "model_name", repr(p)),
+                        raw_local,
+                        update_to_apply,
+                    )
 
                 local_param = to_local_if_dtensor(p.data)
                 all_local_params.append(local_param)
