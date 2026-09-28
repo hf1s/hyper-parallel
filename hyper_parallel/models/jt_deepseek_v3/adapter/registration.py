@@ -19,10 +19,19 @@ from hyper_parallel.models.jt_deepseek_v3.adapter.policies.sharding import build
 from hyper_parallel.models.registry import register_custom_model, register_model_adapter
 
 
+def _load_expert_parallel():
+    """Return JT's expert-parallel provider lazily."""
+    from hyper_parallel.models.jt_deepseek_v3.adapter.distributed import (  # pylint: disable=C0415
+        expert_parallel,
+    )
+
+    return expert_parallel
+
 JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="JTDeepseekV3ForCausalLM",
     model_type="jt_deepseek_v3",
     sharding_rules=build_parameter_sharding_rules,
+    expert_parallel=_load_expert_parallel,
     fsdp_wrap_modules=lambda model: tuple(
         f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers))
     ),
