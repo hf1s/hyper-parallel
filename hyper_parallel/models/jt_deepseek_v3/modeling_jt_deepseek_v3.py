@@ -17,9 +17,10 @@
 # This model uses the Torch/HF runtime, like the existing Trainer model families.
 # pylint: disable=forbidden-backend-import
 from __future__ import annotations
-
 import copy
 import functools
+import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -40,6 +41,7 @@ from hyper_parallel.components.modules.mtp import DeepseekV3MTP
 from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab_parallel_cross_entropy_local
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
+logger = logging.getLogger(__name__)
 
 
 class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
@@ -606,6 +608,13 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             loss_fn=functools.partial(masked_vocab_parallel_loss, vocab_size=self.config.vocab_size),
             auxiliary_loss=auxiliary, auxiliary_fn=lambda decoder: decoder.mlp.auxiliary_loss,
         )
-        mtp_loss, auxiliary = mtp_output.loss, mtp_output.auxiliary_loss
-        return {"loss": (lm_loss + auxiliary) + mtp_loss, "lm_loss": lm_loss,
-                "mtp_loss": mtp_loss, "aux_loss": auxiliary}
+        losses = {"loss": (lm_loss + auxiliary) + mtp_loss, "lm_loss": lm_loss,
+                  "mtp_loss": mtp_loss, "aux_loss": auxiliary}
+        if os.getenv("JT_LOSS_TRACE") == "1":
+            rank_logger = getattr(logger, "info_rank0", logger.info)
+            rank_logger(
+                "[JT_RAW_LOSS] lm=%.9e mtp=%.9e aux=%.9e total=%.9e",
+                *(float(losses[name].detach().float().item())
+                  for name in ("lm_loss", "mtp_loss", "aux_loss", "loss")),
+            )
+        return losses

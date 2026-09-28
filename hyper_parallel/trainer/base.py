@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
-from abc import ABC
+import os
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
@@ -557,6 +557,28 @@ class BaseTrainer(Stateful, ABC):
             self.step_token_counts,
             device_mesh=self.mesh,
         )
+        if os.getenv("JT_LOSS_TRACE") == "1":
+            rank_logger = getattr(logger, "info_rank0", logger.info)
+            if isinstance(local_loss, torch.Tensor):
+                local_values = {"tensor": float(local_loss.detach().float().item())}
+            else:
+                local_values = {
+                    key: float(value.detach().float().item())
+                    for key, value in local_loss.items()
+                }
+            reduced_values = {
+                key: float(value.detach().float().item())
+                for key, value in loss_dict.items()
+            }
+            rank_logger(
+                "[JT_TRAINER_LOSS] local=%s reduced=%s current_tokens=%s "
+                "step_tokens=%s sequence_parallel=%s",
+                local_values,
+                reduced_values,
+                {key: int(value.item()) for key, value in self.current_token_counts.items()},
+                {key: int(value.item()) for key, value in self.step_token_counts.items()},
+                self.mesh.sequence_parallel,
+            )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
