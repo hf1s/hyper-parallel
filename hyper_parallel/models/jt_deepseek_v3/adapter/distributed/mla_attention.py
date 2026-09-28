@@ -142,7 +142,8 @@ class JTDeepseekV3FusedMLAAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
-        batch, sequence = hidden_states.shape[:2]
+        # Latent norms gather the sequence; hidden_states remains SP-local.
+        batch, sequence = query.shape[0], query.shape[2]
         attn_output = attn_output.reshape(batch, sequence, -1).contiguous()
         return self.o_proj(attn_output), attn_weights
 
