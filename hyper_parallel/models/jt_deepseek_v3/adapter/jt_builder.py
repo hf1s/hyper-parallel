@@ -145,6 +145,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
             weights_mapping=get_model_conversion_mapping(model),
             context=_build_replacement_context(setup, None),
         )
+    model.to_empty(device="cpu")
     # Rotary buffers are nonpersistent; restore their deterministic reference state after to_empty().
     model.model.rotary_emb = type(model.model.rotary_emb)(config)
     with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
