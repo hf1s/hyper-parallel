@@ -66,6 +66,33 @@ def _dump_muon_ns_trace(
         path,
     )
 
+def _dump_muon_apply_trace(
+        parameter_name: str,
+        parameter_before: torch.Tensor,
+        parameter_after: torch.Tensor,
+        scaled_update: torch.Tensor,
+) -> None:
+    """Persist the actual local parameter application when tracing is enabled."""
+    trace_dir = os.getenv("JT_MUON_APPLY_TRACE_DIR")
+    if not trace_dir:
+        return
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    rank_dir = Path(trace_dir) / f"rank_{rank}"
+    safe_name = parameter_name.replace("/", "_")
+    path = rank_dir / f"{safe_name}.pt"
+    if path.exists():
+        return
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "parameter_name": parameter_name,
+            "parameter_before": parameter_before.detach().cpu(),
+            "parameter_after": parameter_after.detach().cpu(),
+            "scaled_update": scaled_update.detach().cpu(),
+            "applied_delta": (parameter_after - parameter_before).detach().cpu(),
+        },
+        path,
+    )
 logger = logging.getLogger(__name__)
 
 # Legacy: single-coefficient quintic NS (Keller Jordan / Moonlight).
@@ -573,6 +600,11 @@ class Muon(BaseDistributedOptimizer):
 
                 local_params = [to_local_if_dtensor(p.data) for p in sub_batch]
                 local_updates = [updates_dict[p].view(lp.shape) for p, lp in zip(sub_batch, local_params)]
+                apply_trace_before = (
+                    [local_param.detach().clone() for local_param in local_params]
+                    if os.getenv("JT_MUON_APPLY_TRACE_DIR")
+                    else None
+                )
                 trace_raw = getattr(self, "_jt_muon_ns_raw_updates", {})
                 if trace_raw:
                     for parameter, local_update, local_param in zip(
@@ -591,6 +623,15 @@ class Muon(BaseDistributedOptimizer):
                 # pylint: disable=protected-access
                 apply_alpha = 1.0 if group["apply_lr_in_update"] else -lr
                 torch._foreach_add_(local_params, local_updates, alpha=apply_alpha)
+                if apply_trace_before is not None:
+                    for parameter, before, after, update in zip(
+                            sub_batch, apply_trace_before, local_params, local_updates):
+                        _dump_muon_apply_trace(
+                            getattr(parameter, "model_name", repr(parameter)),
+                            before,
+                            after,
+                            update,
+                        )
 
     def _gather_and_compute_shard_updates(
             self,
@@ -1118,6 +1159,7 @@ class Muon(BaseDistributedOptimizer):
 
         all_local_params: List[torch.Tensor] = []
         all_update_shards: List[torch.Tensor] = []
+        apply_trace_records = []
 
         alignment_bytes = 512
         element_size = torch.empty(0, dtype=torch.bfloat16, device=device).element_size()
@@ -1184,6 +1226,15 @@ class Muon(BaseDistributedOptimizer):
 
                 local_param = to_local_if_dtensor(p.data)
                 all_local_params.append(local_param)
+                if os.getenv("JT_MUON_APPLY_TRACE_DIR"):
+                    apply_trace_records.append(
+                        (
+                            p,
+                            local_param.detach().clone(),
+                            update_to_apply.view(local_param.shape).clone(),
+                            local_param,
+                        )
+                    )
                 all_update_shards.append(update_to_apply.view(local_param.shape))
 
         if not all_local_params:
@@ -1198,6 +1249,14 @@ class Muon(BaseDistributedOptimizer):
         # pylint: disable=protected-access
         apply_alpha = 1.0 if group["apply_lr_in_update"] else -lr
         torch._foreach_add_(all_local_params, all_update_shards, alpha=apply_alpha)
+        if apply_trace_records:
+            for parameter, before, update, after in apply_trace_records:
+                _dump_muon_apply_trace(
+                    getattr(parameter, "model_name", repr(parameter)),
+                    before,
+                    after,
+                    update,
+                )
 
     def _build_param_shard_metadata(self) -> None:
         """Build shard metadata once during optimizer init."""
