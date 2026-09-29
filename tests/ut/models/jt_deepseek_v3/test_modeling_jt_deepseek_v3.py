@@ -24,7 +24,13 @@ from transformers import DeepseekV32Config
 
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3MoE,
-    JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
+    JTDeepseekV3Attention,
+)
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.mla_attention import (
+    JTDeepseekV3FusedMLAAttention,
+)
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.grouped_experts import (
+    JTDeepseekV3FusedExperts,
 )
 from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiTokenPredictionLayer
 from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp import JTDeepseekV3MTPExecution
@@ -97,21 +103,28 @@ class TestCompleteModel(unittest.TestCase):
         model = JTDeepseekV3ForCausalLM(small_config())
         previous = dict(model.named_modules())
         self.assertEqual(sum(isinstance(m, JTDeepseekV3Attention) for m in previous.values()), 3)
-        original_q = model.model.layers[0].self_attn.q_a_proj.weight.detach().clone()
-        original_kv = model.model.layers[0].self_attn.kv_a_proj_with_mqa.weight.detach().clone()
+        original_attention = model.model.layers[0].self_attn
+        original_q = original_attention.q_a_proj
+        original_kv = original_attention.kv_a_proj_with_mqa
         recipe_path = Path(__file__).resolve().parents[4] / (
             "hyper_parallel/models/jt_deepseek_v3/recipes/jt_deepseek_v3.yaml")
         recipe = parse_training_args([str(recipe_path)])
         rules = entries_to_module_replacements(recipe.plan_overrides)
-        self.assertEqual(len(rules), 2)
+        self.assertEqual(len(rules), 3)
         plan = compile_module_replacements(model, rules)
         apply_module_replacements(model, plan, weights_mapping=[])
-        self.assertTrue(torch.equal(model.model.layers[0].self_attn.linear_qkv.weight,
-                                    torch.cat((original_q, original_kv))))
+        current_attention = model.model.layers[0].self_attn
+        self.assertIsInstance(current_attention, JTDeepseekV3FusedMLAAttention)
+        self.assertIs(current_attention.q_a_proj, original_q)
+        self.assertIs(current_attention.kv_a_proj_with_mqa, original_kv)
+        self.assertFalse(hasattr(current_attention, "linear_qkv"))
+        self.assertIsInstance(model.model.layers[1].mlp.experts, JTDeepseekV3FusedExperts)
+        self.assertIsInstance(model.mtp.layers[0].transformer_layer.mlp.experts, JTDeepseekV3FusedExperts)
         self.assertIsInstance(model.mtp.execution, JTDeepseekV3MTPExecution)
         self.assertEqual(dict(model.mtp.execution.named_parameters()), {})
         current = dict(model.named_modules())
-        self.assertEqual(sum(isinstance(m, JTDeepseekV3MLAAttention) for m in current.values()), 3)
+        self.assertEqual(sum(isinstance(m, JTDeepseekV3FusedMLAAttention) for m in current.values()), 3)
+        self.assertEqual(sum(isinstance(m, JTDeepseekV3FusedExperts) for m in current.values()), 2)
         for name in ["model.layers.0", "model.layers.1.mlp", "model.norm", "mtp.layers.0"]:
             self.assertIs(current[name], previous[name])
         self.assertIs(model.model.layers[0].self_attn.q_a_layernorm,
