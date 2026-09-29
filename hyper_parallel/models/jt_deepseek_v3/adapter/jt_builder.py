@@ -33,7 +33,7 @@ from transformers import DeepseekV32Config, PreTrainedModel
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, local_compute
 from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
-from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.models.build_options import FSDP2Config, get_device_id
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
     apply_model_infrastructure,
@@ -172,7 +172,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
 
     expected = _load_reference_state(model, arrays)
 
-    device = torch.device(mesh.device_mesh.device_type, torch.distributed.get_rank() % mesh.tp_size)
+    device = torch.device(mesh.device_mesh.device_type, get_device_id())
     model.to(device)
     model.loss_group = mesh.device_mesh["tp"].get_group()
     model = apply_model_infrastructure(
