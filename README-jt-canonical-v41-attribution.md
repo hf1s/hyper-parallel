@@ -62,6 +62,12 @@ B. Hyper Muon core 与 MindFormers Reference Muon update 实现的系统差异
 | [#41](https://github.com/hf1s/hyper-parallel/issues/41) | `experiment/jt-attention-latent-two-gemm` | `809c9a3d4471` | legacy-style split latent GEMMs | `-1.517e-3` | `-9.76e-5` | `-1.614e-3` |
 | [#50](https://github.com/hf1s/hyper-parallel/issues/50) | `experiment/jt-muon-ns-fp32-compare` | `5f9a754f` | FP32 internal NS experiment | `-3.015e-3` | `-2.570e-4` | `-3.272e-3` |
 | [#51](https://github.com/hf1s/hyper-parallel/issues/51) | `experiment/jt-muon-reference-scale` | `0865b2c7` | local logical-dimension scale A/B | `+5.109e-3` | `+4.226e-4` | `+5.530e-3` |
+| [#52](https://github.com/hf1s/hyper-parallel/issues/52) | `experiment/jt-hyper-muon-gather-trace` | `6623c0df` | gather/NS diagnostic only | unchanged |
+| [#53](https://github.com/hf1s/hyper-parallel/issues/53) | `experiment/jt-muon-ns-unbatched` | `eca1fee9` | unbatched NS A/B | unchanged |
+| [#54](https://github.com/hf1s/hyper-parallel/issues/54) | `experiment/jt-muon-ns-reference-arithmetic` | `6d0a1597` | functional NS arithmetic A/B | unchanged |
+| [#55](https://github.com/hf1s/hyper-parallel/issues/55) | `experiment/jt-muon-ns-reference-norm` | `ec27f8fc` | Reference 2D norm A/B | unchanged |
+| [#57](https://github.com/hf1s/hyper-parallel/issues/57) | `experiment/jt-muon-parameter-apply-trace` | `b94a44dc` | parameter apply diagnostic | unchanged |
+| [#58](https://github.com/hf1s/hyper-parallel/issues/58) | `experiment/jt-muon-final-attribution` | `8a21566a` | complete-stage diagnostic | unchanged |
 
 ### Interpretation
 
@@ -102,6 +108,12 @@ The final stable baseline is `86246c8b`.
 | `experiment/jt-hyper-muon-ns-local-trace` | `af547a85` | local-slice Hyper NS trace |
 | `experiment/jt-muon-ns-fp32-compare` | `5f9a754f` | FP32 internal NS A/B; rejected by #50 |
 | `experiment/jt-muon-reference-scale` | `0865b2c7` | Reference local logical-dimension scale A/B; rejected by #51 |
+| `experiment/jt-hyper-muon-gather-trace` | `6623c0df` | gather/NS diagnostic; no metric change |
+| `experiment/jt-muon-ns-unbatched` | `eca1fee9` | unbatched A/B; no metric change |
+| `experiment/jt-muon-ns-reference-arithmetic` | `6d0a1597` | functional NS arithmetic; no metric change |
+| `experiment/jt-muon-ns-reference-norm` | `ec27f8fc` | Reference 2D norm; no metric change |
+| `experiment/jt-muon-parameter-apply-trace` | `b94a44dc` | parameter apply trace; no metric change |
+| `experiment/jt-muon-final-attribution` | `8a21566a` | complete-stage trace; no metric change |
 
 ## 5. Diagnostic run index
 
@@ -119,6 +131,12 @@ The final stable baseline is `86246c8b`.
 | [#49](https://github.com/hf1s/hyper-parallel/issues/49) | `experiment/jt-hyper-muon-ns-local-trace` | `af547a85` | TP-local NS dump; valid shape comparison |
 | [#50](https://github.com/hf1s/hyper-parallel/issues/50) | `experiment/jt-muon-ns-fp32-compare` | `5f9a754f` | FP32 NS internal A/B; final LM delta `-3.015e-3`, rejected |
 | [#51](https://github.com/hf1s/hyper-parallel/issues/51) | `experiment/jt-muon-reference-scale` | `0865b2c7` | Reference-scale A/B flipped LM delta positive; rejected |
+| [#52](https://github.com/hf1s/hyper-parallel/issues/52) | `experiment/jt-hyper-muon-gather-trace` | `6623c0df` | gather trace; unchanged metrics |
+| [#53](https://github.com/hf1s/hyper-parallel/issues/53) | `experiment/jt-muon-ns-unbatched` | `eca1fee9` | unbatched NS; unchanged metrics |
+| [#54](https://github.com/hf1s/hyper-parallel/issues/54) | `experiment/jt-muon-ns-reference-arithmetic` | `6d0a1597` | functional NS arithmetic; unchanged metrics |
+| [#55](https://github.com/hf1s/hyper-parallel/issues/55) | `experiment/jt-muon-ns-reference-norm` | `ec27f8fc` | Reference norm; unchanged metrics |
+| [#57](https://github.com/hf1s/hyper-parallel/issues/57) | `experiment/jt-muon-parameter-apply-trace` | `b94a44dc` | apply trace; unchanged metrics |
+| [#58](https://github.com/hf1s/hyper-parallel/issues/58) | `experiment/jt-muon-final-attribution` | `8a21566a` | complete trace; unchanged metrics |
 
 ## 6. Reference-side diagnostics
 
@@ -217,9 +235,10 @@ Reference ns_output vs Hyper BF16 ns_output:
 ```
 
 This places the first clear divergence after the gradient and inside the Hyper
-Muon NS/update path. The FP32-internal-NS experiment [#50](https://github.com/hf1s/hyper-parallel/issues/50)
-did not improve the 10-step trajectory; the next candidate is local/global
-logical-shape scaling and shard/update ordering.
+did not improve the 10-step trajectory. The local-scale experiment [#51](https://github.com/hf1s/hyper-parallel/issues/51)
+flipped the LM delta positive; unbatched NS, Reference arithmetic, Reference norm, and
+parameter-apply traces [#53](https://github.com/hf1s/hyper-parallel/issues/53)–[#58](https://github.com/hf1s/hyper-parallel/issues/58)
+left metrics unchanged. No tested small NS/scale/apply patch is accepted.
 ## 8. Latest scale experiment
 
 ```text
