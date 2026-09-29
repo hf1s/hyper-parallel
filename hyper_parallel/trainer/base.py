@@ -625,15 +625,26 @@ class BaseTrainer(Stateful, ABC):
                 loss_inputs = self.preforward(loss_inputs)
             labels = loss_inputs.get("labels", micro_batch.get("labels"))
 
-            # A model-integrated loss can translate the public batch fields into
-            # model-family protocol arguments before the model forward starts.
-            prepare_model_inputs = getattr(
+            # Exactly one owner may translate public batch fields into the
+            # model-family protocol: the loss adapter or the model.
+            model_prepare_model_inputs = getattr(
+                self.model,
+                "prepare_model_inputs",
+                None,
+            )
+            loss_prepare_model_inputs = getattr(
                 self.loss_fn,
                 "prepare_model_inputs",
                 None,
             )
-            if callable(prepare_model_inputs):
-                micro_batch = prepare_model_inputs(micro_batch, loss_inputs)
+            if callable(model_prepare_model_inputs) and callable(loss_prepare_model_inputs):
+                raise ValueError(
+                    "Input adapter is defined on both loss_fn and model; define exactly one."
+                )
+            if callable(model_prepare_model_inputs):
+                micro_batch = model_prepare_model_inputs(micro_batch, loss_inputs)
+            elif callable(loss_prepare_model_inputs):
+                micro_batch = loss_prepare_model_inputs(micro_batch, loss_inputs)
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
             self.model_integration.record_batch(micro_batch, loss_inputs)

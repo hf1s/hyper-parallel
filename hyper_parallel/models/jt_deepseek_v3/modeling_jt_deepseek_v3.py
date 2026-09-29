@@ -615,6 +615,19 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.loss_group = None
         self.post_init()
 
+    def prepare_model_inputs(
+            self,
+            model_inputs: dict[str, Any],
+            loss_inputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge the public supervision fields into the JT forward contract."""
+        prepared = dict(model_inputs)
+        for name, value in loss_inputs.items():
+            if name in prepared and prepared[name] is not value:
+                raise ValueError(f"Conflicting model and loss input: {name}")
+            prepared[name] = value
+        return prepared
+
     def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None,
                 loss_mask: torch.Tensor | None = None, *, labels: torch.Tensor | None = None,
                 position_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None,

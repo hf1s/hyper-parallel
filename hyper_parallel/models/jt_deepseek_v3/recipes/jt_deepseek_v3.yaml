@@ -47,8 +47,6 @@ model:
   reference_weights: /path/to/jt_initial_weights
 loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
-  pass_loss_inputs: true
-  check_valid_labels: false
 model_init_dtype: float32
 plan_overrides:
   # The base model is executable; replacements select accelerated JT operators.
