@@ -61,6 +61,7 @@ B. Hyper Muon core 与 MindFormers Reference Muon update 实现的系统差异
 | [#38](https://github.com/hf1s/hyper-parallel/issues/38) | `experiment/jt-canonical-muon-expert-shape-corrected` | `f5deaeaa0572` | corrected expert orientation | same as #34 | same as #34 | same as #34 |
 | [#41](https://github.com/hf1s/hyper-parallel/issues/41) | `experiment/jt-attention-latent-two-gemm` | `809c9a3d4471` | legacy-style split latent GEMMs | `-1.517e-3` | `-9.76e-5` | `-1.614e-3` |
 | [#50](https://github.com/hf1s/hyper-parallel/issues/50) | `experiment/jt-muon-ns-fp32-compare` | `5f9a754f` | FP32 internal NS experiment | `-3.015e-3` | `-2.570e-4` | `-3.272e-3` |
+| [#51](https://github.com/hf1s/hyper-parallel/issues/51) | `experiment/jt-muon-reference-scale` | `0865b2c7` | local logical-dimension scale A/B | `+5.109e-3` | `+4.226e-4` | `+5.530e-3` |
 
 ### Interpretation
 
@@ -100,7 +101,7 @@ The final stable baseline is `86246c8b`.
 | `experiment/jt-hyper-muon-ns-trace` | `45ae7c67` | initial Hyper NS trace; global-shape dump, superseded |
 | `experiment/jt-hyper-muon-ns-local-trace` | `af547a85` | local-slice Hyper NS trace |
 | `experiment/jt-muon-ns-fp32-compare` | `5f9a754f` | FP32 internal NS A/B; rejected by #50 |
-| `experiment/jt-muon-reference-scale` | `0865b2c7` | Reference local logical-dimension scale A/B; pending validation |
+| `experiment/jt-muon-reference-scale` | `0865b2c7` | Reference local logical-dimension scale A/B; rejected by #51 |
 
 ## 5. Diagnostic run index
 
@@ -117,6 +118,7 @@ The final stable baseline is `86246c8b`.
 | [#48](https://github.com/hf1s/hyper-parallel/issues/48) | `experiment/jt-hyper-muon-ns-trace` | `45ae7c67` | initial global-shape NS dump; superseded |
 | [#49](https://github.com/hf1s/hyper-parallel/issues/49) | `experiment/jt-hyper-muon-ns-local-trace` | `af547a85` | TP-local NS dump; valid shape comparison |
 | [#50](https://github.com/hf1s/hyper-parallel/issues/50) | `experiment/jt-muon-ns-fp32-compare` | `5f9a754f` | FP32 NS internal A/B; final LM delta `-3.015e-3`, rejected |
+| [#51](https://github.com/hf1s/hyper-parallel/issues/51) | `experiment/jt-muon-reference-scale` | `0865b2c7` | Reference-scale A/B flipped LM delta positive; rejected |
 
 ## 6. Reference-side diagnostics
 
@@ -218,12 +220,13 @@ This places the first clear divergence after the gradient and inside the Hyper
 Muon NS/update path. The FP32-internal-NS experiment [#50](https://github.com/hf1s/hyper-parallel/issues/50)
 did not improve the 10-step trajectory; the next candidate is local/global
 logical-shape scaling and shard/update ordering.
-## 8. Current pending experiment
+## 8. Latest scale experiment
 
 ```text
 branch: experiment/jt-muon-reference-scale
 commit: 0865b2c7
 base: 86246c8b + diagnostic local-slice trace
+result: rejected; step 10 LM delta +5.109e-3, total delta +5.530e-3
 ```
 
 It enables the Reference-style local logical-dimension scale with:
