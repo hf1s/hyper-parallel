@@ -109,7 +109,8 @@ def zeropower_via_newtonschulz5(
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
 ) -> torch.Tensor:
     """Newton-Schulz orthogonalization with preallocated matmul buffers."""
-    mat_x = ns_inputs
+    original_dtype = ns_inputs.dtype
+    mat_x = ns_inputs.float()
     transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
     if transposed:
         mat_x = mat_x.mT
@@ -153,7 +154,7 @@ def zeropower_via_newtonschulz5(
     if transposed:
         mat_x = mat_x.mT
 
-    return mat_x
+    return mat_x.to(original_dtype)
 
 
 def compute_muon_slice_scale(
