@@ -832,10 +832,32 @@ class Muon(BaseDistributedOptimizer):
             ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
             ns_epsilon: float = 1e-10,
     ) -> List[torch.Tensor]:
-        """Run batched NS on mixed-shape tensors and restore their original shapes."""
+        """Run batched NS, or one independent NS call per logical tensor for A/B tracing."""
+        if os.getenv("JT_MUON_NS_UNBATCHED") == "1":
+            outputs = []
+            for tensor in tensor_list:
+                shape = tuple(tensor.shape)
+                dim_a, dim_b = shape[-2:]
+                if len(shape) == 2:
+                    output = zeropower_via_newtonschulz5(
+                        tensor, ns_steps, ns_variant, ns_epsilon, ns_coefficients)
+                elif len(shape) == 3 and shape[1] == 1:
+                    output = zeropower_via_newtonschulz5(
+                        tensor.squeeze(1).unsqueeze(0),
+                        ns_steps, ns_variant, ns_epsilon, ns_coefficients,
+                    ).squeeze(0).unsqueeze(1)
+                elif len(shape) == 3:
+                    output = zeropower_via_newtonschulz5(
+                        tensor, ns_steps, ns_variant, ns_epsilon, ns_coefficients)
+                else:
+                    output = zeropower_via_newtonschulz5(
+                        tensor.reshape(-1, dim_a, dim_b),
+                        ns_steps, ns_variant, ns_epsilon, ns_coefficients,
+                    ).reshape(shape)
+                outputs.append(output)
+            return outputs
         if not tensor_list:
             return []
-
         inputs_3d = []
         slice_sizes = []
         shapes_info = []
