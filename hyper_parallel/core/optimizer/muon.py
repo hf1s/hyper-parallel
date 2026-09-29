@@ -114,8 +114,11 @@ def zeropower_via_newtonschulz5(
     if transposed:
         mat_x = mat_x.mT
 
-    # Normalize input before Newton-Schulz iteration.
-    mat_x = mat_x / (mat_x.norm(dim=(-2, -1), keepdim=True) + epsilon)
+    # Match Reference: scalar Frobenius norm for 2D, per-matrix norm for batched NS.
+    if mat_x.ndim == 2:
+        mat_x = mat_x / (mat_x.norm() + epsilon)
+    else:
+        mat_x = mat_x / (mat_x.norm(dim=(-2, -1), keepdim=True) + epsilon)
 
     n_size = mat_x.size(-2)
     buf_a = torch.empty(mat_x.shape[:-2] + (n_size, n_size), dtype=mat_x.dtype, device=mat_x.device)
