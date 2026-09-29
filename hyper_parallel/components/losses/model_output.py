@@ -14,7 +14,6 @@
 # ============================================================================
 """Loss module that reads the loss produced by a model."""
 
-
 from typing import Any, Dict, Optional, Union
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
@@ -26,7 +25,6 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 
 class ModelOutputLoss(torch.nn.Module):
     """Return the loss field from a Transformers-style model output."""
-
 
     def forward(  # pylint: disable=unused-argument
         self,
