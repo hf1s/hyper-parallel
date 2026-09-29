@@ -241,9 +241,10 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         """
         if past_key_values is not None or position_embeddings is None:
             raise ValueError("Reference MLA requires explicit positions and no KV cache")
-        weight = self.linear_qkv.weight
-        query_local = F.linear(hidden_states, weight[:self.q_lora_rank])
-        kv_local = F.linear(hidden_states, weight[self.q_lora_rank:])
+        latent_states = F.linear(hidden_states, self.linear_qkv.weight)
+        query_local, kv_local = latent_states.split(
+            (self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim), dim=-1
+        )
         kv_local, rope_local = kv_local.split((self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
         query_latent = self.q_a_layernorm(query_local)
         kv_latent = self.kv_a_layernorm(kv_local)
