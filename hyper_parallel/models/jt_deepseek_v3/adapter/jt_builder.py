@@ -128,10 +128,6 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
     config = DeepseekV32Config(**config)
     setup = _with_model_ep_overrides(distributed_setup, config)
     mesh = setup.mesh_context
-    if (mesh.tp_size, mesh.ep_size, mesh.cp_size, mesh.dp_size, mesh.pp_size) != (8, 8, 1, 1, 1):
-        raise ValueError("JT recipe requires TP8/EP8 and DP/CP/PP1")
-    if not mesh.sequence_parallel or not mesh.loss_parallel:
-        raise ValueError("JT recipe requires sequence_parallel and loss_parallel")
     # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
     framework_setup = replace(
         setup, module_replacements=(), strategy_config=setup.strategy_config or FSDP2Config(),
