@@ -19,7 +19,6 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from torch import nn
 from transformers import DeepseekV32Config
 
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
@@ -27,12 +26,11 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
 )
 from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiTokenPredictionLayer
-from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp import JTDeepseekV3MTPExecution
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 from tests.common.mark_utils import arg_mark
 
 
@@ -72,15 +70,13 @@ class TestCompleteModel(unittest.TestCase):
         self.assertIs(type(model.mtp.execution), DeepseekV3MTPExecution)
         tokens = torch.arange(8).unsqueeze(0)
         output = model(tokens, (tokens + 1) % 32, torch.ones(1, 8))
-        self.assertTrue(torch.isfinite(output.loss))
-        metrics = model.get_logging_metrics()
-        self.assertEqual(set(metrics), {"training/lm_loss", "training/mtp_loss", "training/aux_loss",
-                                       "training/load_balancing_loss"})
-        combined = (metrics["training/lm_loss"] + metrics["training/aux_loss"]) + metrics["training/mtp_loss"]
-        self.assertTrue(torch.equal(output.loss.detach(), combined))
-        self.assertTrue(all(not value.requires_grad for value in metrics.values()))
-        self.assertEqual(model.get_logging_metrics(), {})
-        output.loss.backward()
+        self.assertEqual(
+            set(output.loss),
+            {"foundation/lm_loss", "foundation/mtp_loss", "foundation/aux_loss"},
+        )
+        total_loss = sum(output.loss.values())
+        self.assertTrue(torch.isfinite(total_loss))
+        total_loss.backward()
         for name in ["model.embed_tokens.weight", "model.layers.1.mlp.gate.weight", "mtp.layers.0.eh_proj.weight"]:
             gradient = dict(model.named_parameters())[name].grad
             self.assertIsNotNone(gradient)
@@ -88,11 +84,11 @@ class TestCompleteModel(unittest.TestCase):
             self.assertGreater(gradient.abs().sum().item(), 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_replacement_selects_attention_and_mtp_execution(self):
+    def test_replacement_selects_attention(self):
         """Feature: Acceleration boundary.
 
-        Description: Apply the optional high-performance replacement to a complete model.
-        Expectation: Attention and MTP execution change; decoder, MLP, norm and MTP weights survive.
+        Description: Apply the optional high-performance attention replacement.
+        Expectation: Attention changes while decoder, MLP, norm and MTP weights survive.
         """
         model = JTDeepseekV3ForCausalLM(small_config())
         previous = dict(model.named_modules())
@@ -103,13 +99,11 @@ class TestCompleteModel(unittest.TestCase):
             "hyper_parallel/models/jt_deepseek_v3/recipes/jt_deepseek_v3.yaml")
         recipe = parse_training_args([str(recipe_path)])
         rules = entries_to_module_replacements(recipe.plan_overrides)
-        self.assertEqual(len(rules), 2)
+        self.assertEqual(len(rules), 1)
         plan = compile_module_replacements(model, rules)
         apply_module_replacements(model, plan, weights_mapping=[])
         self.assertTrue(torch.equal(model.model.layers[0].self_attn.linear_qkv.weight,
                                     torch.cat((original_q, original_kv))))
-        self.assertIsInstance(model.mtp.execution, JTDeepseekV3MTPExecution)
-        self.assertEqual(dict(model.mtp.execution.named_parameters()), {})
         current = dict(model.named_modules())
         self.assertEqual(sum(isinstance(m, JTDeepseekV3MLAAttention) for m in current.values()), 3)
         for name in ["model.layers.0", "model.layers.1.mlp", "model.norm", "mtp.layers.0"]:
@@ -117,24 +111,6 @@ class TestCompleteModel(unittest.TestCase):
         self.assertIs(model.model.layers[0].self_attn.q_a_layernorm,
                       previous["model.layers.0.self_attn.q_a_layernorm"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_specialized_mtp_rounds_only_its_fusion(self):
-        """Feature: Specialized MTP.
-
-        Description: Use rounding-sensitive states and independent identity components.
-        Expectation: BF16 hidden-then-embedding fusion and both input gradients are preserved.
-        """
-        layer = MultiTokenPredictionLayer(embedding_norm=nn.Identity(), hidden_norm=nn.Identity(),
-                                      projection=nn.Identity(), decoder=nn.Identity(), output_norm=nn.Identity())
-        hidden = torch.tensor([[[1.001, 2.003]]], requires_grad=True)
-        embedding = torch.tensor([[[3.005, 4.007]]], requires_grad=True)
-        execution = JTDeepseekV3MTPExecution(module=DeepseekV3MTPExecution())
-        result = execution.fuse_inputs(layer, hidden, embedding)
-        self.assertEqual(result.dtype, torch.bfloat16)
-        self.assertTrue(torch.equal(result, torch.cat((hidden.bfloat16(), embedding.bfloat16()), dim=-1)))
-        result.float().sum().backward()
-        self.assertTrue(torch.equal(hidden.grad, torch.ones_like(hidden)))
-        self.assertTrue(torch.equal(embedding.grad, torch.ones_like(embedding)))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_replacement_loads_converted_reference_state(self):
@@ -198,26 +174,6 @@ class TestCompleteModel(unittest.TestCase):
         self.assertEqual(restored.rope_parameters["rope_theta"], 5000000)
         self.assertIs(get_model_adapter(restored.architectures[0]), get_model_adapter("jt_deepseek_v3"))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_aux_monitor_uses_trunk_moe_count_and_handles_zero_scale(self):
-        """Feature: JT monitoring semantics.
-
-        Description: Use two trunk routers and a separate MTP router, then disable auxiliary loss.
-        Expectation: The monitor averages by two trunk layers; zero scale produces a finite zero.
-        """
-        config = small_config()
-        config.mlp_layer_types = ["sparse", "sparse"]
-        model = JTDeepseekV3ForCausalLM(config)
-        model._step_loss_metrics = torch.tensor([2.0, 0.3, 0.06])
-        model._metric_micro_batches = 1
-        metrics = model.get_logging_metrics()
-        torch.testing.assert_close(metrics["training/load_balancing_loss"], torch.tensor(3.0))
-        self.assertEqual(model.get_logging_metrics(), {})
-        config.moe_aux_loss_coeff = 0.0
-        model = JTDeepseekV3ForCausalLM(config)
-        model._step_loss_metrics = torch.tensor([2.0, 0.3, 0.0])
-        model._metric_micro_batches = 1
-        self.assertEqual(model.get_logging_metrics()["training/load_balancing_loss"].item(), 0.0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_public_batch_fields_reach_model_without_mapping(self):

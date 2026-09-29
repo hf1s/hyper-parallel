@@ -37,8 +37,8 @@ def mean_global_loss(
 
     FSDP divides gradients over its flattened DP+CP domain, so each local loss
     is weighted by valid tokens and multiplied by ``dp_size * cp_size``.
-    Loss keys are returned unchanged; named loss values use the shared
-    trainer token-weighting path.
+    Named loss keys remain output names. Legacy ``*_loss`` prefixes select
+    token counts when the corresponding token domain exists.
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
@@ -48,6 +48,7 @@ def mean_global_loss(
 
     Returns:
         Token-weighted loss tensors keyed by loss name.
+
     Raises:
         ValueError: If sequence parallelism is enabled without a TP device mesh.
     """
@@ -66,7 +67,14 @@ def mean_global_loss(
     if isinstance(losses, torch.Tensor):  # text loss only
         losses = {"foundation_loss": losses}
     for key, cur_loss in losses.items():
-        loss_name = "foundation"
+        token_domain, separator, _ = key.partition("/")
+        legacy_domain = key.split("_loss", maxsplit=1)[0]
+        if separator and token_domain and f"{token_domain}_tokens" in current_token_counts:
+            loss_name = token_domain
+        else:
+            loss_name = legacy_domain
+        if f"{loss_name}_tokens" not in current_token_counts:
+            loss_name = "foundation"
 
         cur_token_len = current_token_counts[f"{loss_name}_tokens"]
         if sequence_parallel:
