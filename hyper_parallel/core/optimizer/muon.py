@@ -16,6 +16,8 @@
 """Muon optimizer with HSDP shard-group-aware communication."""
 
 import math
+import os
+from pathlib import Path
 from collections.abc import Callable, Iterable
 from collections import defaultdict
 from dataclasses import dataclass
@@ -41,6 +43,30 @@ from hyper_parallel.core.optimizer.muon_shard import (
 )
 
 logger = logging.getLogger(__name__)
+def _dump_muon_gather_trace(
+        parameter_name: str,
+        stage: str,
+        tensor: torch.Tensor,
+) -> None:
+    """Persist one first-step gather/NS tensor when tracing is enabled."""
+    trace_dir = os.getenv("JT_MUON_GATHER_TRACE_DIR")
+    if not trace_dir:
+        return
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    rank_dir = Path(trace_dir) / f"rank_{rank}"
+    safe_name = parameter_name.replace("/", "_")
+    path = rank_dir / f"{safe_name}__{stage}.pt"
+    if path.exists():
+        return
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "parameter_name": parameter_name,
+            "stage": stage,
+            "tensor": tensor.detach().cpu(),
+        },
+        path,
+    )
 
 # Legacy: single-coefficient quintic NS (Keller Jordan / Moonlight).
 # Same (a, b, c) applied every step; typically 5 steps.
@@ -603,6 +629,12 @@ class Muon(BaseDistributedOptimizer):
             buffer_cache=buffer_cache,
             keep_indices=my_indices,
         )
+        if os.getenv("JT_MUON_GATHER_TRACE_DIR"):
+            for index, (p, full_inp) in enumerate(zip(valid_params, gathered_list)):
+                if id(p) in my_param_ids and full_inp is not None:
+                    name = getattr(p, "model_name", repr(p))
+                    _dump_muon_gather_trace(name, "before_gather", local_inputs[index])
+                    _dump_muon_gather_trace(name, "after_gather", full_inp)
         for p, full_inp in zip(valid_params, gathered_list):
             if id(p) in my_param_ids:
                 gathered_inputs[p] = full_inp
@@ -926,6 +958,7 @@ class Muon(BaseDistributedOptimizer):
         reshape_groups: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
         origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
         working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
+        trace_owners: Dict[int, torch.nn.Parameter] = {}
 
         for param in p_list:
             local_shape = getattr(param, "local_shape", None)
@@ -939,6 +972,7 @@ class Muon(BaseDistributedOptimizer):
             for reshaped_input in reshaped_inputs:
                 core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
                 reshape_groups[core_shape].append(reshaped_input)
+                trace_owners[id(reshaped_input)] = param
 
         for tensor_list in reshape_groups.values():
             reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
@@ -949,6 +983,12 @@ class Muon(BaseDistributedOptimizer):
                 ns_epsilon=group["ns_epsilon"],
             )
             for reshaped_input, reshaped_update in zip(tensor_list, reshaped_updates):
+                if os.getenv("JT_MUON_GATHER_TRACE_DIR"):
+                    _dump_muon_gather_trace(
+                        getattr(trace_owners[id(reshaped_input)], "model_name", repr(reshaped_input)),
+                        "ns_output_global",
+                        reshaped_update,
+                    )
                 slice_scale = compute_muon_slice_scale(
                     reshaped_update,
                     group["matched_adamw_rms"],
