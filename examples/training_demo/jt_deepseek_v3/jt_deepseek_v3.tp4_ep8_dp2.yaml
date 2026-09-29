@@ -1,5 +1,5 @@
-# JT DeepSeek V3: 8-rank TP2 / EP8 / DP4 probe.
-# Keep CP and PP disabled; global batch follows DP4.
+# JT DeepSeek V3: 8-rank TP4 / EP8 / DP2 probe.
+# Keep CP and PP disabled; global batch follows DP2.
 model:
   _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_model
   config:
@@ -46,8 +46,6 @@ model:
   reference_weights: /path/to/jt_initial_weights
 loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
-  pass_loss_inputs: true
-  check_valid_labels: false
 model_init_dtype: float32
 plan_overrides:
   - match:
@@ -111,14 +109,14 @@ training:
   train_iters: 10
   lr_scheduler_iters: 8
   max_grad_norm: 1.0
-  global_batch_size: 4
+  global_batch_size: 2
   micro_batch_size: 1
   backend: hccl
   init_device: cpu
   seed: 42
   enable_full_determinism: false
 accelerator:
-  tp_size: 2
+  tp_size: 4
   ep_size: 8
   cp_size: 1
   pp_size: 1

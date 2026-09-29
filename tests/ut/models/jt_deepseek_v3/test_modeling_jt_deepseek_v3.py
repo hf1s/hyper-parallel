@@ -96,7 +96,7 @@ class TestCompleteModel(unittest.TestCase):
         original_q = model.model.layers[0].self_attn.q_a_proj.weight.detach().clone()
         original_kv = model.model.layers[0].self_attn.kv_a_proj_with_mqa.weight.detach().clone()
         recipe_path = Path(__file__).resolve().parents[4] / (
-            "hyper_parallel/models/jt_deepseek_v3/recipes/jt_deepseek_v3.yaml")
+            "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")
         recipe = parse_training_args([str(recipe_path)])
         rules = entries_to_module_replacements(recipe.plan_overrides)
         self.assertEqual(len(rules), 1)
@@ -121,7 +121,7 @@ class TestCompleteModel(unittest.TestCase):
         """
         config = small_config()
         recipe_path = Path(__file__).resolve().parents[4] / (
-            "hyper_parallel/models/jt_deepseek_v3/recipes/jt_deepseek_v3.yaml")
+            "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")
         rules = entries_to_module_replacements(parse_training_args([str(recipe_path)]).plan_overrides)
         with torch.device("meta"):
             candidate = JTDeepseekV3ForCausalLM(config)
@@ -156,7 +156,7 @@ class TestCompleteModel(unittest.TestCase):
         Expectation: Model dimensions, JT options and independent adapter identity survive.
         """
         recipe_path = Path(__file__).resolve().parents[4] / (
-            "hyper_parallel/models/jt_deepseek_v3/recipes/jt_deepseek_v3.yaml")
+            "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")
         recipe = parse_training_args([str(recipe_path)])
         config = DeepseekV32Config(**recipe.model.config)
         self.assertIs(type(config), DeepseekV32Config)

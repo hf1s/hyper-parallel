@@ -1,5 +1,5 @@
-# Run the configured JT model through the standard Trainer training loop.
-# Model fields are native HF/JT options; reference weights are converted offline.
+# JT DeepSeek V3: 8-rank TP2 / EP8 / DP4 probe.
+# Keep CP and PP disabled; global batch follows DP4.
 model:
   _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_model
   config:
@@ -37,7 +37,6 @@ model:
     use_cache: false
     attention_bias: false
     mlp_bias: false
-    # Model-owned MTP and routing options, not a foreign configuration document.
     num_nextn_predict_layers: 1
     mtp_loss_factor: 0.3
     use_pad_tokens: true
@@ -47,11 +46,8 @@ model:
   reference_weights: /path/to/jt_initial_weights
 loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
-  pass_loss_inputs: true
-  check_valid_labels: false
 model_init_dtype: float32
 plan_overrides:
-  # The base model is executable; replacements select accelerated JT operators.
   - match:
       - "model.layers.*.self_attn"
       - "mtp.layers.*.transformer_layer.self_attn"
@@ -113,15 +109,14 @@ training:
   train_iters: 10
   lr_scheduler_iters: 8
   max_grad_norm: 1.0
-  global_batch_size: 1
+  global_batch_size: 4
   micro_batch_size: 1
   backend: hccl
   init_device: cpu
   seed: 42
-  # The configured model adapter retains the NPU execution policy.
   enable_full_determinism: false
 accelerator:
-  tp_size: 8
+  tp_size: 2
   ep_size: 8
   cp_size: 1
   pp_size: 1

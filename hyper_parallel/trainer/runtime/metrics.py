@@ -34,10 +34,10 @@ def mean_global_loss(
 ) -> dict[str, torch.Tensor]:
     """Calculate the global mean loss using explicit mesh information.
 
-    FSDP divides gradients over its flattened DP+CP domain, so each local loss
-    is weighted by valid tokens and multiplied by ``dp_size * cp_size``.
-    Named loss keys remain output names. Legacy ``*_loss`` prefixes select
-    token counts when the corresponding token domain exists.
+    Named loss keys remain output names. Keys in ``<token-domain>/<name>``
+    format use the token domain before ``/``; legacy ``*_loss`` keys use
+    the prefix before ``_loss``.
+
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
@@ -66,21 +66,17 @@ def mean_global_loss(
     if isinstance(losses, torch.Tensor):  # text loss only
         losses = {"foundation_loss": losses}
     for key, cur_loss in losses.items():
-        token_domain, separator, _ = key.partition("/")
-        legacy_domain = key.split("_loss", maxsplit=1)[0]
-        if separator and token_domain and f"{token_domain}_tokens" in current_token_counts:
-            loss_name = token_domain
+        if "/" in key:
+            token_domain = key.split("/", maxsplit=1)[0]
         else:
-            loss_name = legacy_domain
-        if f"{loss_name}_tokens" not in current_token_counts:
-            loss_name = "foundation"
+            token_domain = key.split("_loss", maxsplit=1)[0]
+        cur_token_len = current_token_counts[f"{token_domain}_tokens"]
 
-        cur_token_len = current_token_counts[f"{loss_name}_tokens"]
         if sequence_parallel:
             cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
 
         all_reduced_len = all_reduce(
-            step_token_counts[f"{loss_name}_tokens"].item(),
+            step_token_counts[f"{token_domain}_tokens"].item(),
             op="sum",
             group=dp_cp_group,
         )
