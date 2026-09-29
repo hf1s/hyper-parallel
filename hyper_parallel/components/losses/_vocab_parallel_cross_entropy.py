@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
+# pylint: disable=forbidden-backend-import
 import torch
 import torch.distributed.nn.functional as dist_func
 from torch import Tensor
@@ -391,6 +392,10 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
         ctx.save_for_backward(
             log_probs_local, target, weight, total_weight, nll_result[2], nll_result[3]
         )
+        if reduction == "none":
+            return _differentiable_all_reduce(
+                loss, op="sum", group=mesh.get_group(mesh_dim)
+            )
         if reduction == "mean":
             if total_weight.item() == 0:
                 return torch.tensor(float('nan'), dtype=loss.dtype, device=loss.device)
