@@ -19,7 +19,6 @@ from functools import partial
 from typing import Any
 
 import torch
-import torch.distributed as dist
 
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.mla_attention import (
@@ -28,8 +27,8 @@ from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.mla_attention impo
 
 
 @torch.no_grad()
-def clip_qk(model: torch.nn.Module, threshold: float) -> dict[str, torch.Tensor]:
-    """Clip coupled query/key projections and return detached global maxima.
+def clip_qk(model: torch.nn.Module, threshold: float) -> None:
+    """Clip coupled query/key projections after each optimizer update.
 
     Args:
         model: JT model with MLA statistics.
@@ -40,9 +39,6 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> dict[str, torch.Tensor]
         if not isinstance(module, JTDeepseekV3FusedMLAAttention):
             continue
         maximum = module.max_logits_val
-        observed = maximum.detach().amax().clone()
-        dist.all_reduce(observed, op=dist.ReduceOp.MAX, group=model.loss_group)
-        metrics[f"optimizer/qkclip_maxlogits/{name}"] = observed
         scale = threshold / maximum.clamp_min(threshold)
         query = module.q_b_proj.weight.view(
             module.num_heads, module.qk_nope_head_dim + module.qk_rope_head_dim, -1)
@@ -51,9 +47,7 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> dict[str, torch.Tensor]
         key_value = module.kv_b_proj.weight.view(module.num_heads, module.qk_nope_head_dim + module.v_head_dim, -1)
         key_value[:, :module.qk_nope_head_dim].mul_(scale.sqrt()[:, None, None])
         maximum.zero_()
-    if metrics:
-        metrics["optimizer/qkclip_maxlogits"] = torch.stack(list(metrics.values())).amax()
-    return metrics
+
 
 
 
@@ -61,7 +55,7 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> dict[str, torch.Tensor]
 def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
     """Apply model-owned updates after all public optimizer leaves complete."""
     del optimizer, args, kwargs
-    model.jt_optimizer_metrics = clip_qk(model, threshold)
+    clip_qk(model, threshold)
     config = model.config
     if config.moe_router_enable_expert_bias:
         for module in model.modules():
@@ -71,11 +65,6 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
                 module.expert_load.zero_()
 
 
-def _take_metrics(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Return QK clipping metrics collected after the previous optimizer step."""
-    result = model.jt_optimizer_metrics
-    model.jt_optimizer_metrics = {}
-    return result
 
 
 def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
@@ -97,6 +86,4 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     })
     optimizer = builder.get_optimizer()
     optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
-    model.jt_optimizer_metrics = {}
-    optimizer.get_logging_metrics = partial(_take_metrics, model)
     return builder
