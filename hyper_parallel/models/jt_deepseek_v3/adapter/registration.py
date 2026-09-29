@@ -21,11 +21,9 @@ from hyper_parallel.models.registry import register_custom_model, register_model
 
 def _load_expert_parallel():
     """Return JT's expert-parallel provider lazily."""
-    from hyper_parallel.models.jt_deepseek_v3.adapter.distributed import (  # pylint: disable=C0415
-        expert_parallel,
-    )
+    from hyper_parallel.models.jt_deepseek_v3.adapter import jt_builder
 
-    return expert_parallel
+    return jt_builder
 
 JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="JTDeepseekV3ForCausalLM",

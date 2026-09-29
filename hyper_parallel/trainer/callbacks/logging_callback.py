@@ -19,6 +19,7 @@ from typing import Any
 
 from .base import Callback, TrainerState
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,7 +64,6 @@ class LoggingCallback(Callback):
         if callable(tqdm_write) and tqdm_write(message):
             return
         logger.info("%s", message)
-
 
     def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
         """Log all shared environment metrics at the configured cadence."""

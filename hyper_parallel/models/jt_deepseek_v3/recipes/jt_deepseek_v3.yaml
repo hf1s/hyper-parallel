@@ -51,7 +51,7 @@ loss_fn:
   check_valid_labels: false
 model_init_dtype: float32
 plan_overrides:
-  # The base model is executable; replacements select acceleration and JT MTP precision.
+  # The base model is executable; replacements select accelerated JT operators.
   - match:
       - "model.layers.*.self_attn"
       - "mtp.layers.*.transformer_layer.self_attn"
@@ -59,11 +59,6 @@ plan_overrides:
     exact_type: true
     replace_module:
       _target_: hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.JTDeepseekV3MLAAttention
-  - match: "mtp.execution"
-    module_type: hyper_parallel.components.modules.mtp.DeepseekV3MTPExecution
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp.JTDeepseekV3MTPExecution
   - match: "*.self_attn"
     params:
       linear_qkv.weight: {tp: replicate}
@@ -113,7 +108,7 @@ plan_overrides:
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.expert_parallel.build_jt_ep
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_ep
 training:
   train_iters: 10
   lr_scheduler_iters: 8

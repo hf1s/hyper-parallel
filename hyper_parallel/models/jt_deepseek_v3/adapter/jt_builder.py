@@ -19,10 +19,11 @@
 
 from __future__ import annotations
 
+from functools import partial
 from dataclasses import replace
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -31,6 +32,7 @@ from transformers import DeepseekV32Config, PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, local_compute
+from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
@@ -41,7 +43,28 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
-from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.expert_parallel import build_jt_ep
+
+
+@local_compute
+def build_jt_ep(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """Bind public EP execution using the JT model routing contract."""
+    del mesh, tp_mesh, cp_mesh
+    if ep_mesh is None:
+        raise ValueError("JT requires an EP mesh")
+    module.ep_group = ep_mesh.get_group("ep")
+    module.ep_world = ep_mesh["ep"].size()
+    executor = build_ep_compute(
+        module,
+        ep_mesh,
+        router_fn=type(module).route,
+        archetype_key="jt_deepseek_v3_hf",
+        expected_attrs=["gate", "experts", "shared_experts", "config"],
+        combine=module.combine_routed,
+        use_grouped_gemm=True,
+    )
+    module.ep_compute = partial(executor, module)
+    return type(module).forward
+
 
 def _configured_moe_fqns(config: DeepseekV32Config) -> tuple[str, ...]:
     """Return the configured routed-MoE parents, excluding dense trunk layers."""
