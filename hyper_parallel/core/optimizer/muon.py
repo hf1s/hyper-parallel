@@ -117,10 +117,6 @@ def zeropower_via_newtonschulz5(
     # Normalize input before Newton-Schulz iteration.
     mat_x = mat_x / (mat_x.norm(dim=(-2, -1), keepdim=True) + epsilon)
 
-    n_size = mat_x.size(-2)
-    buf_a = torch.empty(mat_x.shape[:-2] + (n_size, n_size), dtype=mat_x.dtype, device=mat_x.device)
-    buf_b = torch.empty_like(buf_a)
-    buf_c = torch.empty(mat_x.shape, dtype=mat_x.dtype, device=mat_x.device)
 
     if ns_variant == "legacy":
         step_coeffs = [_NS_LEGACY_COEFFS] * steps
@@ -140,15 +136,10 @@ def zeropower_via_newtonschulz5(
         )
 
     for coeff_a, coeff_b, coeff_c in step_coeffs:
-        torch.matmul(mat_x, mat_x.mT, out=buf_a)
-        torch.matmul(buf_a, buf_a, out=buf_b)
-        buf_a.mul_(coeff_b)
-        buf_b.mul_(coeff_c)
-        buf_a.add_(buf_b)
-        torch.matmul(buf_a, mat_x, out=buf_c)
-        mat_x.mul_(coeff_a).add_(buf_c)
+        a_mat = torch.matmul(mat_x, mat_x.mT)
+        b_mat = coeff_b * a_mat + coeff_c * torch.matmul(a_mat, a_mat)
+        mat_x = coeff_a * mat_x + torch.matmul(b_mat, mat_x)
 
-    del buf_a, buf_b, buf_c
 
     if transposed:
         mat_x = mat_x.mT
