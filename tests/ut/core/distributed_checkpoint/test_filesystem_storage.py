@@ -26,10 +26,7 @@ from unittest.mock import Mock, patch
 import torch
 from safetensors import safe_open
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.filesystem_storage as fs_mod
 import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mod
@@ -67,7 +64,7 @@ from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import RaggedShard
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 class _FakeBatcher:
@@ -108,8 +105,6 @@ class TestFilesystemStorage(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the storage module against the torch platform before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         importlib.reload(fs_mod)
         planner_mod.StandardSavePlanner.cached_save_result.clear()

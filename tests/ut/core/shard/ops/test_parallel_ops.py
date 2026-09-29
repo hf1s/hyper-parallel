@@ -23,7 +23,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor, _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 def _make_mesh(mock_dist, mesh_shape, mesh_dim_names):

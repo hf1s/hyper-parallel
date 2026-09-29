@@ -23,7 +23,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
 from hyper_parallel.core.dtensor.dtensor import _LAYOUT_CACHE, _build_layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.shard.ops.parallel_unbind import UnbindDistributedOp
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 op = UnbindDistributedOp("unbind")
 

@@ -14,6 +14,8 @@
 # limitations under the License.
 """CheckpointerCallback --- save/restore policy on top of a Checkpointer."""
 
+__all__ = ["CheckpointerCallback"]
+
 import os
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -473,6 +475,3 @@ class CheckpointerCallback(Callback):
         steps_per_epoch = self._steps_per_epoch()
         trainer.start_epoch = trainer.state.global_step // steps_per_epoch
         trainer.start_step = trainer.state.global_step % steps_per_epoch
-
-
-__all__ = ["CheckpointerCallback"]

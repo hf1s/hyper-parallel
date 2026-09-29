@@ -36,7 +36,7 @@ from hyper_parallel.core.distributed_checkpoint.utils import (
     logger,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 def copy_each(dests: list, srcs: list) -> None:

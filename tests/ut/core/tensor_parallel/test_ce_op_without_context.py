@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 
 class TestCEOpWithoutLossParallelContext:
@@ -30,7 +29,7 @@ class TestCEOpWithoutLossParallelContext:
     def _mock_dist_backend(self):
         """Set up mock distributed backend for each test."""
         from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
-        from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+        from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
         mock_utils = MagicMock()
@@ -174,7 +173,7 @@ class TestCEOpCheckLogic:
     def _mock_dist_backend(self):
         """Set up mock distributed backend for each test."""
         from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
-        from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+        from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
         mock_utils = MagicMock()

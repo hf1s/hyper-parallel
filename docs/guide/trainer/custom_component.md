@@ -1,6 +1,6 @@
-# AutoModels 二次开发指南
+# 二次开发指南
 
-AutoModels 将 YAML 解析为 `TrainerConfig`，再由任务 Trainer 构建运行对象。`Target` 和 CLI dotted override 的解析规则见 [YAML Trainer 配置结构](yaml_config.md)。
+HyperParallel 模型训练将 YAML 解析为 `TrainerConfig`，再由任务 Trainer 构建运行对象。`Target` 和 CLI dotted override 的解析规则见 [YAML Trainer 配置结构](yaml_config.md)。
 
 ## 扩展入口
 
@@ -53,10 +53,11 @@ YAML 解析结果为 `list[PlanOverride]`；Trainer 侧先归一化为替换规�
 
 完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82)。
 
-模型族自带的替换工厂、运行时合约、CP wrapper 和 EP compute 工厂收敛在该族的
-`models/<family>/adapter/` 下（Qwen3-MoE 分别位于 `adapter/conversion/`、`adapter/runtime/` 和
-`adapter/distributed/`），在 YAML 中通过 `_target_` 直接引用，唯一训练入口为
-`models/<family>/recipes/train.yaml`。
+模型族 adapter 按职责统一划分：模块/权重转换位于 `adapter/conversion/`，数据编码、processor、
+transform 和 runtime-input 位于 `adapter/data/`，模型前向合约位于 `adapter/runtime/`，CP/EP
+实现位于 `adapter/distributed/`，并行与重计算策略位于 `adapter/policies/`，验收声明位于
+`adapter/validation/`。没有对应职责的模型无需创建空目录。YAML 通过 `_target_` 直接引用具体实现，
+唯一训练入口为 `models/<family>/recipes/train.yaml`。
 
 ## 3. 接入新的组件实现
 
@@ -168,7 +169,7 @@ optimizer:
 | `lr_scheduler` | [`BaseTrainer._build_lr_scheduler()`](../../../hyper_parallel/trainer/base.py#L415-L422) | `optimizer`、`train_iters` |
 | `loss_fn` | [`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) | 构建时无；可选生命周期接收模型、并行配置和 loss inputs |
 
-其他组件的配置与教程见 [AutoModels README](../../../hyper_parallel/models/README.md)。
+其他组件的配置与教程见 [HyperParallel 模型训练](../../../hyper_parallel/models/README.md)。
 
 ## 4. 新增任务 Trainer
 

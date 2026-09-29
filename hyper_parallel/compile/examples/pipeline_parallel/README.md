@@ -33,7 +33,8 @@ per-rank stage slices: fwd_gm + bwd_gm  ── boundary act/grad via isend/irecv
 ScheduleGPipe installed as a call_module node in the graph stub
         │
         ▼
-GraphTrainer runs graph_module(*state, input, label) unchanged
+GraphTrainer runs graph_module(*state, *inputs) unchanged; user inputs are
+routed by dataflow to the stage that consumes them (no arity constraint)
 ```
 
 1. **Node → stage attribution** — every FX node is mapped to a stage via
@@ -71,8 +72,8 @@ pp:
     - [layers.2, layers.3, norm, lm_head]
 ```
 
-Both come from `PassPlan.pp_stage(stage_idx, fqns)` /
-`create_pass_plan_from_yaml`.
+Both come from `GraphParallelPlan.pp_stage(stage_idx, fqns)` /
+`create_plan_from_yaml`.
 
 ## Configuration reference (`parallel:` section)
 

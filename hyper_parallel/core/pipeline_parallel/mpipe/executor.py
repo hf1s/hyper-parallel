@@ -21,8 +21,9 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStep, PipelineContext
+    from hyper_parallel.core.pipeline_parallel.scheduler import PipelineContext
     from hyper_parallel.core.pipeline_parallel.mpipe.schedule import ScheduleMPipeTranspose
+    from hyper_parallel.core.pipeline_parallel.utils import MetaStep
 
 logger = logging.getLogger(__name__)
 
@@ -79,15 +80,38 @@ class MPipeTransposeExecutor:
         """Clear the per-step compute caches at the start of each schedule run."""
         self._output_arity_for_comm = None
         self._input_arity_for_comm = None
-        assert len(self._inputs_for_explicit_forward) == 0
-        assert len(self._outputs_for_stage0) == 0
-        assert len(self._outputs_for_bwd) == 0
-        assert len(self._keep_grad) == 0
+        # Every per-micro entry must have been consumed by the previous run.
+        for name, cache in (("inputs_for_explicit_forward", self._inputs_for_explicit_forward),
+                            ("outputs_for_stage0", self._outputs_for_stage0),
+                            ("outputs_for_bwd", self._outputs_for_bwd),
+                            ("keep_grad", self._keep_grad)):
+            if cache:
+                raise RuntimeError(
+                    f"MPipe executor cache '{name}' still holds micro-batches "
+                    f"{sorted(cache)} from the previous run"
+                )
         self._fwd_received.clear()
         # Snapshot the already-reduced grads from prior runs so GRAD_REDUCE
         # reduces only this run's added contribution.
         if self._owner_backward:
             self._grad_snapshot = self._snapshot_tower_grads()
+
+    def abort(self) -> None:
+        """Drop the per-micro caches after a run that raised.
+
+        Each entry is erased by the step that consumes it, so a step raising
+        mid-run strands whole micro-batches of device tensors -- including the
+        graph-connected tower output, which pins the autograd graph -- and the
+        next run's :meth:`reset` then refuses to start. The schedule calls this
+        on the error path only: on the normal path the caches must already be
+        empty, and ``reset`` still checks that.
+        """
+        self._inputs_for_explicit_forward.clear()
+        self._outputs_for_stage0.clear()
+        self._outputs_for_bwd.clear()
+        self._keep_grad.clear()
+        self._fwd_received.clear()
+        self._grad_snapshot = None
 
     def _send_meta(self, tensor, dst) -> None:
         """Send a tensor's ``(shape, dtype)`` to ``dst``.
@@ -406,6 +430,10 @@ class MPipeTransposeExecutor:
         micro = step.micro_index
         dst = self._global_rank(self._schedule.owner_of(micro))
         if dst == self._global_rank(0):
+            # Nothing to ship, but the entry still has to go: no later step
+            # erases it, so leaving it would strand the feature tensors and
+            # make the next run's reset() refuse to start.
+            self._keep_grad.pop(micro, None)
             return
         for tensor in self._keep_grad[micro]:
             grad = getattr(tensor, "grad", None)
@@ -457,6 +485,9 @@ class MPipeTransposeExecutor:
             ctx (PipelineContext): The pipeline run context (unused).
         """
         self._reduce_grads(self._mpipe_group, self._grad_snapshot)
+        # Dead once the delta is reduced: drop the clone rather than hold it
+        # across the optimizer step; the next reset() takes a fresh one.
+        self._grad_snapshot = None
 
     def transpose_backward(self, step: "MetaStep", ctx: "PipelineContext") -> None:
         """Recompute the preprocess forward on stage 0 and backprop dL/dfeatures.
@@ -520,7 +551,8 @@ class MPipeTransposeExecutor:
     def _connected_forward(self, args, kwargs):
         return self._preprocess(*args, **kwargs)
 
-    def _mark_requires_grad(self, tensor) -> None:
+    @staticmethod
+    def _mark_requires_grad(tensor) -> None:
         tensor.requires_grad_(True)
 
     def _explicit_forward_before_backward(self, inputs, kwargs, grads) -> None:
@@ -540,15 +572,18 @@ class MPipeTransposeExecutor:
 
     # --- owner-does-backward hooks (opt-in, trainable tower) -----------------
 
-    def _detach_for_wire(self, tensor):
+    @staticmethod
+    def _detach_for_wire(tensor):
         # Ship a detached, contiguous copy so the owner keeps the autograd graph.
         return tensor.detach().contiguous()
 
-    def _zeros_like(self, tensor):
+    @staticmethod
+    def _zeros_like(tensor):
         # Contiguous zero grad for a feature tensor that received none.
         return torch.zeros_like(tensor).contiguous()
 
-    def _owner_transpose_backward(self, retained_out, grads) -> None:
+    @staticmethod
+    def _owner_transpose_backward(retained_out, grads) -> None:
         # Backprop dL/dfeatures through the retained connected tower graph on this
         # rank's replica; skip non-grad-requiring outputs (else autograd raises).
         pairs = [(out_i, g) for out_i, g in zip(retained_out, grads) if out_i.requires_grad]

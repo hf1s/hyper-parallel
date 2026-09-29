@@ -34,7 +34,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # noqa: E402  pylint: disable=wrong-import-position
 from torch import nn  # noqa: E402  pylint: disable=wrong-import-position
@@ -184,7 +183,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
         assert schedule.num_transpose_micro_batches == 4  # min(PP=4, M=8)
         assert schedule._overlap_b_f is False, \
             "MPipe must force overlap_b_f off on the base schedule"
-        assert schedule._DATA_KEYS == ("input_ids",)
+        assert schedule._data_keys == ("input_ids",)
         assert sorted(schedule.exec_order.keys()) == [0, 1, 2, 3]
         # Frozen: no broadcast, no stage-0-backward input transport, no retain.
         for order in schedule.exec_order.values():
@@ -250,7 +249,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
             constructor.
         Expectation: ``less_memory`` reaches the interleaved base, the
             consumer is exposed via the property, the overflow mode drives
-            ``owned_micros``, and the kwarg spec extends ``_DATA_KEYS``.
+            ``owned_micros``, and the kwarg spec extends ``_data_keys``.
         """
         consumer = lambda ctx, micro, out: None  # noqa: E731  pylint: disable=unnecessary-lambda-assignment
         schedule, _ = _build_real_schedule(
@@ -263,7 +262,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
         # "min": rank 0 absorbs the overflow micros, other owners keep one.
         assert schedule.owned_micros(0) == frozenset({0, 4, 5, 6, 7})
         assert schedule.owned_micros(1) == frozenset({1})
-        assert schedule._DATA_KEYS == ("input_ids", "attention_mask")
+        assert schedule._data_keys == ("input_ids", "attention_mask")
 
 
 class TestMPipeTransposeRunWithDataIterator(unittest.TestCase):
@@ -398,6 +397,32 @@ class TestMPipeTransposeRunWithDataIterator(unittest.TestCase):
         bwd_handle.wait.assert_called_once()
         assert not schedule.fwd_handle_cache and not schedule.bwd_handle_cache, \
             "the finally drain must pop every cached handle"
+
+    def test_error_path_releases_executor_caches_and_allows_retry(self):
+        """
+        Feature: run_with_dataiterator error-path executor cleanup.
+        Description: A mid-run error (iterator exhausted before every DATA_LOAD)
+            can strand micro-batches in the executor's per-micro caches, which
+            nothing else frees -- the scheduler's drain covers only the P2P
+            handles -- so the run must hand them to ``abort`` on the way out.
+        Expectation: the error propagates, ``abort`` runs, the caches are empty,
+            and a retry in the same process completes instead of dying in reset.
+        """
+        schedule, _, _, _, _ = self._build_run_setup(3)
+        executor = schedule._executor  # pylint: disable=protected-access
+
+        with patch.object(executor, "abort", wraps=executor.abort) as abort:
+            with self.assertRaises(StopIteration):
+                schedule.run_with_dataiterator(iter(_micro_batches(1)),
+                                               pp_fsdp_composed=False)
+            abort.assert_called_once()
+        assert not (executor._inputs_for_explicit_forward or executor._outputs_for_stage0
+                    or executor._outputs_for_bwd or executor._keep_grad), \
+            "the aborted run must not strand micro-batches in the executor caches"
+
+        losses = schedule.run_with_dataiterator(iter(_micro_batches(3)),
+                                                pp_fsdp_composed=False)
+        assert len(losses) == 3, f"retry after an aborted run must complete, got {losses}"
 
 
 if __name__ == "__main__":

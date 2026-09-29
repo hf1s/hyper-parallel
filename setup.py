@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# encoding: utf-8
 # Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,8 +19,9 @@ import os
 import shutil
 import stat
 import platform
+import subprocess
 from importlib import import_module
-from setuptools import setup, find_packages, Distribution
+from setuptools import setup, find_packages, find_namespace_packages, Distribution
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
 from setuptools.command.install import install
@@ -45,10 +44,6 @@ TORCH29_REQUIRES = [
     "torch-npu==2.9.1",
 ]
 
-MINDSPORE_REQUIRES = [
-    "mindspore>=2.10",
-]
-
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
     with open(os.path.join(ROOT_DIR, requirements_path), encoding='utf-8') as file:
@@ -59,14 +54,14 @@ def _read_requirements(requirements_path: str) -> list[str]:
         ]
 
 
-def get_readme_content():
+def get_readme_content() -> str:
     """Read and return the contents of README.md for use as the package long description."""
     pwd = os.path.dirname(os.path.realpath(__file__))
     with open(os.path.join(pwd, 'README.md'), encoding='UTF-8') as f:
         return f.read()
 
 
-def get_platform():
+def get_platform() -> str:
     """
     Get platform name.
 
@@ -76,7 +71,7 @@ def get_platform():
     return f"{platform.system().strip().lower()}_{platform.machine().strip().lower()}"
 
 
-def get_description():
+def get_description() -> str:
     """
     Get description.
 
@@ -111,12 +106,11 @@ def get_extra_requires() -> dict[str, list[str]]:
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
         "torch29": list(TORCH29_REQUIRES),
-        "mindspore": list(MINDSPORE_REQUIRES),
-        "all": TORCH29_REQUIRES + MINDSPORE_REQUIRES,
+        "all": list(TORCH29_REQUIRES),
     }
 
 
-def update_permissions(path):
+def update_permissions(path: str) -> None:
     """
     Update permissions.
 
@@ -132,10 +126,41 @@ def update_permissions(path):
             os.chmod(file_fullpath, stat.S_IREAD | stat.S_IWRITE)
 
 
+def write_commit_id(target_lib_dir: str) -> None:
+    """Write repository revision information into the wheel build tree.
+
+    Args:
+        target_lib_dir: Built ``hyper_parallel`` package directory.
+    """
+    commit_id_path = os.path.join(target_lib_dir, '.commit_id')
+    try:
+        branch = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=ROOT_DIR,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        commit = subprocess.run(
+            ['git', 'log', '--abbrev-commit', '-1'],
+            cwd=ROOT_DIR,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        content = branch + commit
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        logger.warning('Cannot get Git revision information: %s', exc)
+        content = 'git is not available while building.\n'
+    with open(commit_id_path, 'w', encoding='utf-8') as commit_id_file:
+        commit_id_file.write(content)
+
+
 class EggInfo(egg_info):
     """Egg info."""
 
-    def run(self):
+    def run(self) -> None:
+        """Regenerate package metadata and normalize its permissions."""
         egg_info_dir = os.path.join(os.path.dirname(
             __file__), 'hyper_parallel.egg-info')
         shutil.rmtree(egg_info_dir, ignore_errors=True)
@@ -146,7 +171,7 @@ class EggInfo(egg_info):
 class BuildPy(build_py):
     """Build py files."""
 
-    def run(self):
+    def run(self) -> None:
         """Build Python sources and copy the explicitly prepared native payload."""
         shutil.rmtree(self.build_lib, ignore_errors=True)
         super().run()
@@ -163,13 +188,15 @@ class BuildPy(build_py):
                 logger.info("Copied optional native payload from %s", native_payload)
         else:
             logger.info("No native payload selected; assembling a core-only wheel.")
+        write_commit_id(target_lib_dir)
         update_permissions(target_lib_dir)
 
 
 class Install(install):
     """Install."""
 
-    def run(self):
+    def run(self) -> None:
+        """Install the package and normalize installed-file permissions."""
         super().run()
         if sys.argv[-1] == 'install':
             pip = import_module('pip')
@@ -203,7 +230,6 @@ if __name__ == '__main__':
         name='hyper_parallel',
         version='0.1.0',
         author='The MindSpore Authors',
-        author_email='contact@mindspore.cn',
         url='https://www.mindspore.cn',
         download_url='https://gitcode.com/mindspore/hyper-parallel/tags',
         project_urls={
@@ -214,9 +240,10 @@ if __name__ == '__main__':
         long_description=get_readme_content(),
         long_description_content_type="text/markdown",
         test_suite="tests",
-        packages=find_packages(exclude=["*tests*",
-                                        "hyper_parallel.auto_parallel.fast-tuner",
-                                        "hyper_parallel.auto_parallel.fast-tuner.*"]),
+        packages=find_packages(exclude=["*tests*"]) + find_namespace_packages(
+            include=["hyper_parallel.rl", "hyper_parallel.rl.rl", "hyper_parallel.rl.rl.*",
+                     "hyper_parallel.rl.examples", "hyper_parallel.rl.examples.*"],
+        ),
         platforms=[get_platform()],
         include_package_data=True,
         scripts=['hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash'],

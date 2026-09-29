@@ -15,7 +15,6 @@
 """Verify Torch fully_shard hook state transitions with activation checkpointing."""
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 os.environ.setdefault("HP_LOG_CONFIG", "FSDP:DEBUG")
 
 # pylint: disable=C0413
@@ -27,7 +26,7 @@ from torch.utils.checkpoint import checkpoint
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.fully_shard.api import _extend_module_with_hsdp_interface
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
-from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from tests.torch.utils import init_dist_gloo
 
 
@@ -42,7 +41,7 @@ class _Block(nn.Module):
         return torch.relu(inputs @ self.weight)
 
 
-class _TracingTorchHSDPScheduler(TorchHSDPSchedulerV2):
+class _TracingHSDPScheduler(HSDPSchedulerV2):
     """Record scheduler transitions while retaining the production hook implementation."""
 
     def __init__(self, scenario: str, *args, **kwargs) -> None:
@@ -95,11 +94,11 @@ class _TracingTorchHSDPScheduler(TorchHSDPSchedulerV2):
         self._record("root_backward_exit", before)
 
 
-def _build_model(scenario: str, mesh) -> tuple[nn.Module, _TracingTorchHSDPScheduler]:
+def _build_model(scenario: str, mesh) -> tuple[nn.Module, _TracingHSDPScheduler]:
     """Build a traced scheduler model for one hook-state scenario."""
     model = _Block()
     _extend_module_with_hsdp_interface(model)
-    scheduler = _TracingTorchHSDPScheduler(
+    scheduler = _TracingHSDPScheduler(
         scenario,
         model,
         mesh,

@@ -201,7 +201,7 @@ dataloader:
     source_type: online
     attention_mode: compressed
     runtime_input_adapter:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.runtime.DeepseekV41Runtime
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
       # TextParallelBatch already builds these two fields. The model adapter
       # contributes only compact shared-attention packing metadata here.
       include_position_ids: false

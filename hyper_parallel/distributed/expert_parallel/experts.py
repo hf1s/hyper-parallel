@@ -32,10 +32,13 @@ Nothing in this module probes model structure with getattr fallback chains.
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
@@ -45,6 +48,19 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
+
+
+@dataclass(frozen=True)
+class _EPDispatch:
+    """Prepared tensors and split sizes for one routed expert exchange."""
+
+    source_indices: torch.Tensor
+    expert_weights: torch.Tensor
+    dispatch_order: torch.Tensor
+    states: torch.Tensor
+    expert_indices: torch.Tensor
+    send_counts: list[int]
+    receive_counts: list[int]
 
 
 def resolve_swiglu_weights(
@@ -227,14 +243,16 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
-):
+) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     token_count = flattened_states.shape[0]
     experts_per_token = topk_indices.shape[1]
     expert_indices = topk_indices.reshape(-1)
     expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
-    source_indices = torch.arange(token_count, device=flattened_states.device).repeat_interleave(experts_per_token)
+    source_indices = torch.arange(
+        token_count, device=flattened_states.device
+    ).repeat_interleave(experts_per_token)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
     dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
@@ -242,14 +260,14 @@ def _prepare_ep_dispatch(
     send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
     receive_counts_tensor = torch.empty_like(send_counts_tensor)
     dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
-    return (
-        source_indices,
-        expert_weights,
-        dispatch_order,
-        dispatched_states,
-        dispatched_indices,
-        send_counts_tensor.tolist(),
-        receive_counts_tensor.tolist(),
+    return _EPDispatch(
+        source_indices=source_indices,
+        expert_weights=expert_weights,
+        dispatch_order=dispatch_order,
+        states=dispatched_states,
+        expert_indices=dispatched_indices,
+        send_counts=send_counts_tensor.tolist(),
+        receive_counts=receive_counts_tensor.tolist(),
     )
 
 
@@ -344,7 +362,7 @@ def ep_routed_forward(
     global_expert_count = local_expert_count * ep_size
     expert_offset = ep_rank * local_expert_count
 
-    batch_size, sequence_length, hidden_size = hidden_states.shape
+    output_shape = tuple(hidden_states.shape)
     topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
     dispatch = _prepare_ep_dispatch(
         hidden_states,
@@ -355,30 +373,21 @@ def ep_routed_forward(
         ep_size=ep_size,
         ep_group=ep_group,
     )
-    (
-        source_token_indices,
-        flattened_expert_weights,
-        dispatch_order,
-        dispatched_states,
-        dispatched_expert_indices,
-        send_counts,
-        receive_counts,
-    ) = dispatch
     combined_expert_outputs = _run_ep_local_experts(
         module,
-        dispatched_states,
-        dispatched_expert_indices,
-        send_counts,
-        receive_counts,
+        dispatch.states,
+        dispatch.expert_indices,
+        dispatch.send_counts,
+        dispatch.receive_counts,
         ep_group,
         expert_offset,
     )
     return _aggregate_ep_outputs(
         combined_expert_outputs,
-        flattened_expert_weights,
-        source_token_indices,
-        dispatch_order,
-        (batch_size, sequence_length, hidden_size),
+        dispatch.expert_weights,
+        dispatch.source_indices,
+        dispatch.dispatch_order,
+        output_shape,
     )
 
 

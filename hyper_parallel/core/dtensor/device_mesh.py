@@ -25,7 +25,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._mesh_layout import IntTuple, _MeshLayout, _contiguous_strides, _is_int
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 Tensor = torch.Tensor
 
@@ -1417,6 +1417,12 @@ class DeviceMesh:
 _DEVICE_MESH_MAP = {}
 
 
+def clear_device_mesh_cache() -> None:
+    """Discard cached meshes and groups after their distributed runtime is destroyed."""
+    _DEVICE_MESH_MAP.clear()
+    EXISTING_COMM_GROUPS.clear()
+
+
 def _device_mesh_map_key(
         mesh_shape: tuple[int, ...],
         mesh_dim_names: Union[tuple[str, ...], list[str], None],
@@ -1454,7 +1460,7 @@ def _create_device_mesh(device_type: str,
     mesh_dim_names = tuple(mesh_dim_names) if mesh_dim_names else None
     map_key = _device_mesh_map_key(mesh_shape, mesh_dim_names, rank_list)
     if map_key not in _DEVICE_MESH_MAP:
-        _register_device_mesh(
+        return _register_device_mesh(
             DeviceMesh(device_type, mesh, mesh_dim_names=mesh_dim_names, _init_backend=init_backend)
         )
     return _DEVICE_MESH_MAP.get(map_key, None)

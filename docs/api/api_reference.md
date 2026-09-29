@@ -35,7 +35,7 @@ fully_shard(
 | `mixed_precision` | `MixedPrecisionPolicy` | `None` | 混合精度策略 |
 | `offload_policy` | `OffloadPolicy` | `None` | Offload 策略 |
 | `comm_fusion` | `bool` | `True` | 通信融合 |
-| `comm_fusion_zero_copy` | `bool` | `None` | 通信融合零拷贝（PyTorch 默认 True，MindSpore 默认 False） |
+| `comm_fusion_zero_copy` | `bool` | `None` | 通信融合零拷贝（默认 True） |
 
 **返回值：** 切分后的模块（原地修改，返回同一对象）。
 
@@ -761,7 +761,7 @@ get_hyper_optimizer(
 
 ## Activation Checkpoint / Swap
 
-> PyTorch 与 MindSpore 后端均已实现。公共 API 位于 `hyper_parallel.core.activation_checkpoint`。
+> 公共 API 位于 `hyper_parallel.core.activation_checkpoint`。
 
 ### `checkpoint`
 
@@ -844,7 +844,7 @@ checkpoint_exclude_wrapper(
 ) -> CheckpointExcludeWrapper
 ```
 
-支持 PyTorch eager 和 MindSpore PyNative 模式，并且需要在 HyperParallel 的 `checkpoint` 或
+支持 PyTorch eager 模式，并且需要在 HyperParallel 的 `checkpoint` 或
 `checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 Module/Cell 和普通 callable。
 
 `save_output=False` 用于连续 SAVE 区域的中间节点：该区域内部通过 saved-tensor hooks 保存的反向激活
@@ -907,39 +907,27 @@ class SwapManager:
 
 ---
 
-## 平台抽象
-
-### `get_platform`
-
-获取当前平台对象。
-
-```python
-get_platform() -> Platform
-```
-
-返回 PyTorch 或 MindSpore 平台实现，用于访问平台特定功能。
-
----
-
 ## 其他导出接口
 
 ### 主接口导出（`hyper_parallel/__init__.py`）
 
 ```python
-__all__ = [
-    "get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule",
-    "DTensor", "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh",
-    "distribute_module", "init_parameters", "init_empty_weights", "init_on_device",
-    "custom_shard", "SkipDTensorDispatch",
-    "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
-    "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend",
-    "split_group", "get_group_local_rank", "mark_created_groups",
-    "ContextParallel", "AsyncContextParallel",
-    "AsyncDSAIndexerContextParallel", "AsyncDSAIndexerLossContextParallel",
-    "AsyncDSASparseAttentionContextParallel",
-    "DSAIndexerContextParallel", "DSAIndexerLossContextParallel", "DSASparseAttentionContextParallel",
-    "ColwiseParallel", "RowwiseParallel", "SequenceParallel",
-    "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
-    "ParallelStyle", "parallelize_module", "manual_seed",
-]
+__all__ = ["DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
+           "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh", "distribute_module",
+           "distribute_tensor", "ones", "zeros", "empty", "full", "rand", "randn",
+           "Shard", "RaggedShard", "Replicate", "Partial", "Placement",
+           "init_parameters", "init_empty_weights", "init_on_device",
+           "shard_module", "custom_shard", "SkipDTensorDispatch",
+           "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
+           "ScheduleMPipeTranspose",
+           "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend", "split_group",
+           "get_group_local_rank", "mark_created_groups",
+           "ContextParallel", "AsyncContextParallel",
+           "AsyncDSAIndexerContextParallel", "AsyncDSAIndexerLossContextParallel",
+           "AsyncDSASparseAttentionContextParallel",
+           "DSAIndexerContextParallel", "DSAIndexerLossContextParallel", "DSASparseAttentionContextParallel",
+           "ColwiseParallel", "MC2ColwiseParallel", "MC2RowwiseParallel", "MC2Linear",
+           "NoParallel", "RowwiseParallel", "SequenceParallel",
+           "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
+           "ParallelStyle", "parallelize_module", "manual_seed"]
 ```

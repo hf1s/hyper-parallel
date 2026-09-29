@@ -28,8 +28,8 @@ from hyper_parallel import (
     manual_seed,
 )
 from hyper_parallel.core.pipeline_parallel import CommComputeOverlap
-from hyper_parallel.core.activation_checkpoint import swap_wrapper
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager
+from hyper_parallel.core.activation_memory import swap_wrapper
+from hyper_parallel.core.activation_memory.swap import SwapManager
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.dtensor.random import is_rng_supported_mesh
 from tests.torch.utils import _DEVICE_TYPE, to_device

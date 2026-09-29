@@ -20,6 +20,11 @@ while this module owns the HF-side config helpers that decide between the
 HF native implementation and a Hyper-Parallel custom implementation.
 """
 
+__all__ = [
+    "get_hf_config",
+    "get_is_hf_model",
+]
+
 from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
@@ -28,11 +33,6 @@ from hyper_parallel.models.registry import (
     _resolve_custom_model_cls,
     get_model_adapter,
 )
-
-__all__ = [
-    "get_hf_config",
-    "get_is_hf_model",
-]
 
 
 def get_is_hf_model(config: PretrainedConfig, force_hf: bool = False) -> bool:

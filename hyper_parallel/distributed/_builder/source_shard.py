@@ -32,13 +32,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, TypeAlias
 
+from torch.nn import Module as ModuleClass
+from torch.nn import Parameter as ParameterClass
+
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, DTensor, Replicate
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Shard
 from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import EP, resolve_placements
-from hyper_parallel.platform import get_platform
 
 # Mesh dimensions whose sharding semantics belong to FSDP (or to other
 # parallelism concerns), never to the source layout recorded here:
@@ -165,10 +167,6 @@ def build_source_shard_info(
 # fsdp2.py in stage 4f, 05 §15.2.4 row 406; ``self`` became an explicit
 # ``manager`` parameter — FSDP2Manager calls these free functions).
 # ────────────────────────────────────────────────────────────────────────────
-
-platform = get_platform()
-ModuleClass = platform.Module
-ParameterClass = platform.Parameter
 
 SourceShardInfoByFQN: TypeAlias = Mapping[  # pylint: disable=invalid-name
     str, tuple[tuple[Placement, ...], DeviceMesh]
@@ -371,7 +369,7 @@ def _source_infos_for_fully_shard(
 ) -> SourceShardInfoByParam | None:
     """Return explicit metadata only for plain source-layout parameters.
 
-    Validate-mode parameters remain native DTensors. The platform FSDP
+    Validate-mode parameters remain native DTensors. The FSDP
     state derives their source layouts from each parameter directly and
     rejects duplicate explicit metadata.
     """

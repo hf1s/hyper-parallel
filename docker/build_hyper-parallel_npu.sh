@@ -51,7 +51,6 @@ Environment:
 
 Example:
   $(basename "$0") hyper-parallel:npu
-  HP_EXTRA=mindspore DOCKERFILE=docker/Dockerfile.mindspore $(basename "$0") hyper-parallel:mindspore
 EOF
 }
 
@@ -90,7 +89,7 @@ echo "Verify image: ${IMAGE}"
 docker run --rm --entrypoint /bin/bash "${IMAGE}" -lc '
 set -e
 . /usr/local/Ascend/cann/set_env.sh
-python3 -c "import importlib.metadata as md; import hyper_parallel as hp; print(hp.get_platform()); print(md.version(\"hyper_parallel\"))"
+python3 -c "import importlib.metadata as md; print(md.version(\"hyper_parallel\"))"
 '
 
 echo "Done: ${IMAGE}"

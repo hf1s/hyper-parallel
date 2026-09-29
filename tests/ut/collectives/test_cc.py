@@ -18,9 +18,9 @@ import os
 import unittest
 from unittest.mock import call, MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.collectives import cc as collectives_cc
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS  # pylint: disable=C0413
 
 
 @patch("hyper_parallel.collectives.cc.dist")
@@ -28,10 +28,10 @@ class TestProcessGroupWrappers(unittest.TestCase):
     """Verify direct delegation to ``torch.distributed``."""
 
     def setUp(self) -> None:
-        collectives_cc._EXISTING_COMM_GROUPS.clear()
+        EXISTING_COMM_GROUPS.clear()
 
     def tearDown(self) -> None:
-        collectives_cc._EXISTING_COMM_GROUPS.clear()
+        EXISTING_COMM_GROUPS.clear()
 
     def test_init_process_group_forwards_all_arguments(self, mock_dist: MagicMock) -> None:
         """Initialization forwards every supported argument unchanged."""
@@ -79,21 +79,21 @@ class TestProcessGroupWrappers(unittest.TestCase):
     def test_destroy_process_group_forwards_group_and_evicts_cache(self, mock_dist: MagicMock) -> None:
         """Destroying a group removes its cached rank-list entry."""
         group = MagicMock(name="group")
-        collectives_cc._EXISTING_COMM_GROUPS["(0, 1)"] = group
+        EXISTING_COMM_GROUPS["(0, 1)"] = group
 
         collectives_cc.destroy_process_group(group)
 
         mock_dist.destroy_process_group.assert_called_once_with(group)
-        self.assertEqual(collectives_cc._EXISTING_COMM_GROUPS, {})
+        self.assertEqual(EXISTING_COMM_GROUPS, {})
 
     def test_destroy_default_process_group_clears_cache(self, mock_dist: MagicMock) -> None:
         """Destroying the default group clears all locally cached groups."""
-        collectives_cc._EXISTING_COMM_GROUPS["(0, 1)"] = MagicMock()
+        EXISTING_COMM_GROUPS["(0, 1)"] = MagicMock()
 
         collectives_cc.destroy_process_group()
 
         mock_dist.destroy_process_group.assert_called_once_with(None)
-        self.assertEqual(collectives_cc._EXISTING_COMM_GROUPS, {})
+        self.assertEqual(EXISTING_COMM_GROUPS, {})
 
     def test_get_process_group_ranks_uses_world_for_none(self, mock_dist: MagicMock) -> None:
         """The default rank query resolves to ``dist.group.WORLD``."""
@@ -152,7 +152,7 @@ class TestProcessGroupWrappers(unittest.TestCase):
     def test_split_group_reuses_cached_groups(self, mock_dist: MagicMock) -> None:
         """Repeated rank lists reuse cached PyTorch process groups."""
         group = MagicMock(name="group")
-        collectives_cc._EXISTING_COMM_GROUPS["(0, 1)"] = group
+        EXISTING_COMM_GROUPS["(0, 1)"] = group
         mock_dist.get_rank.return_value = 0
 
         result = collectives_cc.split_group(split_ranks=[[1, 0]])
@@ -174,8 +174,8 @@ class TestProcessGroupWrappers(unittest.TestCase):
 
         collectives_cc.mark_created_groups([group0, group1])
 
-        self.assertIs(collectives_cc._EXISTING_COMM_GROUPS["(0, 1)"], group0)
-        self.assertIs(collectives_cc._EXISTING_COMM_GROUPS["(2, 3)"], group1)
+        self.assertIs(EXISTING_COMM_GROUPS["(0, 1)"], group0)
+        self.assertIs(EXISTING_COMM_GROUPS["(2, 3)"], group1)
 
 
 class TestCollectivesPublicExports(unittest.TestCase):

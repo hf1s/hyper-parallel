@@ -30,7 +30,7 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 
 **Must NOT:**
 
-- Call `get_platform()` or use any platform instance — platform is mocked via `@patch` in UT.
+- Reach for a real process group or device — the distributed calls are mocked via `@patch` in UT.
 - Add `@arg_mark` to UT tests — that decorator is for ST only.
 
 **infer_layout calls:** pass a single `cache_values` list — `op.infer_layout(cache_values)`, not `op.infer_layout(layouts, extra_args)`.
@@ -48,7 +48,7 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 
 - Data parallel, model parallel, hybrid parallel, all replicated, negative dim index, partial input error.
 - All operator-specific error paths (sharded forbidden dim, layout inconsistency, invalid args).
-- Preprocess routing (if `_MS_PRIMITIVE_OP_NAMES` is defined): verify keyword-only params land in `local_kwargs` for PyTorch ops, and in `local_args` (or correct `local_kwargs` for Primitives with `kwonlyargs`) for MindSpore Primitives.
+- Preprocess routing: verify keyword-only params land in `local_kwargs` and everything else in `local_args`, per the op's declared argument conventions.
 
 ---
 

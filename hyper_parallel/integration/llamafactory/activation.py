@@ -66,7 +66,7 @@ def _build_policy_fn(hp_args):
     Returns:
         A policy_fn callable or None (for plain recompute mode).
     """
-    from hyper_parallel.core.activation_checkpoint import CheckpointPolicy  # pylint: disable=C0415
+    from hyper_parallel.core.activation_memory import CheckpointPolicy  # pylint: disable=C0415
 
     mode = hp_args.activation_mode
 
@@ -119,7 +119,7 @@ def _install_swap_tensor_backward_hooks(module, input, output):  # pylint: disab
     if group_name is None:
         return
 
-    from hyper_parallel.core.activation_checkpoint import SwapManager  # pylint: disable=C0415
+    from hyper_parallel.core.activation_memory import SwapManager  # pylint: disable=C0415
     from torch.utils._pytree import tree_flatten  # pylint: disable=C0415
 
     # Pre-backward: fires at START of module backward
@@ -185,7 +185,7 @@ def _wrap_one_container(
 
     Returns the number of newly wrapped (i.e. trainable) blocks.
     """
-    from hyper_parallel.core.activation_checkpoint import (  # pylint: disable=C0415
+    from hyper_parallel.core.activation_memory import (  # pylint: disable=C0415
         SwapManager,
         checkpoint_wrapper,
     )

@@ -23,7 +23,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager
+from hyper_parallel.core.activation_memory.swap import SwapManager
 from hyper_parallel.core.pipeline_parallel import pipeline_swap, scheduler as scheduler_module
 from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     PipelineSwapSession,

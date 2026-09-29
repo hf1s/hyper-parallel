@@ -28,8 +28,8 @@ from hyper_parallel.core.optimizer.swap_optimizer import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Torch-only optimizer implementations import torch at module load. Keep them
-# off the eager path so MindSpore-only environments can import SwapOptimizer.
+# Optimizer implementations import torch at module load. Keep them off the
+# eager path so importing the package does not pull in torch.
 _LAZY_EXPORTS = {
     "AdamW": ".adamw",
     "Muon": ".muon",
@@ -67,18 +67,16 @@ def _load_torch_optimizer_runtime():
 
 
 def _effective_optimizer_config(
-        optimizer_class: Any,
-        configured_values: Dict[str, Any],
-        runtime_optimizer: Any,
+    optimizer_class: Any,
+    configured_values: Dict[str, Any],
+    runtime_optimizer: Any,
 ) -> Dict[str, Any]:
     """Merge constructor defaults, user values, and resolved runtime defaults."""
     signature = inspect.signature(optimizer_class.__init__)
-    effective_config = {
-        name: parameter.default
-        for name, parameter in signature.parameters.items()
-        if name not in {"self", "params"}
-        and parameter.default is not inspect.Parameter.empty
-    }
+    effective_config = {}
+    for name, parameter in signature.parameters.items():
+        if name not in {"self", "params"} and parameter.default is not inspect.Parameter.empty:
+            effective_config[name] = parameter.default
     effective_config.update(configured_values)
     effective_config.update(runtime_optimizer.defaults)
     if hasattr(runtime_optimizer, "hsdp_replica_count"):
@@ -101,6 +99,7 @@ def _filter_optimizer_config(
         inspect.signature(optimizer_class.__init__).parameters.keys()
         - {"self", "params"}
     )
+    allowed_keys = set(allowed_keys) | set(getattr(optimizer_class, "ADDITIONAL_CONFIG_KEYS", ()))
     filtered_config = {
         key: value
         for key, value in normalized_config.items()

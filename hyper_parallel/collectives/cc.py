@@ -19,8 +19,7 @@ from typing import Any, Optional, Union
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-
-_EXISTING_COMM_GROUPS: dict[str, ProcessGroup] = {}
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 def _group_key(ranks: list[int]) -> str:
@@ -73,11 +72,11 @@ def destroy_process_group(group: Optional[ProcessGroup] = None) -> None:
 
     """
     if group is None:
-        _EXISTING_COMM_GROUPS.clear()
+        EXISTING_COMM_GROUPS.clear()
     else:
-        keys_to_destroy = [key for key, cached_group in _EXISTING_COMM_GROUPS.items() if cached_group == group]
+        keys_to_destroy = [key for key, cached_group in EXISTING_COMM_GROUPS.items() if cached_group == group]
         for key in keys_to_destroy:
-            del _EXISTING_COMM_GROUPS[key]
+            del EXISTING_COMM_GROUPS[key]
     dist.destroy_process_group(group)
 
 
@@ -126,10 +125,10 @@ def split_group(parent_pg: Optional[ProcessGroup] = None,
     current_group = None
     for ranks in split_ranks:
         key = _group_key(ranks)
-        group = _EXISTING_COMM_GROUPS.get(key)
+        group = EXISTING_COMM_GROUPS.get(key)
         if group is None:
             group = dist.new_group(ranks=ranks)
-            _EXISTING_COMM_GROUPS[key] = group
+            EXISTING_COMM_GROUPS[key] = group
         if current_rank in ranks:
             current_group = group
     return current_group
@@ -151,4 +150,4 @@ def mark_created_groups(process_group: Union[ProcessGroup, list[ProcessGroup]]) 
     groups = process_group if isinstance(process_group, list) else [process_group]
     for group in groups:
         ranks = dist.get_process_group_ranks(group)
-        _EXISTING_COMM_GROUPS[_group_key(ranks)] = group
+        EXISTING_COMM_GROUPS[_group_key(ranks)] = group

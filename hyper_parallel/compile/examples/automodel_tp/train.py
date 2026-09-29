@@ -44,6 +44,7 @@ boundary forwards). FSDPPass only sees the FX graph — it is TP-agnostic.
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -52,12 +53,18 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
 
+from model import (  # pylint: disable=C0413
+    build_model as build_model_from_config,
+    DataSampler,
+)
 from hyper_parallel.compile import (  # pylint: disable=C0413
+    GraphParallelPlan,
     GraphTrainer,
     PassConfig,
-    PassPlan,
 )
 from hyper_parallel.distributed.mesh import MeshContext  # pylint: disable=C0413
 from hyper_parallel.distributed import (  # pylint: disable=C0413
@@ -65,13 +72,11 @@ from hyper_parallel.distributed import (  # pylint: disable=C0413
     apply_sharding_plan,
 )
 
-from model import (  # pylint: disable=C0413
-    build_model as build_model_from_config,
-    DataSampler,
-)
+_LOG = logging.getLogger(__name__)
 
 
 def parse_args():
+    """Parse example CLI arguments."""
     parser = argparse.ArgumentParser(
         description="TP + FSDP graph-mode demo (automodel TP-shard + FSDPPass)"
     )
@@ -80,6 +85,7 @@ def parse_args():
 
 
 def load_config(path: str) -> dict:
+    """Load the example YAML config."""
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -91,12 +97,15 @@ def setup_distributed() -> str:
             dist.init_process_group(backend="hccl")
             torch.npu.set_device(dist.get_rank() % torch.npu.device_count())
             if dist.get_rank() == 0:
-                print(f"[setup] backend=hccl, world_size={dist.get_world_size()}, "
-                      f"npu_device={torch.npu.current_device()}")
+                _LOG.info(
+                    "[setup] backend=hccl, world_size=%s, npu_device=%s",
+                    dist.get_world_size(),
+                    torch.npu.current_device(),
+                )
             return "npu"
         dist.init_process_group(backend="gloo")
         if dist.get_rank() == 0:
-            print(f"[setup] backend=gloo, world_size={dist.get_world_size()}")
+            _LOG.info("[setup] backend=gloo, world_size=%s", dist.get_world_size())
         return "cpu"
     return "cpu"
 
@@ -114,9 +123,7 @@ def build_model(cfg: dict, device: torch.device) -> torch.nn.Module:
     return build_model_from_config(cfg["model"], device)
 
 
-def build_mesh_context(
-    parallel_cfg: dict, device_type: str
-) -> MeshContext:
+def build_mesh_context(parallel_cfg: dict, device_type: str) -> MeshContext:
     """Build the automodel (dp, cp, tp) mesh + the dense FSDP sub-mesh."""
     tp = parallel_cfg["tp_size"]
     dp = parallel_cfg["dp_size"]
@@ -146,7 +153,7 @@ def build_mesh_context(
     return ctx
 
 
-def train_fn(model, input_ids, labels):
+def train_fn(model, *, input_ids, labels):
     """Standard CE loss on the boundary-wrapped model forward.
 
     In SP mode the lm_head boundary all-gathers hidden_states to full
@@ -182,7 +189,7 @@ def inspect_graph(trainer: GraphTrainer) -> None:
     ``call_function`` nodes whose op name mentions all_gather/all_reduce/
     reduce_scatter.
     """
-    gm = trainer._joint_graph.graph_module  # pylint: disable=W0212
+    gm = trainer._compiler._joint_graph.graph_module  # pylint: disable=W0212
     fsdp, tp_nodes = [], []
     for node in gm.graph.nodes:
         if node.op != "call_function":
@@ -195,17 +202,19 @@ def inspect_graph(trainer: GraphTrainer) -> None:
             tp_nodes.append((node.name, target))
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank == 0:
-        print("=" * 70)
-        print(f"[graph] FSDP comm nodes: {len(fsdp)}")
+        _LOG.info("=" * 70)
+        _LOG.info("[graph] FSDP comm nodes: %s", len(fsdp))
         for n, c in fsdp[:6]:
-            print(f"    {n}: {c}")
-        print(f"[graph] TP(boundary) comm nodes: {len(tp_nodes)}")
+            _LOG.info("    %s: %s", n, c)
+        _LOG.info("[graph] TP(boundary) comm nodes: %s", len(tp_nodes))
         for n, t in tp_nodes[:6]:
-            print(f"    {n}: {t}")
-        print("=" * 70)
+            _LOG.info("    %s: %s", n, t)
+        _LOG.info("=" * 70)
 
 
-def main():
+def main():  # pylint: disable=too-many-locals
+    """Run the TP + FSDP graph-mode demo end to end."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
     cfg = load_config(args.config)
 
@@ -219,10 +228,10 @@ def main():
     world_size = dist.get_world_size()
 
     if rank == 0:
-        print("=" * 70)
-        print("TP + FSDP graph-mode demo")
-        print(f"  world_size={world_size}, device={device_type}")
-        print("=" * 70)
+        _LOG.info("=" * 70)
+        _LOG.info("TP + FSDP graph-mode demo")
+        _LOG.info("  world_size=%s, device=%s", world_size, device_type)
+        _LOG.info("=" * 70)
 
     # 1. Model on a real device (distribute_tensor needs real params).
     tp_size = cfg["parallel"]["tp_size"]
@@ -248,22 +257,25 @@ def main():
     )
     model, _ = apply_sharding_plan(model, plan, mesh_ctx, validate_mode=False)
     if rank == 0:
-        print(
+        _LOG.info(
             "[automodel] TP sharding applied — params are now plain TP shards, "
             "boundary forwards wrap TP collectives on activations"
         )
         if sequence_parallel:
-            print(f"[SP] sequence_parallel=True, tp_size={tp_size}")
+            _LOG.info("[SP] sequence_parallel=True, tp_size=%s", tp_size)
 
     # 3a. No rotary_emb patch needed — the model places
     #     rotary_emb inside Attention.forward (after boundary all-gather),
     #     so cos/sin naturally have the full sequence length.
     if sequence_parallel and rank == 0:
-        print("[SP] Using AutoModelAdapterForCausalLM — rotary_emb inside attention, no patch needed")
+        _LOG.info(
+            "[SP] Using AutoModelAdapterForCausalLM — rotary_emb inside "
+            "attention, no patch needed"
+        )
 
-    # 4. FSDP wrap plan for the graph-mode FSDPPass (wrap everything).
-    fsdp_plan = PassPlan()
-    fsdp_plan.fsdp_wrap_pattern("*")
+    # 4. FSDP plan for the graph-mode FSDPPass (mark everything).
+    fsdp_plan = GraphParallelPlan()
+    fsdp_plan.fsdp_mark_pattern("*")
 
     # 5. GraphTrainer reuses the automodel mesh (tp group already created);
     #    it registers the dp sub-mesh as "fsdp" and back-fills fsdp_degree.
@@ -278,9 +290,11 @@ def main():
             sequence_parallel=sequence_parallel,
             loss_parallel=loss_parallel,
         ),
-        pass_plan=fsdp_plan,
-        optimizer_config={"lr": tcfg.get("lr", 1e-4),
-                          "grad_clip": tcfg.get("grad_clip", 1.0)},
+        parallel_plan=fsdp_plan,
+        optimizer_config={
+            "lr": tcfg.get("lr", 1e-4),
+            "grad_clip": tcfg.get("grad_clip", 1.0),
+        },
         mesh_context=mesh_ctx,
         device=device,
     )
@@ -301,23 +315,27 @@ def main():
     )
 
     # Sample one batch for compilation (shape must match runtime batches)
-    sample_input, sample_label = sampler.sample()
+    input_batch, label_batch = sampler.sample()
     if sequence_parallel and rank == 0:
-        print(f"[SP] sample input full seq_len={sample_input.shape[1]} (SP sharding via embedding reduce-scatter)")
-    trainer.compile(sample_input, sample_label)
+        _LOG.info(
+            "[SP] sample input full seq_len=%s (SP sharding via embedding "
+            "reduce-scatter)",
+            input_batch.shape[1],
+        )
+    trainer.compile(input_ids=input_batch, labels=label_batch)
     inspect_graph(trainer)
 
     # 7. Training data iterator (DataSampler yields full-sequence batches)
-    print("\nStarting training...")
+    _LOG.info("\nStarting training...")
     trainer.train(
         iter(sampler),
         max_steps=tcfg["max_steps"],
         log_interval=cfg["logging"]["log_interval"],
     )
     if rank == 0:
-        print("=" * 70)
-        print("Training completed!")
-        print("=" * 70)
+        _LOG.info("=" * 70)
+        _LOG.info("Training completed!")
+        _LOG.info("=" * 70)
 
     if dist.is_initialized():
         dist.destroy_process_group()

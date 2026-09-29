@@ -18,11 +18,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+import torch
+import torch.distributed as dist
+
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, Shard
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.utils import communication
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
 
 
 @dataclass
@@ -39,20 +41,20 @@ class TPExecutionOp:
     def execute(self, tensor: Any) -> Any:
         """Execute the differentiable collective selected during lowering."""
         if self.kind == "all_gather":
-            return platform.differentiable_all_gather_concat(
+            return communication.differentiable_all_gather_concat(
                 tensor,
                 self.group,
                 self.group_size,
                 self.tensor_dim,
             )
         if self.kind == "all_reduce":
-            return platform.differentiable_all_reduce(
+            return communication.differentiable_all_reduce(
                 tensor,
                 self.reduce_op,
                 self.group,
             )
         if self.kind == "reduce_scatter":
-            return platform.differentiable_reduce_scatter(
+            return communication.differentiable_reduce_scatter(
                 tensor,
                 self.group_size,
                 self.tensor_dim,
@@ -60,17 +62,16 @@ class TPExecutionOp:
                 self.group,
             )
         if self.kind == "all_reduce_shard":
-            reduced = platform.differentiable_all_reduce(
+            reduced = communication.differentiable_all_reduce(
                 tensor,
                 self.reduce_op,
                 self.group,
             )
-            return platform.chunk(
+            return torch.chunk(
                 reduced,
-                self.tensor_dim,
                 self.group_size,
-                self.group_rank,
-            )
+                dim=self.tensor_dim,
+            )[self.group_rank]
         raise ValueError(f"Unsupported TP execution operation: {self.kind!r}")
 
 
@@ -144,7 +145,7 @@ def create_tp_collective_lowerer(
     tp_mesh = mesh if mesh_dim_names == ("tp",) else mesh["tp"]
     group = tp_mesh.get_group()
     mesh_ranks = tuple(tp_mesh.rank_list)
-    group_ranks = tuple(platform.get_process_group_ranks(group))
+    group_ranks = tuple(dist.get_process_group_ranks(group))
     if mesh_ranks != group_ranks:
         logger.warning(
             "TP mesh rank order %s differs from process group rank order %s; "
@@ -154,7 +155,7 @@ def create_tp_collective_lowerer(
         )
         return None
 
-    backend = collective_backend or platform.get_backend(group)
+    backend = collective_backend or dist.get_backend(group)
     return TPCollectiveLowerer(
         mesh_dim_names=mesh_dim_names,
         group=group,

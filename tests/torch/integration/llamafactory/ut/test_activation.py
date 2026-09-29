@@ -48,7 +48,7 @@ from hyper_parallel.integration.llamafactory.activation import (
     setup_activation_optimization,
 )
 from hyper_parallel.integration.llamafactory.utils import HyperParallelArguments
-from hyper_parallel.platform.torch.activation_checkpoint import CheckpointWrapper
+from hyper_parallel.core.activation_memory import CheckpointWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +250,7 @@ class TestBuildPolicyFn:
 
     def test_swap_policy_matmul_ops_must_swap(self):
         """Matmul-family ops should be marked MUST_SWAP, other ops MUST_RECOMPUTE."""
-        from hyper_parallel.core.activation_checkpoint import CheckpointPolicy  # pylint: disable=C0415
+        from hyper_parallel.core.activation_memory import CheckpointPolicy  # pylint: disable=C0415
 
         args = HyperParallelArguments(activation_mode="swap")
         fn = _build_policy_fn(args)

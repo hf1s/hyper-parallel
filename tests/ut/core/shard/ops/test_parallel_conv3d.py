@@ -17,17 +17,15 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_conv3d import Conv3dDistributedOp
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 # Initialize the operator
 op = Conv3dDistributedOp("conv3d")
@@ -47,7 +45,6 @@ class TestParallelConv3D(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
-        self.platform = get_platform()
         self._utils_patcher = patch(
             "hyper_parallel.core.dtensor.device_mesh._utils"
         )
@@ -74,16 +71,13 @@ class TestParallelConv3D(unittest.TestCase):
         output_layouts, _ = op.infer_layout(self._cache_values(layouts, extra_args))
         return output_layouts[0]
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests.
 
-        Args:
-            mock_platform: The MagicMock object injected by @patch.
-            platform_type: Optional PlatformType to set on the mock.
-            world_size: Value returned by mock_platform.get_world_size().
+            Args:
+                mock_platform: The MagicMock object injected by @patch.
+                world_size: Value returned by mock_platform.get_world_size().
         """
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
@@ -107,7 +101,7 @@ class TestParallelConv3D(unittest.TestCase):
         """
         Feature: New dispatch preprocessing
         Description: Conv3d preprocess converts DTensors to local tensors and builds cache_values.
-        Expectation: MindSpore-compatible positional args are returned and cache_values carries layouts.
+        Expectation: positional args are returned and cache_values carries layouts.
         """
         mesh = self._make_1d_mesh(mock_platform, world_size=4, mesh_dim_names=("dp",))
         in_layout = _build_layout(mesh, (Replicate(),), 5)
