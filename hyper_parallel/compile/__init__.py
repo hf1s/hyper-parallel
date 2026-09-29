@@ -24,9 +24,10 @@ Core Features:
 
 Usage Example:
     from hyper_parallel.compile import (
+        GraphCompiler,
+        GraphParallelPlan,
         GraphTrainer,
         PassConfig,
-        PassPlan,
     )
 
     # Create model
@@ -35,23 +36,29 @@ Usage Example:
     # Configure parallelism
     pass_config = PassConfig(enable_overlap=True)
 
-    # Build pass plan
-    pass_plan = PassPlan()
-    pass_plan.fsdp_wrap_pattern("layers.*")
+    # Build parallel plan
+    parallel_plan = GraphParallelPlan()
+    parallel_plan.fsdp_mark_pattern("layers.*")
 
-    # Create trainer
-    trainer = GraphTrainer(model, train_fn, pass_config, pass_plan)
+    # Compile + forward_backward only (no optimizer / training loop); model
+    # inputs travel as kwargs, forwarded to train_fn(model, **inputs):
+    compiler = GraphCompiler(model, train_fn, pass_config, parallel_plan)
+    compiler.compile(input_ids=input_ids, labels=labels)
+    loss = compiler.forward_backward(input_ids=input_ids, labels=labels)  # grads -> param.grad
 
-    # Training -- train compiles on the first batch, moves batches onto the
-    # trainer's device, and drives the whole train/optimize loop.
+    # Or drive the whole train/optimize loop -- the trainer composes a
+    # GraphCompiler, compiles on the first batch, moves each input dict onto
+    # its device, and owns the optimizer. data_iterable yields input dicts:
+    trainer = GraphTrainer(model, train_fn, pass_config, parallel_plan)
     trainer.train(dataloader, max_steps=100, log_interval=10)
 """
 
-from .pass_plan import (
-    PassPlan,
-    FSDPModuleConfig,
-    create_pass_plan_from_yaml,
-    create_simple_pass_plan,
+from .compiler import GraphCompiler
+
+from .graph_parallel_plan import (
+    GraphParallelPlan,
+    create_all_fsdp_plan,
+    create_plan_from_yaml,
 )
 
 from .pass_config import PassConfig
@@ -59,13 +66,14 @@ from .pass_config import PassConfig
 from .trainer import GraphTrainer
 
 __all__ = [
-    # Pass plan
-    "PassPlan",
-    "FSDPModuleConfig",
-    "create_pass_plan_from_yaml",
-    "create_simple_pass_plan",
+    # Parallel plan
+    "GraphParallelPlan",
+    "create_plan_from_yaml",
+    "create_all_fsdp_plan",
     # Config
     "PassConfig",
+    # Compiler (compile + forward_backward only)
+    "GraphCompiler",
     # Trainer
     "GraphTrainer",
 ]

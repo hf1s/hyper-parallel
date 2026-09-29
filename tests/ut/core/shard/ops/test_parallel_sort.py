@@ -26,9 +26,8 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 op = SortDistributedOp("sort")
-op_ms = SortDistributedOp("SortExt")
 
 
 class TestParallelSort(unittest.TestCase):
@@ -56,7 +55,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x4 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 4),
                                 mesh_dim_names=("dp", "mp"), init_backend=False)
 
@@ -64,7 +62,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x2 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 4
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2),
                                 mesh_dim_names=("dp", "tp"), init_backend=False)
 
@@ -72,7 +69,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x2x2 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2, 2),
                                 mesh_dim_names=("dp", "tp", "mp"), init_backend=False)
 
@@ -265,11 +261,11 @@ class TestParallelSort(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_sort_preprocess_mindspore_stable_in_args(self, mock_platform):
+    def test_sort_preprocess_stable_default_in_kwargs(self, mock_platform):
         """
-        Feature: SortDistributedOp preprocess routes stable into positional args for MindSpore Primitive.
-        Description: MindSpore SortExt Primitive does not accept kwargs; op_name is 'SortExt'.
-        Expectation: local_kwargs is empty; local_args has 4 elements with stable as the 4th arg.
+        Feature: SortDistributedOp preprocess keeps stable in kwargs by default.
+        Description: With no arguments supplied, the normalizer applies its defaults.
+        Expectation: local_kwargs carries dim/descending/stable; local_args holds the tensor only.
         """
         mesh = self._make_2x2_mesh(mock_platform)
         x_placements = (Shard(0), Replicate())
@@ -279,17 +275,14 @@ class TestParallelSort(unittest.TestCase):
         mock_tensor.layout = x_layout
         mock_tensor.to_local.return_value = MagicMock()
 
-        local_args, local_kwargs, cache_values = op_ms.preprocess((mock_tensor,), {})
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor,), {})
 
-        assert not local_kwargs, (
-            f"For MindSpore 'SortExt', local_kwargs should be empty, got {local_kwargs}"
+        assert local_kwargs == {'dim': -1, 'descending': False, 'stable': False}, (
+            f"For 'sort', local_kwargs should be {{'dim': -1, 'descending': False, 'stable': False}}, "
+            f"got local_kwargs={local_kwargs}"
         )
-        assert len(local_args) == 4, (
-            f"For MindSpore 'SortExt', local_args should have 4 elements "
-            f"(tensor, dim, descending, stable), got {len(local_args)}"
-        )
-        assert local_args[3] is False, (
-            f"stable default should be False, got {local_args[3]}"
+        assert len(local_args) == 1, (
+            f"For 'sort', local_args should hold the tensor only, got {len(local_args)}"
         )
 
 

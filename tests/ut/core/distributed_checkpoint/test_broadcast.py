@@ -24,10 +24,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.broadcast as broadcast_mod
 import hyper_parallel.core.distributed_checkpoint.utils as utils_mod
@@ -45,7 +42,7 @@ from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 class _RecordingHandle:
@@ -252,8 +249,6 @@ class TestBroadcastShard(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild broadcast against the torch platform before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(broadcast_mod)
 
     @staticmethod
@@ -372,8 +367,6 @@ class TestEnsureBroadcastGroups(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild broadcast against the torch platform before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(broadcast_mod)
 
     @staticmethod
@@ -686,8 +679,6 @@ class TestBroadcastBatcher(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild broadcast against the torch platform before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(broadcast_mod)
 
     @staticmethod

@@ -38,7 +38,7 @@ IMAGE=hyper-parallel:npu bash docker/run_hyper-parallel.sh --name hyper-parallel
 ```bash
 docker exec -it hyper-parallel-npu bash
 source /usr/local/Ascend/cann/set_env.sh
-python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
+python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
 ## 文件说明
@@ -47,7 +47,6 @@ python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
 | --- | --- |
 | `Dockerfile.hyper-parallel-npu` | 通用 HyperParallel NPU 镜像，默认 PyTorch 2.9 后端 |
 | `Dockerfile.torch` | PyTorch 后端镜像，安装 `hyper_parallel[torch29]` |
-| `Dockerfile.mindspore` | MindSpore 后端镜像，安装 `hyper_parallel[mindspore]` |
 | `build_hyper-parallel_npu.sh` | 简化构建脚本，构建后自动做 import smoke test |
 | `run_hyper-parallel.sh` | Ascend NPU 容器启动脚本 |
 
@@ -73,18 +72,10 @@ HP_EXTRA=torch29 \
 bash docker/build_hyper-parallel_npu.sh hyper-parallel:torch
 ```
 
-构建 MindSpore 环境：
-
-```bash
-DOCKERFILE=docker/Dockerfile.mindspore \
-HP_EXTRA=mindspore \
-bash docker/build_hyper-parallel_npu.sh hyper-parallel:mindspore
-```
-
 `HP_EXTRA` 对应 `docs/installation.md` 中的 extras：
 
 ```text
-torch26 | torch27 | torch29 | torch | mindspore | all
+torch26 | torch27 | torch29 | torch | all
 ```
 
 ## 启动容器
@@ -112,7 +103,7 @@ CARDS=auto DEFAULT_CARDS=0,1,2,3 bash docker/run_hyper-parallel.sh
 
 ```bash
 bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
-  python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
+  python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
 ## Native 扩展构建
@@ -120,8 +111,8 @@ bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
 Dockerfile 支持以下构建参数：
 
 ```text
-BUILD_MULTICORE_EXTENSION=off|mindspore|torch|all
-BUILD_SHMEM_EXTENSION=off|mindspore|torch|all
+BUILD_MULTICORE_EXTENSION=off|torch|all
+BUILD_SHMEM_EXTENSION=off|torch|all
 HYPER_PARALLEL_BUILD_STRICT=off|on
 ```
 
@@ -143,7 +134,7 @@ docker build -f docker/Dockerfile.torch \
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
-python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
+python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
 查看包版本：
@@ -151,7 +142,7 @@ python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
 ```bash
 python3 - <<'PY'
 import importlib.metadata as md
-for name in ("hyper_parallel", "torch", "torch-npu", "mindspore"):
+for name in ("hyper_parallel", "torch", "torch-npu"):
     try:
         print(name, md.version(name))
     except md.PackageNotFoundError:

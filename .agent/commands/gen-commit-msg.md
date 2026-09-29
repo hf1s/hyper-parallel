@@ -48,11 +48,9 @@ Infer scope from changed file paths:
 | `hyper_parallel/core/shard/ops/` | `ops` |
 | `hyper_parallel/core/fully_shard/` | `fsdp` (includes shared `hsdp_*.py` / HSDP scheduler state) |
 | `hyper_parallel/core/pipeline_parallel/` | `pipeline` |
-| `hyper_parallel/core/activation_checkpoint/` | `activation` |
-| `hyper_parallel/core/checkpoint/` | `checkpoint` |
-| `hyper_parallel/platform/torch/` | `torch` |
-| `hyper_parallel/platform/mindspore/` | `mindspore` |
-| `hyper_parallel/platform/` (base) | `platform` |
+| `hyper_parallel/core/activation_memory/` | `activation` |
+| `hyper_parallel/core/distributed_checkpoint/` | `checkpoint` |
+| `hyper_parallel/distributed/` | `distributed` |
 | `hyper_parallel/collectives/` | `collectives` |
 | `tests/` | `test` |
 | `docs/` | `docs` |
@@ -109,14 +107,14 @@ Support unbind with automatic layout derivation for
 sharded tensors along any dimension.
 ```
 
-**Cross-platform fix:**
+**Distributed-tensor fix:**
 
 ```
-fix(platform): align reduce_scatter return type across backends
+fix(dtensor): align reduce_scatter return type across call sites
 
-MindSpore path was returning raw tensor while torch path
-returned DTensor. Normalize both to return DTensor with
-correct layout.
+One path returned a raw local tensor while the other returned
+DTensor. Normalize both to return DTensor with the correct
+layout.
 ```
 
 **FSDP change:**
@@ -125,8 +123,7 @@ correct layout.
 refactor(fsdp): simplify parameter unsharding lifecycle
 
 Consolidate pre-forward and pre-backward unsharding into
-a shared helper to reduce code duplication between torch
-and mindspore paths.
+a shared helper to remove duplicated lifecycle code.
 ```
 
 ## See Also

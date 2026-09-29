@@ -25,7 +25,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 class TestParallelActivationWithAxis(unittest.TestCase):
@@ -57,16 +57,13 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         output_layouts, _ = op.infer_layout(cache_values)
         return output_layouts[0]
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests.
 
-        Args:
-            mock_platform: The MagicMock object injected by @patch.
-            platform_type: Optional PlatformType to set on the mock.
-            world_size: Value returned by mock_platform.get_world_size().
+            Args:
+                mock_platform: The MagicMock object injected by @patch.
+                world_size: Value returned by mock_platform.get_world_size().
         """
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
@@ -357,7 +354,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         assert not local_kwargs
         assert cache_values == [x_layout, 1]
 
-softmax_ms_op = ActivationWithAxisDistributedOp("Softmax")
+softmax_pascal_op = ActivationWithAxisDistributedOp("Softmax")
 softmax_torch_op = ActivationWithAxisDistributedOp("softmax")
 
 
@@ -387,10 +384,8 @@ class TestParallelSoftmax(unittest.TestCase):
         output_layouts, _ = op.infer_layout(cache_values)
         return output_layouts[0]
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests."""
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
@@ -422,7 +417,7 @@ class TestParallelSoftmax(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         cache_values = [x_layout, -1]
-        output_layout = self._infer_single_layout(softmax_ms_op, cache_values)
+        output_layout = self._infer_single_layout(softmax_pascal_op, cache_values)
         expected_map = (0, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map},"
@@ -431,9 +426,9 @@ class TestParallelSoftmax(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert softmax_ms_op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
+        assert softmax_pascal_op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {softmax_ms_op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
+            f"got {softmax_pascal_op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
@@ -449,7 +444,7 @@ class TestParallelSoftmax(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaises(ValueError):
-            _ = softmax_ms_op.infer_layout([x_layout, 0])
+            _ = softmax_pascal_op.infer_layout([x_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_torch_softmax_data_parallel_success(self, mock_platform):

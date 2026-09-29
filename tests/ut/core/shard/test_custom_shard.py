@@ -17,7 +17,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import numpy as np
 import torch
@@ -26,7 +25,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor, _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.shard.custom_shard import custom_shard
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 def _make_mesh(mock_platform, mesh_shape, mesh_dim_names):

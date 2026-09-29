@@ -56,7 +56,7 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAIndexer,
     build_sliding_window_indices as _window_indices,
 )
-from hyper_parallel.models.deepseek_v41.adapter.image_processor import (
+from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
@@ -654,7 +654,31 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_sequence_start: int = 0,
             **kwargs: Any,
     ) -> MoeModelOutputWithPast:
-        """Execute image injection, Engram, shared attention, and pipelined mHC."""
+        """Execute image injection, Engram, shared attention, and pipelined mHC.
+
+        Args:
+            input_ids: Input token IDs.
+            attention_mask: Compact sample-boundary metadata.
+            position_ids: Token position IDs.
+            past_key_values: Unsupported KV-cache state.
+            inputs_embeds: Precomputed token embeddings.
+            use_cache: Whether to request KV-cache output.
+            token_types: Text and image token-type IDs.
+            pixel_values: Flattened ViT patch tensor.
+            image_patch_offsets: Image offsets in ``pixel_values``.
+            image_vit_grid_hw: Per-image ViT grid dimensions.
+            image_llm_grid_hw: Per-image LLM grid dimensions.
+            image_batch_indices: Batch index for each image.
+            image_token_starts: Global token start for each image span.
+            image_sequence_start: Global start of this CP sequence shard.
+            **kwargs: Additional decoder-layer keyword arguments.
+
+        Returns:
+            Decoder hidden state and optional cache metadata.
+        """
+        # The conditions below enforce one ordered forward contract across text,
+        # vision, Engram, shared-attention, mHC, and gradient-checkpointing paths.
+        #lizard forgives(cyclomatic_complexity)
         if use_cache or past_key_values is not None:
             raise NotImplementedError("the V4.1 validation crop supports training without KV cache")
         if (input_ids is None) == (inputs_embeds is None):

@@ -87,7 +87,7 @@ class TestDecomposedCEOpDispatchError:
     def _mock_dist_backend(self):
         """Set up mock distributed backend for each test."""
         from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
-        from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+        from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
         mock_utils = MagicMock()
@@ -123,7 +123,6 @@ class TestDecomposedCEOpDispatchError:
     def test_check_raises_with_sharded_dtensor_in_context(self):
         """Check should raise ValueError with Shard(-1) DTensor in context."""
         import os
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -163,7 +162,6 @@ class TestDecomposedCEOpDispatchError:
     def test_check_does_not_raise_with_replicated_dtensor(self):
         """Check should not raise with Replicate DTensor in context."""
         import os
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         from hyper_parallel.core.dtensor.dtensor import DTensor

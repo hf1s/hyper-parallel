@@ -280,6 +280,7 @@ class _IndexWriter:
         """
         self.idx_path = idx_path
         self.dtype = dtype
+        self.idx_writer = None
 
     def __enter__(self) -> "_IndexWriter":
         """Enter the context introduced by the 'with' keyword
@@ -414,21 +415,21 @@ class _IndexReader:
         logger.info("Extracting sequence lengths")
         self.sequence_lengths = numpy.frombuffer(
             self._buffer, dtype=numpy.int32, count=self.sequence_count, offset=payload_offset
-        ).copy()
+        )
         logger.info("Extracting sequence pointers")
         self.sequence_pointers = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
             count=self.sequence_count,
             offset=payload_offset + self.sequence_lengths.nbytes,
-        ).copy()
+        )
         logger.info("Extracting document indices")
         self.document_indices = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
             count=self.document_count,
             offset=payload_offset + self.sequence_lengths.nbytes + self.sequence_pointers.nbytes,
-        ).copy()
+        )
 
         self.sequence_modes: Optional[numpy.ndarray] = None
         if multimodal:
@@ -441,11 +442,15 @@ class _IndexReader:
                 + self.sequence_lengths.nbytes
                 + self.sequence_pointers.nbytes
                 + self.document_indices.nbytes,
-            ).copy()
+            )
 
-        assert self.sequence_lengths.shape[0] == len(self)
-        assert self.sequence_lengths.shape[0] == self.sequence_count
-        assert self.sequence_lengths.shape[0] == self.document_indices[-1]
+        sequence_length_count = self.sequence_lengths.shape[0]
+        if sequence_length_count != len(self):
+            raise ValueError("Sequence length count does not match the dataset length")
+        if sequence_length_count != self.sequence_count:
+            raise ValueError("Sequence length count does not match the index sequence count")
+        if sequence_length_count != self.document_indices[-1]:
+            raise ValueError("Sequence length count does not match the final document index")
 
         logger.info("Sequences: %d | Documents: %d", len(self), self.document_indices.shape[0] - 1)
 
@@ -764,9 +769,8 @@ class IndexedDataset(torch.utils.data.Dataset):
             bin_reader: _BinReader = OBJECT_STORAGE_BIN_READERS[access](bin_path, object_storage_config)
             index_reader = _IndexReader(local_idx_path, multimodal)
         else:
-            assert os.path.exists(idx_path) and os.path.exists(bin_path), (
-                f"Missing .idx or .bin at prefix {path_prefix}"
-            )
+            if not os.path.exists(idx_path) or not os.path.exists(bin_path):
+                raise FileNotFoundError(f"Missing .idx or .bin at prefix {path_prefix}")
             bin_reader = _MMapBinReader(bin_path) if mmap else _FileBinReader(bin_path)
             index_reader = _IndexReader(idx_path, multimodal)
 
@@ -950,14 +954,16 @@ class IndexedDatasetBuilder:
         """
         # Concatenate index
         index = _IndexReader(get_idx_path(path_prefix), multimodal=self.multimodal)
-        assert index.dtype == self.dtype
+        if index.dtype != self.dtype:
+            raise ValueError(f"Index dtype {index.dtype} does not match builder dtype {self.dtype}")
 
         offset = len(self.sequence_lengths)
         self.sequence_lengths.extend(index.sequence_lengths)
         self.document_indices.extend((offset + index.document_indices)[1:])
 
         if self.multimodal:
-            assert index.sequence_modes is not None, "sequence_modes cannot not be None"
+            if index.sequence_modes is None:
+                raise ValueError("sequence_modes cannot be None for a multimodal dataset")
             self.sequence_modes.extend(index.sequence_modes)
 
         # Free up memory to make space for new indices

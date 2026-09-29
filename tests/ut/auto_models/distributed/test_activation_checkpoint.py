@@ -13,22 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for model-agnostic activation-checkpoint block discovery."""
-# pylint: disable=wrong-import-position
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from torch import Tensor, nn
 
-from tests.ut.platform.mindspore._ensure_mindspore_platform import (
-    restore_torch_platform_for_ut,
-)
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-restore_torch_platform_for_ut()
-
+from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
     _find_transformer_block_modules,
@@ -245,13 +238,20 @@ class TestActivationCheckpointSwapInputs(unittest.TestCase):
     """Tests for activation checkpoint input-swapping configuration."""
 
     def setUp(self) -> None:
-        """Keep swap-input tests independent of optional Transformers imports."""
+        """Keep swap-input tests independent of optional and platform adapters."""
         hf_checkpointing_patch = patch(
             f"{_ACTIVATION_CHECKPOINT_MODULE}._should_use_hf_native_gradient_checkpointing",
             return_value=False,
         )
         hf_checkpointing_patch.start()
         self.addCleanup(hf_checkpointing_patch.stop)
+
+        checkpoint_wrapper_patch = patch(
+            f"{_ACTIVATION_CHECKPOINT_MODULE}.checkpoint_wrapper",
+            new=_checkpoint_wrapper,
+        )
+        checkpoint_wrapper_patch.start()
+        self.addCleanup(checkpoint_wrapper_patch.stop)
 
     @staticmethod
     def _wrapped_blocks(model):

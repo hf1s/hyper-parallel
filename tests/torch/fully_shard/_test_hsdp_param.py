@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Test TorchHSDPParamV2 implementation"""
+"""Test HSDPParamV2 implementation"""
 # pylint: disable=W0611
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch.distributed as dist
 import torch
 from tests.torch.utils import _DEVICE_TYPE, init_backend
 from tests.torch.common_net import DenseNet
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.dtensor._utils import get_device_handle
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
@@ -28,24 +27,21 @@ from hyper_parallel.core.fully_shard.utils import (
     HSDPMeshInfo,
     SourceShardMetaInfo,
 )
-from hyper_parallel.platform.torch.fully_shard.param import (
-    TorchHSDPParamV2,
+from hyper_parallel.core.fully_shard.hsdp_param import (
+    HSDPParamV2,
     ParamModuleInfo
 )
 from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard, Replicate
 from hyper_parallel import DTensor, init_device_mesh
 
 
-platform = get_platform()
-
-
 def _current_device():
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
+    device_handle = get_device_handle(_DEVICE_TYPE)
     return torch.device(device_handle.current_device())
 
 
 def _build_hsdp_param(**kwargs):
-    """Construct TorchHSDPParamV2 with the metadata supplied by its owning state."""
+    """Construct HSDPParamV2 with the metadata supplied by its owning state."""
     param = kwargs["param"]
     if isinstance(param, DTensor):
         kwargs["source_shard_info"] = SourceShardMetaInfo(
@@ -53,13 +49,13 @@ def _build_hsdp_param(**kwargs):
             placements=tuple(param.placements),
             origin_is_dtensor=True,
         )
-    return TorchHSDPParamV2(**kwargs)
+    return HSDPParamV2(**kwargs)
 
 
 def test_hsdp_param_v2_fsdp_1d_mesh():
     """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with 1D FSDP mesh
+    Feature: HSDPParamV2.
+    Description: Test HSDPParamV2 with 1D FSDP mesh
     Expectation: sharded param shape is correct and state is SHARDED
     """
     init_backend(_DEVICE_TYPE)
@@ -74,8 +70,8 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -105,8 +101,8 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
 
 def test_hsdp_param_v2_hsdp_2d_mesh():
     """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with 2D HSDP mesh (replicate + shard)
+    Feature: HSDPParamV2.
+    Description: Test HSDPParamV2 with 2D HSDP mesh (replicate + shard)
     Expectation: sharded param shape is correct with 2D mesh
     """
     init_backend(_DEVICE_TYPE)
@@ -132,8 +128,8 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -160,7 +156,7 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
 
 def test_hsdp_param_v2_sharded_state_transitions():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test state transitions (sharded -> unsharded -> sharded)
     Expectation: state transitions work correctly
     """
@@ -176,8 +172,8 @@ def test_hsdp_param_v2_sharded_state_transitions():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -222,8 +218,8 @@ def test_hsdp_param_v2_sharded_state_transitions():
 
 def test_hsdp_param_v2_custom_shard_placement():
     """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with custom shard placement function
+    Feature: HSDPParamV2.
+    Description: Test HSDPParamV2 with custom shard placement function
     Expectation: custom shard placement is applied correctly
     """
     init_backend(_DEVICE_TYPE)
@@ -242,8 +238,8 @@ def test_hsdp_param_v2_custom_shard_placement():
     # Custom shard placement function - shard along dim 1 instead of default dim 0
     def custom_shard_fn(param):
         return Shard(1)
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2 with custom placement
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2 with custom placement
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -268,8 +264,8 @@ def test_hsdp_param_v2_custom_shard_placement():
 
 def test_hsdp_param_v2_mixed_precision():
     """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with mixed precision policy
+    Feature: HSDPParamV2.
+    Description: Test HSDPParamV2 with mixed precision policy
     Expectation: dtype attributes are set correctly
     """
     init_backend(_DEVICE_TYPE)
@@ -290,8 +286,8 @@ def test_hsdp_param_v2_mixed_precision():
         param_dtype=torch.float16,
         reduce_dtype=torch.float32,
     )
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2 with mixed precision
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2 with mixed precision
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -314,7 +310,7 @@ def test_hsdp_param_v2_mixed_precision():
 
 def test_hsdp_param_v2_all_gather_comm():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test param-level all-gather communication
     Expectation: all-gather correctly reconstructs full parameter
     """
@@ -331,8 +327,8 @@ def test_hsdp_param_v2_all_gather_comm():
     net = DenseNet(in_channels, hidden_size)
     # Initialize weight with rank-based values for verification
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -360,7 +356,7 @@ def test_hsdp_param_v2_all_gather_comm():
 
 def test_hsdp_param_v2_prefetch_unshard():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test async prefetch and unshard workflow
     Expectation: prefetch correctly prepares unsharded parameter
     """
@@ -376,8 +372,8 @@ def test_hsdp_param_v2_prefetch_unshard():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -403,7 +399,7 @@ def test_hsdp_param_v2_prefetch_unshard():
 
 def test_hsdp_param_v2_unshard_shard_cycle():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test complete unshard -> shard cycle with communication
     Expectation: state transitions and communication work correctly
     """
@@ -419,8 +415,8 @@ def test_hsdp_param_v2_unshard_shard_cycle():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -446,7 +442,7 @@ def test_hsdp_param_v2_unshard_shard_cycle():
 
 def test_hsdp_param_v2_reduce_scatter_grad():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test reduce-scatter gradient communication with deterministic data
     Expectation: gradient is correctly reduced and scattered
     """
@@ -462,8 +458,8 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -504,7 +500,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
 
 def test_hsdp_param_v2_all_reduce_grad():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test all-reduce gradient communication in HSDP mode
     Expectation: gradient is correctly all-reduced across replicate dimension
     """
@@ -530,8 +526,8 @@ def test_hsdp_param_v2_all_reduce_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -568,7 +564,7 @@ def test_hsdp_param_v2_all_reduce_grad():
 
 def test_hsdp_param_v2_accumulate_grad():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test gradient accumulation workflow with deterministic data
     Expectation: gradients are correctly accumulated across iterations
     """
@@ -584,8 +580,8 @@ def test_hsdp_param_v2_accumulate_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle(_DEVICE_TYPE)
-    # Create TorchHSDPParamV2
+    device_handle = get_device_handle(_DEVICE_TYPE)
+    # Create HSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
@@ -639,7 +635,7 @@ def test_hsdp_param_v2_accumulate_grad():
 
 def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 2D dp x tp mesh with fully_shard enabled.
     Expectation: fully_shard only adds DP sharding and preserves TP placement after unshard.
     """
@@ -691,7 +687,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
 
 def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 2D dp x tp mesh when TP and fully_shard split the same tensor dim.
     Expectation: fully_shard uses StridedShard and layout tensor_map preserves the split order.
     """
@@ -743,7 +739,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
 
 def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor param on 3D dp x tp x ep mesh.
     Expectation: unshard only restores the DP/FSDP dim and keeps TP/EP placements unchanged.
     """
@@ -795,7 +791,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
 
 def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test a size-one DP mesh with a TP-replicated DTensor parameter.
     Expectation: The DP reduce-scatter is local and the TP replicate dimension is all-reduced.
     """
@@ -852,7 +848,7 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
 
 def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test a size-one DP mesh with a TP-sharded DTensor parameter.
     Expectation: The TP-sharded dimension does not trigger replicate all-reduce.
     """
@@ -904,7 +900,7 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
 
 def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test unified mesh uses explicit DP mesh prefix followed by TP mesh.
     Expectation: DP replicate group size stays correct and StridedShard is applied on the FSDP axis.
     """
@@ -956,7 +952,7 @@ def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
 
 def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test DTensor unified layout keeps the explicit DP/FSDP dims on the unified mesh.
     Expectation: Shard/replicate mesh dims, placements, and communication sizes stay correct.
     """
@@ -1017,7 +1013,7 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
 
 def test_hsdp_param_v2_non_dim0_unshard_round_trip():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test non-dim0 fully_shard reconstructs the original tensor after all-gather.
     Expectation: local shard and unsharded parameter both match the reference layout.
     """
@@ -1064,7 +1060,7 @@ def test_hsdp_param_v2_non_dim0_unshard_round_trip():
 
 def test_hsdp_param_v2_non_dim0_reduce_scatter_grad():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test non-dim0 fully_shard packs gradients with chunk-cat and recovers local shard grad.
     Expectation: reduce_scatter_grad and apply_reduced_grad match the reference dim1 shards.
     """
@@ -1127,7 +1123,7 @@ def test_hsdp_param_v2_non_dim0_reduce_scatter_grad():
 
 def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
     """
-    Feature: TorchHSDPParamV2.
+    Feature: HSDPParamV2.
     Description: Test same-dim TP + fully_shard on dim=1 restores the TP-local view and shards grads correctly.
     Expectation: placements, unshard, reduce_scatter_grad, and apply_reduced_grad all match the reference layout.
     """

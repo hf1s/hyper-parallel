@@ -22,10 +22,7 @@ from unittest.mock import patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mod
 
@@ -58,7 +55,7 @@ from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import RaggedShard
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 class TestStandardPlanner(unittest.TestCase):
@@ -66,8 +63,6 @@ class TestStandardPlanner(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the planner module before every case so the plan cache starts empty."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         StandardSavePlanner.cached_save_result.clear()
 

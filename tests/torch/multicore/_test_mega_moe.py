@@ -25,7 +25,6 @@ import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # The launcher activates CANN and the multicore payload before importing this
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
@@ -38,8 +37,7 @@ from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.platform.torch.common import GroupedExperts
-from hyper_parallel.core.multicore.shmem.lifecycle import acquire_symmetric_memory
+from hyper_parallel.components.modules.moe import GroupedExperts
 
 # pylint: enable=wrong-import-position
 
@@ -541,26 +539,7 @@ def _run_precision_case() -> None:
 
 
 def test_mega_moe_level0_balanced() -> None:
-    """Validate SHMEM lifecycle, then compare routed-expert training results."""
-    memory = acquire_symmetric_memory(dist.group.WORLD)
-    regular = memory.empty((256,), torch.uint8)
-    aligned = memory.aligned_empty((256,), torch.uint8, 512)
-    assert aligned.data_ptr() % 512 == 0, (
-        f"rank={RANK}: aligned SHMEM pointer is not 512-byte aligned."
-    )
-    regular.fill_(RANK)
-    aligned.fill_(RANK)
-    memory.barrier()
-    memory.free(regular)
-    memory.free(aligned)
-    assert regular.untyped_storage().nbytes() == 0, (
-        f"rank={RANK}: regular SHMEM tensor remained accessible after free."
-    )
-    assert aligned.untyped_storage().nbytes() == 0, (
-        f"rank={RANK}: aligned SHMEM tensor remained accessible after free."
-    )
-    memory.close()
-    memory.close()
+    """Compare routed-expert training results with the reference implementation."""
     _run_precision_case()
 
 

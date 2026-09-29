@@ -1,0 +1,1232 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Swap tensor and swap manager implementation for activation checkpointing"""
+# pylint: disable=W0212
+
+import functools
+import threading
+import warnings
+
+from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
+
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from . import _backend
+
+# ---------------------------------------------------------------------------
+# Module-level buffer pools — process-local, no locking needed for single-
+# stream training.  Each GPU process owns its own Python interpreter, so
+# these dicts are never shared across processes.
+#
+# _CPU_PINNED_POOL: a list of available pinned CPU tensors per dtype_key.
+#   Created via alloc_tensor_buffer(pin_memory=True) on the first miss; the
+#   base tensor is returned here after wait_load and reused in the next
+#   launch_offload, avoiding repeated cudaHostAlloc / cudaFreeHost calls.
+# ---------------------------------------------------------------------------
+_CPU_PINNED_POOL: Dict[str, List[Any]] = defaultdict(list)
+# Cap each group-swap staging allocation. 32 MiB keeps DMA chunks large
+# while avoiding one huge per-dtype staging tensor in large models.
+_GROUP_SWAP_MAX_BULK_COPY_BYTES = 32 * 1024 * 1024
+
+
+def _get_cpu_pinned_buf(dtype_key: str, total_numel: int, dtype):
+    """Pop the smallest sufficient pinned buffer from the pool, or allocate.
+
+    Best-fit selection minimises wasted pinned memory.  When no buffer in the
+    pool is large enough, an undersized entry is discarded before allocating a
+    fresh buffer via alloc_tensor_buffer.
+
+    Returns the *full* buffer (capacity >= total_numel).  Callers must slice
+    ``buf[:total_numel]`` for the actual copy so the returned reference can be
+    passed back to :func:`_return_cpu_pinned_buf` without any platform-specific
+    introspection.
+    """
+    pool = _CPU_PINNED_POOL[dtype_key]
+    best_i = -1
+    for i, buf in enumerate(pool):
+        if buf.numel() >= total_numel:
+            if best_i == -1 or buf.numel() < pool[best_i].numel():
+                best_i = i
+    if best_i != -1:
+        return pool.pop(best_i)
+    # No suitable buffer — discard one stale undersized entry.
+    if pool:
+        pool.pop()
+    return _backend.alloc_tensor_buffer(total_numel, dtype, device='cpu', pin_memory=True)
+
+
+def _return_cpu_pinned_buf(buf):
+    """Return a full pinned CPU buffer to the pool for reuse."""
+    if buf is None:
+        return
+    _CPU_PINNED_POOL[str(buf.dtype)].append(buf)
+
+
+def _collect_device_storage_ptrs(tensors: Any) -> Set[int]:
+    """Collect device storage pointers from a nested tensor structure."""
+    storage_ptrs = set()
+
+    def _collect(x):
+        local_tensor = x.to_local() if isinstance(x, DTensor) else x
+        if isinstance(local_tensor, _backend.Tensor) and str(local_tensor.device).lower() != "cpu":
+            storage_ptrs.add(local_tensor.untyped_storage().data_ptr())
+        return x
+
+    _backend.tree_map(_collect, tensors)
+    return storage_ptrs
+
+
+class SwapTensor:
+    """A tensor that can be swapped between device and host memory asynchronously."""
+    STATE_DEVICE = "device"
+    STATE_HOST = "host"
+    STATE_D2H = "d2h"
+    STATE_H2D = "h2d"
+    STATE_NON_TENSOR = "non_tensor"
+
+    def __init__(self, val: Any, funcname: str, group_swap: bool = False, cpu_pool=None) -> None:
+        self.val = val
+        self.funcname = funcname
+        self._keep_on_device = False
+        self._duplicate_swap = False
+        self._group_managed = False # True when this tensor is handled by SwapGroup bulk copy
+        self.group_swap = group_swap # opt-in for group copy fusion (MUST_SWAP tensors only)
+        self.cpu_pool = cpu_pool
+        self._cpu_pool_buffer = None
+        if isinstance(val, _backend.Tensor) and str(val.device).lower() != 'cpu':
+            self.ver = val._version
+            self._state = self.STATE_DEVICE
+            val_storage = val.untyped_storage()
+            self.storage_size = val_storage.size()
+            self.is_slice_tensor = self.storage_size != val.numel() * _backend.get_element_size(val)
+            self.val_cpu = None
+        else:
+            self.ver = None
+            self._state = self.STATE_NON_TENSOR
+            self.val_cpu = None
+            self.is_slice_tensor = False
+            self.storage_size = 0
+
+    def dedup_key(self):
+        """Return a stable identity key for duplicate-swap detection."""
+        if self._state == self.STATE_NON_TENSOR:
+            return None
+        val_storage = self.val.untyped_storage()
+        return (
+            str(self.val.device),
+            val_storage.data_ptr(),
+            self.val.storage_offset(),
+            val_storage.size(),
+            tuple(self.val.stride()),
+        )
+
+    def mark_duplicate_swap(self) -> None:
+        """Mark this wrapper as a duplicate registration in the same swap group."""
+        self._duplicate_swap = True
+
+    def protect_if_aliases(self, alias_storage_ptrs: Set[int]) -> None:
+        """Keep tensors that alias externally-owned tensors on device."""
+        if self._state == self.STATE_NON_TENSOR:
+            return
+        if self.val.untyped_storage().data_ptr() in alias_storage_ptrs:
+            self._keep_on_device = True
+
+    def get_val(self) -> Any:
+        """Return the underlying tensor value.
+
+        Raises RuntimeError if the tensor is not currently in the 'device' state.
+        Non-tensor values are returned directly regardless of state.
+        """
+        if self._state == self.STATE_NON_TENSOR:
+            return self.val
+        if self._state != self.STATE_DEVICE:
+            raise RuntimeError(
+                f"Cannot call get_val(): tensor is in '{self._state}' state. "
+                f"Must be in 'device' state."
+            )
+        return self.val
+
+    def resize_device_storage(self):
+        """Reallocate device memory on compute stream."""
+        if self._state == self.STATE_NON_TENSOR or self._duplicate_swap:
+            return
+
+        if self._state != self.STATE_HOST:
+            return
+        storage = self.val.untyped_storage()
+        if storage.size() == self.storage_size:
+            return
+        storage.resize_(self.storage_size)
+
+    def async_load(self):
+        """async load tensor from host to device"""
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
+            return
+        if self._group_managed:
+            return
+
+        if self._state != self.STATE_HOST:
+            warnings.warn(
+                f"[SwapTensor.async_load] Invalid state: current={self._state}, "
+                f"expected 'host'. Operation skipped."
+            )
+            return
+
+        if self.val_cpu is None:
+            raise ValueError("val_cpu must not be None during async_load")
+        with _backend.preserve_version_counter(self.val):
+            if self.cpu_pool is not None or self.is_slice_tensor:
+                self.val.data.copy_(self.val_cpu, non_blocking=True)
+            else:
+                self.val.untyped_storage().copy_(self.val_cpu.untyped_storage(), non_blocking=True)
+        self._state = self.STATE_H2D
+
+    def async_group_load(self, source):
+        """Copy a packed device-buffer slice back into the original storage."""
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
+            return
+        if not self._group_managed:
+            return
+        if self._state != self.STATE_HOST:
+            warnings.warn(
+                f"[SwapTensor.async_group_load] Invalid state: current={self._state}, "
+                f"expected 'host'. Operation skipped."
+            )
+            return
+        if self.val.untyped_storage().size() != self.storage_size:
+            raise RuntimeError(
+                f"Cannot load grouped tensor from {self.funcname}: device storage was not restored. "
+                f"expected size:{self.storage_size}, current size:{self.val.untyped_storage().size()}"
+            )
+        with _backend.preserve_version_counter(self.val):
+            self.val.copy_(source.reshape(self.val.shape), non_blocking=True)
+        self._state = self.STATE_H2D
+
+    def release_cpu_buffer(self, event=None):
+        """Release an explicitly pooled host buffer exactly once."""
+        if self.cpu_pool is None or self._cpu_pool_buffer is None:
+            return
+        release_tensor = self.val_cpu if self.val_cpu is not None else self._cpu_pool_buffer
+        self.cpu_pool.release(release_tensor, event=event)
+        self._cpu_pool_buffer = None
+        self.val_cpu = None
+
+    def wait_load(self, release_event=None):
+        """change state to device after async load is done"""
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
+            return
+
+        if self._state == self.STATE_DEVICE:
+            return  # already loaded
+        if self._state != self.STATE_H2D:
+            warnings.warn(
+                f"[SwapTensor.wait_load] Called in invalid state: {self._state}. "
+                f"Expected 'h2d'. Skipped."
+            )
+            return
+        self._state = self.STATE_DEVICE
+        self.release_cpu_buffer(release_event)
+        if self.cpu_pool is None:
+            self.val_cpu = None
+
+    def async_offload(self):
+        """async offload tensor from device to host"""
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
+            return
+        if self._group_managed:
+            return
+
+        if self._state != self.STATE_DEVICE:
+            warnings.warn(
+                f"[SwapTensor.async_offload] Invalid state: current={self._state}, "
+                f"expected 'device'. Operation skipped."
+            )
+            return
+
+        if self.storage_size != self.val.untyped_storage().size():
+            raise RuntimeError(
+                f"There is a tensor from {self.funcname} cannot be SWAPPED! Its storage has been resized "
+                f"presize:{self.storage_size}, current size:{self.val.untyped_storage().size()}"
+            )
+        if self.ver != self.val._version:
+            raise RuntimeError(
+                f"There is a tensor from {self.funcname} cannot be SWAPPED! In-place modification happened "
+                f"preversion:{self.ver}, current version:{self.val._version}"
+            )
+
+        if self.val_cpu is None:
+            if self.cpu_pool is None:
+                self.val_cpu = _backend.empty_like(
+                    self.val, device="cpu", pin_memory=True
+                )
+            else:
+                logical_bytes = self.val.numel() * _backend.get_element_size(self.val)
+                self._cpu_pool_buffer = self.cpu_pool.acquire(logical_bytes)
+                try:
+                    self.val_cpu = self._cpu_pool_buffer.view(self.val.dtype).reshape(self.val.shape)
+                except Exception as exc:
+                    pool_buffer = self._cpu_pool_buffer
+                    self.release_cpu_buffer()
+                    raise RuntimeError(
+                        "Failed to create a typed CPU-pool view for activation tensor "
+                        f"from {self.funcname!r}: shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
+                        f"logical_bytes={logical_bytes}, pool_buffer_shape={tuple(pool_buffer.shape)}, "
+                        f"pool_buffer_dtype={pool_buffer.dtype}. Original error: {exc}"
+                    ) from exc
+        try:
+            if self.cpu_pool is not None or self.is_slice_tensor:
+                self.val_cpu.copy_(self.val, non_blocking=True)
+            else:
+                self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
+        except Exception as exc:
+            if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
+                release_event = _backend.new_event()
+                release_event.record(_backend.get_current_stream())
+                self.release_cpu_buffer(release_event)
+            self.val_cpu = None
+            copy_mode = "tensor" if self.cpu_pool is not None or self.is_slice_tensor else "storage"
+            raise RuntimeError(
+                "Failed to offload activation tensor from device to CPU: "
+                f"source={self.funcname!r}, shape={tuple(self.val.shape)}, dtype={self.val.dtype}, "
+                f"device={self.val.device}, copy_mode={copy_mode}, "
+                f"cpu_pool={'enabled' if self.cpu_pool is not None else 'disabled'}. "
+                f"Original error: {exc}"
+            ) from exc
+        self._state = self.STATE_D2H
+
+    def wait_offload(self):
+        """wait offload to host and free device memory"""
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
+            return
+
+        if self._state == self.STATE_HOST:
+            return
+        if self._state != self.STATE_D2H:
+            warnings.warn(
+                f"[SwapTensor.wait_offload] Called in invalid state: {self._state}. "
+                f"Expected 'd2h'. Skipped."
+            )
+            return
+        storage = self.val.untyped_storage()
+        if storage.size() != 0:
+            storage.resize_(0)
+        self._state = self.STATE_HOST
+
+    @property
+    def state(self) -> str:
+        """Return the current swap state of this tensor (device, host, d2h, h2d, or non_tensor)."""
+        return self._state
+
+    def __repr__(self):
+        if self._state == self.STATE_NON_TENSOR:
+            return f"<SwapTensor state=non_tensor, val_type={type(self.val).__name__}>"
+        return (
+            f"<SwapTensor state={self._state}, duplicate={self._duplicate_swap}, "
+            f"device_val={'exists' if self.val is not None else 'None'}>"
+        )
+
+
+class Storage:
+    """Manage a collection of tensors for swapping operations.
+
+    Supports dict-like access: ``storage[key].append(item)``, ``storage.clear()``,
+    ``for batch in storage.values(): ...``.
+    """
+
+    def __init__(self):
+        self._data: Dict[Any, List[Any]] = defaultdict(list)
+
+    def __getitem__(self, key: Any) -> List[Any]:
+        return self._data[key]
+
+    def values(self):
+        """Return an iterable view of all stored lists."""
+        return self._data.values()
+
+    def clear(self):
+        """Remove all entries from the storage."""
+        self._data.clear()
+
+    def iter_swap_tensors(self):
+        """Iterate all SwapTensor objects stored in this storage."""
+        collected = []
+
+        def _collect(x):
+            if isinstance(x, SwapTensor):
+                collected.append(x)
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_collect, item)
+        return collected
+
+    def mark_duplicate_swaps(self, seen_keys) -> int:
+        """Mark tensors already registered in the same swap group as duplicates."""
+        duplicate_count = 0
+        for swap_tensor in self.iter_swap_tensors():
+            dedup_key = swap_tensor.dedup_key()
+            if dedup_key is None:
+                continue
+            if dedup_key in seen_keys:
+                swap_tensor.mark_duplicate_swap()
+                duplicate_count += 1
+                continue
+            seen_keys.add(dedup_key)
+        return duplicate_count
+
+    def protect_alias_storage_ptrs(self, alias_storage_ptrs: Set[int]):
+        """Avoid offloading swap entries that alias externally-owned storage."""
+        if not alias_storage_ptrs:
+            return
+
+        def _protect_tensor(x):
+            if isinstance(x, SwapTensor):
+                x.protect_if_aliases(alias_storage_ptrs)
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_protect_tensor, item)
+
+    def launch_load(self):
+        """launch async load for all tensors in swap storage"""
+        def _async_load(x):
+            if isinstance(x, SwapTensor):
+                x.async_load()
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_async_load, item)
+
+    def resize_device_storage(self):
+        """Resize device storage for all swap tensors (runs on compute stream)."""
+        def _resize(x):
+            if isinstance(x, SwapTensor):
+                x.resize_device_storage()
+            return x
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_resize, item)
+
+    def wait_load(self, release_event=None):
+        """wait load for all tensors in swap storage"""
+        def _wait_load(x):
+            if isinstance(x, SwapTensor):
+                x.wait_load(release_event=release_event)
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_wait_load, item)
+        self.clear()
+
+    def release_cpu_buffers(self, event=None):
+        """Release all explicitly pooled host buffers held by this storage."""
+        def _release(x):
+            if isinstance(x, SwapTensor):
+                x.release_cpu_buffer(event=event)
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_release, item)
+
+    def wait_offload(self):
+        """wait offload for all tensors in swap storage"""
+        def _wait_offload(x):
+            if isinstance(x, SwapTensor):
+                x.wait_offload()
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_wait_offload, item)
+
+    def launch_offload(self):
+        """launch async offload for all tensors in swap storage"""
+        def _async_offload(x):
+
+            if isinstance(x, SwapTensor):
+                x.async_offload()
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                _backend.tree_map(_async_offload, item)
+
+
+class SwapGroup:
+    """Manager for a group of storages to coordinate swap operations.
+
+    Non-slice tensors within the group are packed into bounded contiguous device
+    buffers before D2H transfer, and loaded back from bounded H2D buffers.
+    Each packed slice is copied back into its tensor's original device storage so
+    autograd views that alias that storage remain valid during backward.
+
+    Slice tensors (storage larger than logical data) fall back to the original
+    per-tensor copy path.
+    """
+
+    def __init__(self, group_name: str):
+        self.group_name = group_name
+        self.is_last_group: bool = False
+        self._storages: List[Storage] = []
+        self._load_event: Optional[Any] = None
+        self._offload_event: Optional[Any] = None
+        # Group-level contiguous buffers for non-slice tensors.
+        self._packed_tensor_info: List = []   # [(SwapTensor, bucket_key, element_offset), ...]
+        self._packed_buckets: Dict[str, Dict[str, Any]] = {}
+        self._group_cpu_buf = None            # pinned CPU bufs; live offload→load
+        self._group_device_buf = None         # temp device bufs; cleared after each phase
+        # Persistent dedup set accumulated across add() calls; avoids O(N²) rebuild.
+        # mark_duplicate_swaps mutates it in-place, so new keys are added automatically.
+        # Reset at wait_load() so stale data_ptrs don't leak into the next iteration.
+        self._seen_dedup_keys: set = set()
+        # Per-bucket SwapTensor lists built in _collect_packable_tensors and consumed
+        # in launch_offload, eliminating a redundant pass over _packed_tensor_info.
+        self._packed_by_bucket: Dict[str, List] = {}
+
+    def add(self, storage):
+        """Add a storage to the swap group."""
+        duplicate_count = storage.mark_duplicate_swaps(self._seen_dedup_keys)
+        if duplicate_count > 0:
+            warnings.warn(
+                f"SwapGroup '{self.group_name}' skipped {duplicate_count} duplicate tensor swap registration(s)."
+            )
+        self._storages.append(storage)
+
+    def protect_alias_tensors(self, tensors: Any):
+        """Protect externally-owned tensors from premature offload."""
+        alias_storage_ptrs = _collect_device_storage_ptrs(tensors)
+        if not alias_storage_ptrs:
+            return
+        for storage in self._storages:
+            storage.protect_alias_storage_ptrs(alias_storage_ptrs)
+
+    @staticmethod
+    def _bucket_tensor(candidate_buckets, dtype_key, x):
+        """Append ``x`` to its dtype bucket, opening a new bucket when full."""
+        dtype_buckets = candidate_buckets.setdefault(dtype_key, [])
+        if (not dtype_buckets or
+                dtype_buckets[-1]["total_bytes"] + x.storage_size > _GROUP_SWAP_MAX_BULK_COPY_BYTES):
+            dtype_buckets.append({
+                "bucket_key": f"{dtype_key}#{len(dtype_buckets)}",
+                "dtype": x.val.dtype,
+                "dtype_key": str(x.val.dtype),
+                "device": x.val.device,
+                "tensors": [],
+                "total_bytes": 0,
+                "total_numel": 0,
+                "cpu_pool": x.cpu_pool,
+            })
+        bucket = dtype_buckets[-1]
+        bucket["tensors"].append(x)
+        bucket["total_bytes"] += x.storage_size
+        bucket["total_numel"] += x.val.numel()
+        return x
+
+    def _finalize_packed_buckets(self, candidate_buckets, packed_info, packed_buckets, packed_by_bucket) -> int:
+        """Turn multi-tensor candidate buckets into packed buckets; return owned bytes."""
+        total_bytes = 0
+        for dtype_bucket_list in candidate_buckets.values():
+            for candidate_bucket in dtype_bucket_list:
+                tensors = candidate_bucket["tensors"]
+                if len(tensors) < 2:
+                    continue
+                bucket_key = candidate_bucket["bucket_key"]
+                packed_buckets[bucket_key] = {
+                    "dtype": candidate_bucket["dtype"],
+                    "dtype_key": candidate_bucket["dtype_key"],
+                    "device": candidate_bucket["device"],
+                    "total_numel": candidate_bucket["total_numel"],
+                    "total_bytes": candidate_bucket["total_bytes"],
+                    "cpu_pool": candidate_bucket["cpu_pool"],
+                }
+                element_offset = 0
+                for tensor in tensors:
+                    tensor._group_managed = True
+                    tensor._state = SwapTensor.STATE_D2H
+                    packed_info.append((tensor, bucket_key, element_offset))
+                    element_offset += tensor.val.numel()
+                packed_by_bucket[bucket_key] = tensors
+                total_bytes += candidate_bucket["total_bytes"]
+        return total_bytes
+
+    def _collect_packable_tensors(self) -> int:
+        """Identify tensors eligible for group packing and mark them for bulk copy.
+
+        A tensor is eligible only when it is contiguous, not a slice tensor,
+        not a duplicate, not sharing storage with another live swap tensor, and
+        has ``group_swap=True``.  Dtype buckets are split before their staging
+        allocation would exceed ``_GROUP_SWAP_MAX_BULK_COPY_BYTES``.  A packed
+        bucket with fewer than two tensors is left on the original per-tensor
+        path because it has no batch-copy benefit.  Non-contiguous
+        tensors are excluded because the packing step copies storage-order
+        bytes while restore uses the original stride; those tensors fall back to
+        the per-tensor copy path.
+        Shared-storage tensors also fall back together because group packing
+        frees the original storage after packing, which would invalidate any
+        non-packed aliases such as transpose views before their own offload.
+
+        Side effects: marks each eligible tensor with ``_group_managed=True``
+        and ``_state=STATE_D2H``, and populates ``_packed_tensor_info`` /
+        ``_packed_buckets``.
+
+        Returns:
+            Total byte count of all packable tensors.
+        """
+        candidate_buckets: Dict[str, List[Dict[str, Any]]] = {}
+        packed_info: List = []
+        packed_buckets: Dict[str, Dict[str, Any]] = {}
+        packed_by_bucket: Dict[str, List] = {}
+
+        def _try_pack(x):
+            if not isinstance(x, SwapTensor):
+                return x
+            no_pack = (not x.group_swap or x._state != SwapTensor.STATE_DEVICE or x._keep_on_device
+                       or x.is_slice_tensor or x._duplicate_swap or x.storage_size >= _GROUP_SWAP_MAX_BULK_COPY_BYTES
+                       or not x.val.is_contiguous())
+            if no_pack:
+                return x
+            if x.storage_size != x.val.untyped_storage().size():
+                raise RuntimeError(
+                    f"There is a tensor from {x.funcname} cannot be SWAPPED! Its storage has been resized "
+                    f"presize:{x.storage_size}, current size:{x.val.untyped_storage().size()}"
+                )
+            if x.ver != x.val._version:
+                raise RuntimeError(
+                    f"There is a tensor from {x.funcname} cannot be SWAPPED! In-place modification happened "
+                    f"preversion:{x.ver}, current version:{x.val._version}"
+                )
+            dtype_key = (str(x.val.dtype), id(x.cpu_pool))
+            return self._bucket_tensor(candidate_buckets, dtype_key, x)
+
+        for storage in self._storages:
+            for storage_list in storage.values():
+                for item in storage_list:
+                    _backend.tree_map(_try_pack, item)
+
+        total_bytes = self._finalize_packed_buckets(
+            candidate_buckets, packed_info, packed_buckets, packed_by_bucket
+        )
+
+        self._packed_tensor_info = packed_info
+        self._packed_buckets = packed_buckets
+        self._packed_by_bucket = packed_by_bucket
+        return total_bytes
+
+    def _pack_device_buffers(self):
+        """Concatenate each packed bucket's tensors into one contiguous device buffer."""
+        group_device_bufs = {}
+        for bucket_key, swap_tensors in self._packed_by_bucket.items():
+            group_device_bufs[bucket_key] = _backend.cat(
+                [st.val.reshape(-1) for st in swap_tensors], dim=0
+            )
+        return group_device_bufs
+
+    @staticmethod
+    def _protect_device_bufs(group_device_bufs, copy_stream):
+        """Keep staging device buffers reserved for the copy stream.
+
+        A staging buffer is otherwise referenced only by a local, so a failure
+        part-way through the copy loop can drop the last reference while the
+        copy stream is still reading it -- and the caching allocator may then
+        hand that memory to the compute stream.
+        """
+        for buf in group_device_bufs.values():
+            device = getattr(buf, "device", None)
+            if device is not None and device.type not in ("cpu", "meta"):
+                buf.record_stream(copy_stream)
+
+    def _acquire_bucket_cpu_buf(self, bucket_key, bucket):
+        """Acquire the pinned CPU buffer that receives one bucket's D2H copy."""
+        numel = bucket["total_numel"]
+        if bucket["cpu_pool"] is None:
+            return _get_cpu_pinned_buf(bucket["dtype_key"], numel, bucket["dtype"])
+        raw_buf = bucket["cpu_pool"].acquire(bucket["total_bytes"])
+        try:
+            return raw_buf.view(bucket["dtype"])
+        except Exception as exc:
+            bucket["cpu_pool"].release(raw_buf)
+            raise RuntimeError(
+                "Failed to create a typed CPU-pool view for packed activation bucket: "
+                f"group={self.group_name!r}, bucket={bucket_key!r}, "
+                f"requested_dtype={bucket['dtype']}, total_numel={numel}, "
+                f"total_bytes={bucket['total_bytes']}, raw_buffer_shape={tuple(raw_buf.shape)}, "
+                f"raw_buffer_dtype={raw_buf.dtype}. Original error: {exc}"
+            ) from exc
+
+    def _release_offloaded_bucket_bufs(self, group_cpu_bufs, copy_stream):
+        """Give back every buffer already filled before a failed D2H loop."""
+        release_event = _backend.new_event()
+        release_event.record(copy_stream)
+        for bucket_key, cpu_buf in group_cpu_bufs.items():
+            cpu_pool = self._packed_buckets[bucket_key]["cpu_pool"]
+            if cpu_pool is not None:
+                cpu_pool.release(cpu_buf, event=release_event)
+            else:
+                _return_cpu_pinned_buf(cpu_buf)
+
+    def _offload_buckets_d2h(self, group_device_bufs, copy_stream):
+        """One-shot D2H per packed bucket."""
+        group_cpu_bufs = {}
+        active_bucket_key = None
+        try:
+            for bucket_key, bucket in self._packed_buckets.items():
+                active_bucket_key = bucket_key
+                cpu_buf = self._acquire_bucket_cpu_buf(bucket_key, bucket)
+                group_cpu_bufs[bucket_key] = cpu_buf
+                cpu_buf[:bucket["total_numel"]].copy_(
+                    group_device_bufs[bucket_key], non_blocking=True
+                )
+        except Exception as exc:
+            self._release_offloaded_bucket_bufs(group_cpu_bufs, copy_stream)
+            failed_bucket = self._packed_buckets.get(active_bucket_key, {})
+            raise RuntimeError(
+                "Failed to offload packed activation bucket from device to CPU: "
+                f"group={self.group_name!r}, bucket={active_bucket_key!r}, "
+                f"dtype={failed_bucket.get('dtype', 'unknown')}, "
+                f"total_numel={failed_bucket.get('total_numel', 'unknown')}, "
+                f"total_bytes={failed_bucket.get('total_bytes', 'unknown')}, "
+                f"cpu_pool={'enabled' if failed_bucket.get('cpu_pool') is not None else 'disabled'}. "
+                f"Original error: {exc}"
+            ) from exc
+        return group_cpu_bufs
+
+    def launch_offload(self, copy_stream):
+        """Launch async offload for all storages in the group.
+
+        Non-slice tensors are first packed into bounded contiguous device
+        buffers, then transferred to pinned CPU memory.  Slice tensors are
+        offloaded individually via the existing per-tensor path.
+        """
+        total_bytes = self._collect_packable_tensors()
+        with _backend.no_grad():
+            group_device_bufs = self._pack_device_buffers() if total_bytes > 0 else {}
+
+        compute_event = _backend.new_event()
+        compute_event.record(_backend.get_current_stream())
+        self._offload_event = _backend.new_event()
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(copy_stream):
+            compute_event.wait(copy_stream)
+
+            if total_bytes > 0:
+                # Publish and protect the staging buffers before the first async
+                # D2H: if the copy loop fails part-way, the stack unwinding must
+                # not drop the last reference to memory the copy stream is still
+                # reading.
+                self._group_device_buf = group_device_bufs
+                self._protect_device_bufs(group_device_bufs, copy_stream)
+                self._group_cpu_buf = self._offload_buckets_d2h(group_device_bufs, copy_stream)
+
+            # Slice tensors use the existing per-tensor path.
+            # Group-managed tensors are already STATE_D2H so async_offload is a no-op.
+            for storage in self._storages:
+                storage.launch_offload()
+            self._offload_event.record(copy_stream)
+
+    def wait_offload(self):
+        """Wait for offload to complete for all storages in the group."""
+        if self._offload_event is None:
+            raise RuntimeError(
+                f"SwapGroup '{self.group_name}' wait_offload() called before launch_offload()."
+            )
+        compute_stream = _backend.get_current_stream()
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(compute_stream):
+            self._offload_event.wait(compute_stream)
+            self._offload_event = None
+            for storage in self._storages:
+                storage.wait_offload()
+        # Release the temporary device packing buffer; _group_cpu_buf persists until launch_load.
+        self._group_device_buf = None
+
+    def launch_load(self, copy_stream):
+        """Prepare storage and launch async load for all storages in the group.
+
+        Non-slice tensors are loaded from pinned CPU memory into bounded
+        contiguous device buffers, then copied device-to-device into their
+        original storages.  Slice tensors use the existing per-tensor path.
+        """
+        # Restore original storages before scheduling copies. Keeping the same
+        # storage object is required for autograd-saved views of packed tensors.
+        with _backend.no_grad():
+            for storage in self._storages:
+                storage.resize_device_storage()
+
+        compute_event = _backend.new_event()
+        compute_event.record(_backend.get_current_stream())
+        self._load_event = _backend.new_event()
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(copy_stream):
+            compute_event.wait(copy_stream)
+
+            if self._packed_tensor_info and self._group_cpu_buf is not None:
+                group_device_bufs = {}
+                for bucket_key, bucket in self._packed_buckets.items():
+                    cpu_buf = self._group_cpu_buf.get(bucket_key)
+                    if cpu_buf is None:
+                        continue
+                    numel = bucket["total_numel"]
+                    group_device_bufs[bucket_key] = _backend.alloc_tensor_buffer(
+                        numel, bucket["dtype"], bucket["device"]
+                    )
+                # Publish and protect the staging buffers before the first async
+                # H2D, for the same reason as launch_offload.
+                self._group_device_buf = group_device_bufs
+                self._protect_device_bufs(group_device_bufs, copy_stream)
+
+                for bucket_key, bucket in self._packed_buckets.items():
+                    group_device_buf = group_device_bufs.get(bucket_key)
+                    if group_device_buf is None:
+                        continue
+                    # One-shot H2D per packed bucket.
+                    group_device_buf.copy_(
+                        self._group_cpu_buf[bucket_key][:bucket["total_numel"]],
+                        non_blocking=True,
+                    )
+
+                # Unpack with D2D copies into the original storages. Rebinding
+                # st.val with set_() would leave existing aliases on freed storage.
+                for st, bucket_key, element_offset in self._packed_tensor_info:
+                    group_device_buf = group_device_bufs.get(bucket_key)
+                    if group_device_buf is None:
+                        continue
+                    source = group_device_buf[element_offset:element_offset + st.val.numel()]
+                    st.async_group_load(source)
+
+            # Slice tensors use the existing per-tensor path.
+            # Group-managed tensors skip async_load via _group_managed flag.
+            for storage in self._storages:
+                storage.launch_load()    # Only copy, no resize
+            self._load_event.record(copy_stream)
+
+    def release_cpu_buffers(self, event=None):
+        """Release staging buffers immediately or defer until ``event`` completes."""
+        if self._group_cpu_buf is None:
+            return
+        for bucket_key, buf in self._group_cpu_buf.items():
+            bucket = self._packed_buckets.get(bucket_key)
+            if bucket is not None and bucket["cpu_pool"] is not None:
+                bucket["cpu_pool"].release(buf, event=event)
+            else:
+                _return_cpu_pinned_buf(buf)
+        self._group_cpu_buf = None
+
+    def wait_load(self):
+        """Wait for grouped H2D and D2D loads to complete."""
+        if self._load_event is None:
+            raise RuntimeError(
+                f"SwapGroup '{self.group_name}' wait_load() called before launch_load()."
+            )
+        compute_stream = _backend.get_current_stream()
+        load_event = self._load_event
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(compute_stream):
+            load_event.wait(compute_stream)
+            for storage in self._storages:
+                storage.wait_load(release_event=load_event)
+            self._load_event = None
+        self._storages.clear()
+        # Keep explicit-pool buffers pending until the copy event completes;
+        # legacy buffers retain their existing immediate-reuse behavior.
+        self.release_cpu_buffers(event=load_event)
+        # Device buffer: the pool holds the staging reference; just drop
+        # the local reference.  Tensors aliasing _group_device_buf's
+        # storage keep it alive via their own storage references until
+        # they are consumed in backward.
+        self._group_device_buf = None
+        self._packed_tensor_info = []
+        self._packed_buckets = {}
+        self._packed_by_bucket = {}
+        self._seen_dedup_keys = set()
+
+
+class SwapManager:
+    """Singleton manager for swap groups and their operations."""
+    _instance: Optional["SwapManager"] = None
+    _lock = threading.Lock()
+    _FORWARD_PREFETCH_HOOK_HANDLE_ATTRS = (
+        "_swap_forward_pre_hook_handle",
+        "_swap_forward_hook_handle",
+        "_swap_backward_pre_hook_handle",
+        "_swap_backward_hook_handle",
+    )
+
+    def __init__(self) -> None:
+        """Initialize process-local swap groups once for the singleton."""
+        if hasattr(self, '_groups'):
+            return
+        self._groups: Dict[str, SwapGroup] = {}
+        self._current_group_name: ContextVar[str] = ContextVar(
+            "swap_current_group_name", default=""
+        )
+        self._layer_count: int = 0
+        self._copy_stream: Optional[Any] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def add_storage(self, group_name: str, storage: Storage) -> None:
+        """Add a storage to a specified swap group."""
+        self.ensure_group(group_name)
+        self._groups[group_name].add(storage)
+
+    def ensure_group(self, group_name: str) -> None:
+        """Create the swap group if it does not exist yet."""
+        if group_name not in self._groups:
+            self._groups[group_name] = SwapGroup(group_name)
+
+    def launch_offload(self, group_name: str, copy_stream=None):
+        """Launch async offload for a specified swap group."""
+        group = self._groups.get(group_name)
+        if group is None:
+            raise RuntimeError(f"Group {group_name} does not exist.")
+        if copy_stream is None:
+            copy_stream = self._get_copy_stream()
+        group.launch_offload(copy_stream)
+
+    def protect_alias_tensors(self, group_name: str, tensors: Any):
+        """Keep tensors that alias externally-owned tensors on device."""
+        group = self._groups.get(group_name)
+        if group is None:
+            raise RuntimeError(f"Group {group_name} does not exist.")
+        group.protect_alias_tensors(tensors)
+
+    def wait_offload(self, group_name: str):
+        """Wait for offload to complete for a specified swap group."""
+        group = self._groups.get(group_name)
+        if group is None:
+            raise RuntimeError(f"Group {group_name} does not exist.")
+        group.wait_offload()
+
+    def launch_load(self, group_name: str, copy_stream=None):
+        """Launch async load for a specified swap group."""
+        group = self._groups.get(group_name)
+        if group is None:
+            raise RuntimeError(f"Group {group_name} does not exist.")
+        if copy_stream is None:
+            copy_stream = self._get_copy_stream()
+        group.launch_load(copy_stream)
+
+    def wait_load(self, group_name: str):
+        """Wait for load to complete for a specified swap group."""
+        group = self._groups.get(group_name)
+        if group is None:
+            raise RuntimeError(f"Group {group_name} does not exist.")
+        group.wait_load()
+
+    def release_group_storage(self, group_name: str) -> None:
+        """Release storage references held by the swap group."""
+        group = self._groups.get(group_name)
+        if group is not None:
+            group._storages.clear()
+
+    def abort_group(self, group_name: str) -> None:
+        """Synchronize in-flight transfers and remove a failed run's group."""
+        group = self._groups.pop(group_name, None)
+        if group is None:
+            return
+        for event in (group._offload_event, group._load_event):
+            if event is not None:
+                event.synchronize()
+        for storage in group._storages:
+            storage.release_cpu_buffers()
+        group.release_cpu_buffers()
+        group._storages.clear()
+
+    def get_current_group_name(self) -> str:
+        """Return the name of the currently active swap group."""
+        return self._current_group_name.get()
+
+    def set_current_group_name(self, group_name: str) -> None:
+        """Set the name of the currently active swap group."""
+        self._current_group_name.set(group_name)
+
+    def active_group_count(self) -> int:
+        """Return the number of live swap groups for lifecycle diagnostics."""
+        return len(self._groups)
+
+    @contextmanager
+    def group_context(self, group_name: str) -> Iterator[None]:
+        """Activate a swap group within the current execution context."""
+        token = self._current_group_name.set(group_name)
+        try:
+            yield
+        finally:
+            self._current_group_name.reset(token)
+
+    def is_last_group(self, group_name: Optional[str] = None) -> bool:
+        """Return whether the specified swap group is the terminal group in the chain."""
+        group_name = self.get_current_group_name() if group_name is None else group_name
+        group = self._groups.get(group_name)
+        if group is None:
+            return False
+        return group.is_last_group
+
+    def unregister_forward_prefetch_hooks(self, module: Any) -> int:
+        """Remove hooks installed by :meth:`set_forward_prefetch_layer`.
+
+        Args:
+            module: Module whose layer-level swap hooks should be removed.
+
+        Returns:
+            Number of removed hook handles.
+        """
+        removed_count = 0
+        for attr_name in self._FORWARD_PREFETCH_HOOK_HANDLE_ATTRS:
+            if not hasattr(module, attr_name):
+                continue
+            handle = getattr(module, attr_name)
+            if handle is not None:
+                handle.remove()
+            delattr(module, attr_name)
+            removed_count += 1
+        return removed_count
+
+    def unregister_forward_prefetch_layer(self, module: Any) -> int:
+        """Tear down prefetch wiring registered on ``module`` and its group.
+
+        Removes the four forward/backward swap hooks installed on ``module``
+        by :meth:`set_forward_prefetch_layer` and drops its swap group from the
+        process-wide singleton.  Mirrors the reverse of :meth:`set_forward_prefetch_layer`
+        so models destroyed in a long-lived process do not leave stale ``SwapGroup``
+        entries or hook handles behind (see the swap-inputs path in
+        ``distributed/activation_checkpoint.py``, which installs these hooks but
+        previously had no teardown).
+
+        Args:
+            module: A layer that participated in a prefetch chain.
+
+        Returns:
+            Number of removed hook handles.
+        """
+        removed_count = self.unregister_forward_prefetch_hooks(module)
+        group_name = getattr(module, "_swap_group_name", None)
+        if group_name is not None:
+            self.abort_group(group_name)
+            delattr(module, "_swap_group_name")
+            if hasattr(module, "_swap_group_order"):
+                delattr(module, "_swap_group_order")
+        # Also drop the swap state so a module re-registered through
+        # set_forward_prefetch_layer does not inherit a stale "pre_backward"
+        # flag that would short-circuit the new forward pre-hook.
+        if hasattr(module, "_swap_state"):
+            delattr(module, "_swap_state")
+        return removed_count
+
+    def set_forward_prefetch_layer(self, first_layer, second_layer):
+        """
+        Configure prefetching and offloading order between two consecutive layers.
+
+        Usage:
+            for i in range(len(model.layers) - 1):
+                set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+
+        Ensures idempotency: safe to call multiple times on the same layer pair.
+        """
+        if first_layer is second_layer:
+            warnings.warn(
+                "set_forward_prefetch_layer: "
+                "Prefetching between identical layers has no effect.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        def _ensure_group_name(module):
+            """Assign a unique swap group name to the module if not already assigned."""
+            if not hasattr(module, "_swap_group_name"):
+                name = f"swap_group_{self._layer_count}"
+                self._layer_count += 1
+                module._swap_group_name = name
+                module._swap_group_order = {"prev": None, "next": None}
+            return module._swap_group_name
+        first_name = _ensure_group_name(first_layer)
+        second_name = _ensure_group_name(second_layer)
+
+        if first_name not in self._groups:
+            self._groups[first_name] = SwapGroup(first_name)
+        if second_name not in self._groups:
+            self._groups[second_name] = SwapGroup(second_name)
+
+        if first_layer._swap_group_order["next"] is None:
+            first_layer._swap_group_order["next"] = second_name
+        if second_layer._swap_group_order["prev"] is None:
+            second_layer._swap_group_order["prev"] = first_name
+
+        self._groups[first_name].is_last_group = first_layer._swap_group_order["next"] is None
+        self._groups[second_name].is_last_group = second_layer._swap_group_order["next"] is None
+
+        def _forward_pre_hook(group_name, module, _):  # pylint: disable=W0613
+            if getattr(module, "_swap_state", None) == "pre_backward":
+                return
+            SwapManager().set_current_group_name(group_name)
+
+        def _forward_hook(group_name, module, args, output):  # pylint: disable=W0613
+            """
+            Forward post-hook executed immediately after forward computation
+            of the current layer finishes.
+
+            Execution timeline (example with 3 layers, forward order: L0 → L1 → L2):
+
+                Time →
+                Forward Compute Stream:
+                    | Fwd L0 | post(L0) | Fwd L1 | post(L1) | Fwd L2 |
+
+                Copy Stream (offload):
+                            | Offload L0 |    -    | Offload L1 |
+                                ↑                ↑
+                            offload at post(L0)  offload at post(L1)
+
+            Swap rules:
+            1. After forward computation of the current layer completes:
+            - If a next layer exists, asynchronously offload the activations
+                of the current layer (launch_offload).
+
+            Example:
+            - At post-forward of L0, offload activations of L0.
+            - At post-forward of L1, offload activations of L1.
+
+            2. To limit device memory peak:
+            - If a previous layer exists, wait until its offload operation
+                has completed (wait_offload).
+
+            Notes:
+            - Offload operations are issued on the copy stream to overlap data transfer
+            with forward computation of subsequent layers.
+            - If the module is already in 'pre_backward' state, this hook is skipped
+            to avoid triggering offload during backward phase.
+            """
+            if getattr(module, "_swap_state", None) == "pre_backward":
+                return
+            next_name = module._swap_group_order.get('next', None)
+            if next_name:
+                SwapManager().protect_alias_tensors(group_name, output)
+                SwapManager().launch_offload(group_name)
+            prev_name = module._swap_group_order.get('prev', None)
+            if prev_name:
+                SwapManager().wait_offload(prev_name)
+
+        def _backward_pre_hook(group_name, module, grad_input):  # pylint: disable=W0613
+            """
+            Pre-backward hook executed immediately before backward computation
+            of the current layer starts.
+
+            Execution timeline (example with 3 layers, backward order: L2 → L1 → L0):
+
+                Time →
+                Backward Compute Stream:
+                    | pre(L2) | Grad L2 | pre(L1) | Grad L1 | pre(L0) | Grad L0 |
+
+                Copy Stream (load):
+                            | Load  L1 |    -    | Load  L0 |
+                                ↑              ↑
+                        prefetch at pre(L2)   prefetch at pre(L1)
+
+            Swap rules:
+            1. At the beginning of backward for the current layer:
+            - If a previous layer exists in backward order, asynchronously
+                prefetch its activations (launch_load).
+
+            Example:
+            - At pre-backward of L2, prefetch activations of L1.
+            - At pre-backward of L1, prefetch activations of L0.
+
+            2. Before starting backward computation of the current layer:
+            - Ensure that the activations of the current layer have already
+                been loaded back to device memory (wait_load).
+
+            Notes:
+            - Load operations are issued on the copy stream to overlap data transfer
+            with backward computation of the current layer.
+            - The swap state is marked as 'pre_backward' to prevent forward hooks
+            from issuing offload operations during backward phase.
+            """
+            module._swap_state = "pre_backward"
+            prev_name = module._swap_group_order.get('prev', None)
+            if prev_name:
+                SwapManager().launch_load(prev_name)
+
+            next_name = module._swap_group_order.get('next', None)
+            if next_name:
+                SwapManager().wait_load(group_name)
+            SwapManager().release_group_storage(group_name)
+
+        def _backward_hook(group_name, module, grad_input, grad_output):  # pylint: disable=W0613
+            module._swap_state = "backward"
+
+        def _register_hooks_once(module, group_name):
+            hooks = [
+                ("_swap_forward_pre_hook_handle",
+                 lambda h: _backend.register_forward_pre_hook(module, h, prepend=True),
+                 functools.partial(_forward_pre_hook, group_name)),
+
+                ("_swap_forward_hook_handle",
+                 module.register_forward_hook,
+                 functools.partial(_forward_hook, group_name)),
+
+                ("_swap_backward_pre_hook_handle",
+                 lambda h: _backend.register_full_backward_pre_hook(module, h, prepend=True),
+                 functools.partial(_backward_pre_hook, group_name)),
+
+                ("_swap_backward_hook_handle",
+                 lambda h: _backend.register_full_backward_hook(module, h),
+                 functools.partial(_backward_hook, group_name)),
+            ]
+
+            for attr_name, register_func, hook in hooks:
+                if not hasattr(module, attr_name):
+                    handle = register_func(hook)
+                    setattr(module, attr_name, handle)
+        # Register for both layers
+        _register_hooks_once(first_layer, first_name)
+        _register_hooks_once(second_layer, second_name)
+
+    def _get_copy_stream(self):
+        """Return a singleton copy stream, created on first access."""
+        if self._copy_stream is None:
+            self._copy_stream = _backend.new_stream()
+        return self._copy_stream
+
+
+def _teardown_wired_swap_layers(wired_modules: Iterable[Any]) -> None:
+    """Release swap groups and prefetch hooks for an iterable of wired layers.
+
+    Teardown for layers already registered through
+    :meth:`SwapManager.set_forward_prefetch_layer` (the swap-inputs paths in
+    ``distributed/activation_checkpoint.py`` and ``distributed/attention_swap.py``).
+    Those paths register the modules in the process-wide singleton and install
+    hook handles, but never otherwise tear them down, so a long-lived process
+    that rebuilds or discards models leaks ``SwapGroup`` entries and hook
+    handles.  This is called from each path's life-cycle finalizer with the wired
+    modules held directly, because the model container is unreachable at that
+    point and its module tree can no longer be traversed.  Idempotent: a module
+    with no ``_swap_group_name`` (already released) is a no-op.
+
+    Args:
+        wired_modules: Layers that participated in a swap prefetch chain.
+    """
+    manager = SwapManager()
+    for module in wired_modules:
+        manager.unregister_forward_prefetch_layer(module)

@@ -188,10 +188,10 @@ compile:
 
 dataset:
   model_assets:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.processor.build_deepseek_v41_processor
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
     config_path: /path/to/DeepSeek-V4.1-Flash
   data_transform:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.transform_fn.build_deepseek_v41_omni_transform
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
     max_seq_len: 4096
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: ./output/training_demo/deepseek_v41/mm_data/deepseek_v41_messages/train.jsonl
@@ -205,7 +205,7 @@ dataloader:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
     encoder_dp: false  # Replicate complete images across TP×CP; bucket routing is not implemented.
     runtime_input_adapter:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.runtime.DeepseekV41Runtime
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
   sampler_type: single
   # Emit one complete multimodal sample per rank without waiting to fill 4k.
   token_budget: 128

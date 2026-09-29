@@ -62,7 +62,7 @@ class TestNestedTarget(unittest.TestCase):
             },
         }
 
-        target = resolve_component(node, expected_type=Target[Any], path="$.target")
+        target = resolve_component(node, annotation=Target[Any], path="$.target")
         dependency, options = target.build()
 
         self.assertIsInstance(dependency, _Dependency)
@@ -85,7 +85,7 @@ class TestNestedTarget(unittest.TestCase):
                 ConfigResolutionError,
                 r"\$\.target\.dependency\._target_",
         ):
-            resolve_component(node, expected_type=Target[Any], path="$.target")
+            resolve_component(node, annotation=Target[Any], path="$.target")
 
     def test_runtime_argument_overrides_nested_target(self):
         """Trainer-supplied runtime values should retain highest precedence."""

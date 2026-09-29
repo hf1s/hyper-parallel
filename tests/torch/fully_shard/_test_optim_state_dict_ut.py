@@ -26,14 +26,13 @@ Covers:
 """
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
 from torch import nn  # noqa: E402
 
 from hyper_parallel.core.distributed_checkpoint import get_optim_state_dict, set_optim_state_dict  # noqa: E402
-from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (  # noqa: E402
+from hyper_parallel.core.fully_shard.state_dict_utils import (  # noqa: E402
     UnsupportedConfigurationError,
     _check_chained_optimizer,
     _flatten_optim_state_dict,
@@ -379,7 +378,7 @@ def test_u10_unflatten_strict_false_inconsistent_fields():
 
     handler = _LogCapture()
     logger = logging.getLogger(
-        "hyper_parallel.platform.torch.fully_shard.state_dict_utils"
+        "hyper_parallel.core.fully_shard.state_dict_utils"
     )
     logger.addHandler(handler)
     original_level = logger.level

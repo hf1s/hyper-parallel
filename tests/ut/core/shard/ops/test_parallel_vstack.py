@@ -30,7 +30,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP,
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 op = VstackDistributedOp("vstack")
 
@@ -60,7 +60,6 @@ class TestVstackDistributedOp(unittest.TestCase):
         """Configure common mock-platform attributes used across tests."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
-        mock_platform.platform_type = MagicMock()
 
     def _make_2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2 mesh via init_device_mesh."""

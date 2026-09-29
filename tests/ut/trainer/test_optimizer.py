@@ -13,25 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for auto-model optimizer parameter grouping."""
-# Select the Torch backend before importing HyperParallel checkpoint aliases.
-# pylint: disable=wrong-import-position
 
-import os
 import unittest
 
 import torch
 from torch import nn
 
-from tests.ut.platform.mindspore._ensure_mindspore_platform import (
-    restore_torch_platform_for_ut,
-)
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-restore_torch_platform_for_ut()
-
 from hyper_parallel.components.optim.builders import AdamW
 from hyper_parallel.components.optim.parameter_groups import get_parameter_names
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
+from hyper_parallel.core.activation_memory import checkpoint_wrapper
 
 
 class _Block(nn.Module):

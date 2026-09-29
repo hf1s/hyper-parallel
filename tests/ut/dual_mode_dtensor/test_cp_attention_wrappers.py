@@ -25,11 +25,14 @@ from hyper_parallel.data.parallel.batch_parallel import (
     _shard_seq_lens_for_cp,
     shard_batch_for_cp,
 )
+from hyper_parallel.distributed.context_parallel import wrappers
 from hyper_parallel.distributed.context_parallel.collectives import (
     _slice_sequence,
 )
 from hyper_parallel.distributed.context_parallel.wrappers import (
     INNER_WRAPPER_REGISTRY,
+    _cp_sdpa_call,
+    _validate_ulysses_requirements,
     is_flex_attention,
     is_hf_style_attention,
     is_sdpa_attention,
@@ -997,9 +1000,6 @@ def test_style_helpers_and_sdpa_call_condition():
 
     # ── case: is_causal_kept_when_cp_inactive ── cp_size=1: is_causal is
     # passed through unchanged; no explicit mask substitution
-    from hyper_parallel.distributed.context_parallel.wrappers import (
-        _cp_sdpa_call,
-    )
     received = {}
 
     def fake_sdpa(q, k, v, **kwargs):
@@ -1011,6 +1011,49 @@ def test_style_helpers_and_sdpa_call_condition():
     assert received.get("is_causal") is True, \
         "case: is_causal_kept_when_cp_inactive"
     assert "attn_mask" not in received, "case: is_causal_kept_when_cp_inactive"
+
+
+def test_cp_sdpa_allgather_preserves_gqa_kv_heads(monkeypatch):
+    """KV all-gather must not expand compact GQA heads before communication."""
+    gathered = {}
+
+    def fake_allgather(key, value, cp_dim, cp_mesh):
+        gathered["key"] = key
+        gathered["value"] = value
+        gathered["cp_dim"] = cp_dim
+        return key, value
+
+    received = {}
+
+    def fake_sdpa(query, key, value, **kwargs):
+        received["query"] = query
+        received["key"] = key
+        received["value"] = value
+        received["kwargs"] = kwargs
+        return query
+
+    monkeypatch.setattr(wrappers, "flex_cp_allgather", fake_allgather)
+    query = torch.randn(1, 28, 4, 2)
+    key = torch.randn(1, 4, 4, 2)
+    value = torch.randn(1, 4, 4, 2)
+    _cp_sdpa_call(
+        fake_sdpa,
+        FakeCpMesh(2, 0),
+        query,
+        key,
+        value,
+        {"is_causal": True, "enable_gqa": True},
+    )
+
+    assert tuple(gathered["key"].shape) == (1, 4, 4, 2), \
+        "case: compact_kv_heads_before_allgather"
+    assert tuple(gathered["value"].shape) == (1, 4, 4, 2), \
+        "case: compact_value_heads_before_allgather"
+    assert gathered["cp_dim"] == 2, "case: allgather_sequence_dimension"
+    assert tuple(received["key"].shape) == (1, 4, 4, 2), \
+        "case: compact_kv_heads_after_allgather"
+    assert received["kwargs"].get("enable_gqa") is True, \
+        "case: preserve_hf_gqa_flag"
 
 
 # ==========================================================================
@@ -1226,7 +1269,7 @@ class _ToyModel(nn.Module):
             num_attention_heads=heads,
             index_num_attention_heads=index_heads,
             dsa_dense_warm_up=False,
-            apply_FA_rescale=True,
+            apply_fa_rescale=True,
             use_fused_sink_fa=False,
         ))
 
@@ -1247,6 +1290,21 @@ def test_mla_dsa_handler_validation():
         mla_dsa_ulysses_cp_wrapper), "case: wrapper_is_registered"
     injection_meta = getattr(mla_dsa_ulysses_cp_wrapper, "_injection_meta")
     assert injection_meta.kind == "inner_wrapper", "case: wrapper_is_registered"
+
+    for options, enabled in (
+        ({"apply_fa_rescale": True}, True),
+        ({"apply_fa_rescale": False}, False),
+        ({}, False),
+    ):
+        model = _ToyModel()
+        del model.config.text_config.apply_fa_rescale
+        for name, value in options.items():
+            setattr(model.config.text_config, name, value)
+        if enabled:
+            _validate_ulysses_requirements(model, 2)
+        else:
+            _expect_raise("rescale_option", ValueError, "apply_fa_rescale=True",
+                          _validate_ulysses_requirements, model, 2)
 
     # ── case: requires_active_cp_mesh ── cp_mesh=None / size=1 → fail-fast
     for label, cp_mesh in (("None", None), ("size1", _FakeCPMesh(size=1))):

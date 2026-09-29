@@ -31,7 +31,6 @@ from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from hyper_parallel.models._transformers import config_resolver
 from hyper_parallel.models import registry

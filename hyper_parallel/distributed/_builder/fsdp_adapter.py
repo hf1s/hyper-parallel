@@ -30,6 +30,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import torch
+from torch.nn import Module as ModuleClass
+from torch.nn import Parameter as ParameterClass
+
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, HSDPModule, fully_shard
 from hyper_parallel.distributed._builder.source_shard import (
@@ -41,7 +45,6 @@ from hyper_parallel.distributed._builder.source_shard import (
 )
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.registry import get_model_adapter
-from hyper_parallel.platform import get_platform
 
 if TYPE_CHECKING:
     from hyper_parallel.distributed.mesh import (
@@ -49,9 +52,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
-ModuleClass = platform.Module
-ParameterClass = platform.Parameter
 
 
 @dataclass(frozen=True)
@@ -168,7 +168,7 @@ class FSDP2Manager:
         return self._build_compatibility_fsdp_mesh()
 
     def _build_mixed_precision_policy(self) -> fully_shard_utils.MixedPrecisionPolicy:
-        """Resolve the configured dtype strings to platform dtypes.
+        """Resolve the configured dtype strings to torch dtypes.
 
         Dtype strings stay YAML-friendly; ``float32`` resolves to the
         framework's ``float32`` dtype object. Fully-sharded params without an
@@ -177,9 +177,9 @@ class FSDP2Manager:
         mix_precision = self.config.mix_precision
         dtype_by_name = {
             None: None,
-            "bfloat16": platform.tensor_dtype.bfloat16,
-            "float16": platform.tensor_dtype.float16,
-            "float32": platform.tensor_dtype.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
         }
         return fully_shard_utils.MixedPrecisionPolicy(
             param_dtype=dtype_by_name[mix_precision.param_dtype],

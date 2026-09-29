@@ -18,7 +18,7 @@ ST (PyTorch): offline checkpoint — HF safetensors, ``convert_full_checkpoint_t
 
 DCP full-weights ↔ disk round-trip without HF/file loaders is covered in ``tests/ut/core/distributed_checkpoint/``.
 
-Module basename is distinct from the MindSpore ST file so pytest can collect both in one session.
+Module basename is distinct from the offline ST helper so pytest can collect both in one session.
 """
 # pylint: disable=wrong-import-position
 import os
@@ -26,8 +26,6 @@ import shutil
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 from hyper_parallel.core.distributed_checkpoint.offline_transform import (
     convert_full_checkpoint_to_dcp,
     dcp_to_full_state_dict,
@@ -36,7 +34,6 @@ from hyper_parallel.core.distributed_checkpoint.offline_transform import (
     save_state_dict_as_huggingface_format,
 )
 
-_platform_mod.platform = None
 _WORKSPACE = os.path.join(os.path.dirname(__file__), "_torch_offline_convert_checkpoint_workspace")
 
 def _cleanup_workspace() -> None:
@@ -64,8 +61,6 @@ def _assert_flat_state_dicts_close_torch(original: dict, loaded: dict) -> None:
 
 def test_offline_convert_checkpoint_roundtrip_suite_torch():
     """HF single+sharded (artifact checks), DCP round-trip, HF->DCP, .pt->DCP."""
-    os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-    _platform_mod.platform = None
     _cleanup_workspace()
     os.makedirs(_WORKSPACE, exist_ok=True)
     try:

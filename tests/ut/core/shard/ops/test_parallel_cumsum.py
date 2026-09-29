@@ -25,10 +25,9 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 op = CumsumDistributedOp("cumsum")
-op_ms = CumsumDistributedOp("CumsumExt")
 
 
 class TestParallelCumsum(unittest.TestCase):
@@ -55,16 +54,13 @@ class TestParallelCumsum(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests.
 
-        Args:
-            mock_platform: The MagicMock object injected by @patch.
-            platform_type: Optional PlatformType to set on the mock.
-            world_size: Value returned by mock_platform.get_world_size().
+            Args:
+                mock_platform: The MagicMock object injected by @patch.
+                world_size: Value returned by mock_platform.get_world_size().
         """
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
@@ -100,7 +96,7 @@ class TestParallelCumsum(unittest.TestCase):
         )
         assert output_layout is not x_layout, "Cumsum output layout should be a deep copy"
         assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
-        
+
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
         assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
@@ -274,11 +270,11 @@ class TestParallelCumsum(unittest.TestCase):
         assert cache_values == [x_layout, -1], f"Unexpected cache_values: {cache_values}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_cumsum_preprocess_mindspore_primitive_in_args(self, mock_platform):
+    def test_cumsum_preprocess_default_dtype(self, mock_platform):
         """
-        Feature: Cumsum preprocess for MindSpore Primitive
-        Description: CumsumExt does not accept kwargs
-        Expectation: dim and dtype are routed to positional args, including dtype=None
+        Feature: Cumsum preprocess with an unspecified dtype
+        Description: dtype defaults to None
+        Expectation: dim is a positional arg; dtype is omitted from kwargs rather than passed as None
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
@@ -287,19 +283,19 @@ class TestParallelCumsum(unittest.TestCase):
         mock_tensor.layout = x_layout
         mock_tensor.to_local.return_value = MagicMock()
 
-        local_args, local_kwargs, cache_values = op_ms.preprocess(
+        local_args, local_kwargs, cache_values = op.preprocess(
             (mock_tensor,),
             {'dim': -1}
         )
 
         assert not local_kwargs, (
-            f"For MindSpore 'CumsumExt', local_kwargs should be empty, got {local_kwargs}"
+            f"For 'cumsum', local_kwargs should be empty when dtype is None, got {local_kwargs}"
         )
-        assert len(local_args) == 3, (
-            f"For MindSpore 'CumsumExt', local_args should be (tensor, dim, dtype), got {local_args}"
+        assert len(local_args) == 2, (
+            f"For 'cumsum', local_args should be (tensor, dim), got {local_args}"
         )
-        assert local_args[1:] == (-1, None), (
-            f"MindSpore positional dim/dtype mismatch, got {local_args[1:]}"
+        assert local_args[1] == -1, (
+            f"dim should be -1, got {local_args[1]}"
         )
         assert cache_values == [x_layout, -1], f"Unexpected cache_values: {cache_values}"
 

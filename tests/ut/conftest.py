@@ -62,6 +62,8 @@ class NoAcceleratorGuard:
         return _blocked
 
     def _check_init_process_group(self, real_init):
+        """Wrap ``init_process_group`` so forbidden backends fail fast."""
+
         def _guarded(*args, **kwargs):
             backend = kwargs.get("backend")
             if backend is None and args:
@@ -117,10 +119,10 @@ def no_accelerator():
 
 
 def _preload_libgomp_early_for_static_tls() -> None:
-    """Preload ``libgomp`` so torch then MindSpore do not exhaust static TLS.
+    """Preload ``libgomp`` so later OpenMP consumers do not exhaust static TLS.
 
     ``pytest_configure`` imports PyTorch first; without an early global load of
-    OpenMP, a later ``import mindspore`` can fail with:
+    OpenMP, a later native extension that links OpenMP can fail with:
 
         ImportError: libgomp.so.1: cannot allocate memory in static TLS block
 
@@ -151,32 +153,5 @@ _preload_libgomp_early_for_static_tls()
 
 
 def pytest_configure(config) -> None:  # pylint: disable=unused-argument
-    """Import ``dtensor`` under PyTorch before collection loads tests that set ``mindspore`` at import time."""
-    os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-    import hyper_parallel.platform.platform as _pp  # pylint: disable=import-outside-toplevel
-
-    _pp.platform = None
+    """Import ``dtensor`` early so collection does not race the torch backend binding."""
     import hyper_parallel.core.dtensor.dtensor  # noqa: F401 pylint: disable=unused-import
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _restore_torch_platform_between_ut_modules(request):
-    """Many ``tests/ut`` modules temporarily set ``HYPER_PARALLEL_PLATFORM=mindspore``; reset for the next module."""
-    yield
-    try:
-        from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # pylint: disable=import-outside-toplevel
-            restore_torch_platform_for_ut,
-        )
-
-        restore_torch_platform_for_ut()
-    # Best-effort: teardown must not abort pytest on import/platform edge cases.
-    except (  # pragma: no cover
-        ImportError,
-        ModuleNotFoundError,
-        OSError,
-        RuntimeError,
-        ValueError,
-        AttributeError,
-        TypeError,
-    ):
-        pass
