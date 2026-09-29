@@ -541,8 +541,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT input_ids, shift_labels and loss_mask must have matching shapes")
         if use_cache:
             raise ValueError("JT does not support cached decoding")
-        with torch.autocast(input_ids.device.type, dtype=torch.bfloat16, cache_enabled=False):
-            losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
+        losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
         return JTDeepseekV3Output(loss={
             "foundation/lm_loss": losses["lm_loss"],
             "foundation/mtp_loss": losses["mtp_loss"],
@@ -578,7 +577,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         frequency = torch.cat((frequency, frequency), dim=-1)
         attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()),
                             "actual_seq_len": (sequence_length,)}
-        hidden = self.model.embed_tokens(input_ids).to(torch.bfloat16)
+        hidden = self.model.embed_tokens(input_ids)
         auxiliary = torch.zeros((), device=hidden.device, dtype=torch.float32)
         for layer in self.model.layers:
             hidden = layer(hidden, **attention_kwargs)

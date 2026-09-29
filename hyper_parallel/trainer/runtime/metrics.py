@@ -36,8 +36,9 @@ def mean_global_loss(
 
     FSDP divides gradients over its flattened DP+CP domain, so each local loss
     is weighted by valid tokens and multiplied by ``dp_size * cp_size``.
-    Named losses may use ``<token-domain>/<loss-name>`` keys to share an
-    existing token count while exposing a clean loss name to the Trainer.
+    Loss keys are opaque output names. A recognized ``<token-domain>/`` prefix
+    is only an optional token-count hint; unknown names use the default
+    ``foundation`` token domain.
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
@@ -64,16 +65,24 @@ def mean_global_loss(
 
     if isinstance(losses, torch.Tensor):  # text loss only
         losses = {"foundation_loss": losses}
+    token_domains = {
+        token_name[:-len("_tokens")]
+        for token_name in current_token_counts
+        if token_name.endswith("_tokens")
+    }
+    if "foundation" in token_domains:
+        default_token_domain = "foundation"
+    else:
+        default_token_domain = next(iter(token_domains), "foundation")
     for key, cur_loss in losses.items():
-        token_domain, separator, metric_name = key.partition("/")
-        if separator:
-            if not token_domain or not metric_name:
-                raise ValueError(f"Loss key must use '<token-domain>/<loss-name>': {key!r}")
+        token_domain, separator, _ = key.partition("/")
+        legacy_domain = key.split("_loss", maxsplit=1)[0]
+        if separator and token_domain in token_domains:
             loss_name = token_domain
-            output_key = metric_name
+        elif legacy_domain in token_domains:
+            loss_name = legacy_domain
         else:
-            loss_name = key.split("_loss", maxsplit=1)[0]  # foundation/image_decoder/**
-            output_key = key
+            loss_name = default_token_domain
 
         cur_token_len = current_token_counts[f"{loss_name}_tokens"]
         if sequence_parallel:
@@ -104,9 +113,7 @@ def mean_global_loss(
         if sequence_parallel:
             cur_loss = cur_loss / sequence_parallel_size
 
-        if output_key in loss_dict:
-            raise ValueError(f"Loss names collide after token-domain stripping: {output_key}")
-        loss_dict[output_key] = cur_loss
+        loss_dict[key] = cur_loss
 
     return loss_dict
 
