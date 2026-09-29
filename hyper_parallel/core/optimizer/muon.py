@@ -160,11 +160,12 @@ def compute_muon_slice_scale(
         slice_tensor: torch.Tensor,
         matched_adamw_rms: float,
         zero_rms_scale_mode: str = "zero",
+        logical_shape: Optional[Tuple[int, ...]] = None,
 ) -> float:
     """Compute Muon scale from the logical matrix dims of a reshaped slice."""
     if not matched_adamw_rms:
         return 1.0 if zero_rms_scale_mode == "use_lr" else 0.0
-    shape = tuple(slice_tensor.shape)
+    shape = tuple(slice_tensor.shape) if logical_shape is None else tuple(logical_shape)
     if len(shape) == 3 and shape[1] == 1:
         logical_dims = (shape[0], shape[2])
     else:
@@ -965,6 +966,8 @@ class Muon(BaseDistributedOptimizer):
         working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
         trace_owners: Dict[int, Tuple[torch.nn.Parameter, int]] = {}
         trace_raw_updates: Dict[torch.nn.Parameter, torch.Tensor] = {}
+        reference_scale = os.getenv("JT_MUON_REFERENCE_SCALE") == "1"
+        scale_shapes: Dict[int, Tuple[int, ...] | None] = {}
 
         for param in p_list:
             local_shape = getattr(param, "local_shape", None)
@@ -978,6 +981,9 @@ class Muon(BaseDistributedOptimizer):
             for reshaped_input in reshaped_inputs:
                 core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
                 reshape_groups[core_shape].append(reshaped_input)
+                scale_shapes[id(reshaped_input)] = (
+                    tuple(local_shape) if reference_scale and not no_shard else None
+                )
                 trace_owners[id(reshaped_input)] = (param, len(reshaped_inputs) - 1)
 
         for tensor_list in reshape_groups.values():
@@ -995,6 +1001,7 @@ class Muon(BaseDistributedOptimizer):
                     reshaped_update,
                     group["matched_adamw_rms"],
                     zero_rms_scale_mode=group["zero_rms_scale_mode"],
+                    logical_shape=scale_shapes[id(reshaped_input)],
                 )
                 if group["apply_lr_in_update"]:
                     slice_scale *= -group["lr"]
