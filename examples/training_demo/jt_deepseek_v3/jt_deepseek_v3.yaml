@@ -47,7 +47,7 @@ model:
   reference_weights: /path/to/jt_initial_weights
 loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
-model_init_dtype: float32
+model_init_dtype: bfloat16
 plan_overrides:
   # The base model is executable; replacements select accelerated JT operators.
   - match:
@@ -127,6 +127,10 @@ accelerator:
   loss_parallel: true
 fsdp_config:
   dp_shard_size: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
 activation_checkpoint:
   mode: "off"
 activation_swap: none
@@ -151,6 +155,7 @@ dataloader:
   num_workers: 0
 optimizer:
   _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.build_optimizer
+  fp32_main_params: true
   muon_config:
     lr: 2.4e-5
     weight_decay: 0.1

@@ -142,9 +142,6 @@ def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray])
 def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
                     distributed_setup: Any, **infrastructure_options: Any) -> PreTrainedModel:
     """Load the native JT model and an offline-converted model.npz artifact."""
-    if infrastructure_options.get("model_init_dtype") not in (None, "float32"):
-        raise ValueError("JT precision requires FP32 master parameters")
-    infrastructure_options["model_init_dtype"] = "float32"
 
     torch_npu.npu.set_compile_mode(jit_compile=False)
     torch.use_deterministic_algorithms(True)
