@@ -485,8 +485,10 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
 
     def _token_loss(self, logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Mean causal-LM loss from the framework-selected ``loss_function`` over targets with a nonzero mask."""
-        return self.loss_function(logits=logits, labels=None, vocab_size=self.config.vocab_size,
+        loss = self.loss_function(logits=logits, labels=None, vocab_size=self.config.vocab_size,
                                   shift_labels=labels.masked_fill(mask == 0, -100))
+        # causal_lm_loss_parallel returns shape [1]; the Trainer stacks named losses, so keep each one 0-d.
+        return loss.reshape(())
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                          loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None
