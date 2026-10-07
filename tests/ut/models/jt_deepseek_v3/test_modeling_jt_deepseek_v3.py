@@ -13,19 +13,24 @@
 # limitations under the License.
 # ============================================================================
 """Complete standalone model construction and optional acceleration boundaries."""
+# pylint: disable=protected-access
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 import unittest
 from unittest.mock import patch
 
 import torch
-from transformers import DeepseekV32Config
 
+from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3MoE,
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
 )
 from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiTokenPredictionLayer
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
 from hyper_parallel.models.registry import get_model_adapter
@@ -34,9 +39,9 @@ from hyper_parallel.trainer.config.parser import parse_training_args
 from tests.common.mark_utils import arg_mark
 
 
-def small_config() -> DeepseekV32Config:
+def small_config() -> JTDeepseekV3Config:
     """Build a CPU-sized fixture without changing the production validation recipe."""
-    config = DeepseekV32Config(
+    config = JTDeepseekV3Config(
         vocab_size=32, hidden_size=16, intermediate_size=32, moe_intermediate_size=16,
         num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
         n_routed_experts=4, n_shared_experts=1, num_experts_per_tok=2, n_group=1, topk_group=1,
@@ -72,7 +77,7 @@ class TestCompleteModel(unittest.TestCase):
         output = model(tokens, (tokens + 1) % 32, torch.ones(1, 8))
         self.assertEqual(
             set(output.loss),
-            {"foundation/lm_loss", "foundation/mtp_loss", "foundation/aux_loss"},
+            {"foundation_loss/lm", "foundation_loss/mtp", "foundation_loss/aux"},
         )
         total_loss = sum(output.loss.values())
         self.assertTrue(torch.isfinite(total_loss))
@@ -82,6 +87,51 @@ class TestCompleteModel(unittest.TestCase):
             self.assertIsNotNone(gradient)
             self.assertTrue(torch.isfinite(gradient).all())
             self.assertGreater(gradient.abs().sum().item(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_standard_policy_bfloat16_forward_closes_activations(self):
+        """Feature: Framework BF16 policy.
+
+        Description: Emulate FSDP param_dtype=bfloat16 compute copies over FP32 storage; buffers stay as stored.
+        Expectation: Activations stay BF16 without FSDP input casts; losses and the expert bias stay FP32.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        for parameter in model.parameters():
+            parameter.data = parameter.data.to(torch.bfloat16)
+        biases = [
+            module.e_score_correction_bias
+            for module in model.modules()
+            if hasattr(module, "e_score_correction_bias")
+        ]
+        self.assertTrue(biases)
+        self.assertTrue(all(bias.dtype == torch.float32 for bias in biases))
+
+        activations = {}
+
+        def capture(name: str) -> Any:
+            """Record a selected module output by name."""
+
+            def hook(_module: Any, _inputs: Any, output: Any) -> None:
+                """Store the tensor output after tuple unwrapping."""
+                output = output[0] if isinstance(output, tuple) else output
+                activations[name] = output
+
+            return hook
+
+        handles = [
+            model.model.layers[0].self_attn.register_forward_hook(capture("attention")),
+            model.model.layers[1].mlp.register_forward_hook(capture("moe")),
+            model.model.layers[1].register_forward_hook(capture("decoder")),
+        ]
+        try:
+            tokens = torch.arange(8).unsqueeze(0)
+            with torch.no_grad():
+                output = model(tokens, (tokens + 1) % 32, torch.ones(1, 8))
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertEqual({value.dtype for value in activations.values()}, {torch.bfloat16})
+        self.assertTrue(all(value.dtype == torch.float32 for value in output.loss.values()))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_replacement_selects_attention(self):
@@ -145,8 +195,23 @@ class TestCompleteModel(unittest.TestCase):
         self.assertIsNot(standard, custom)
         self.assertEqual(standard.architecture, "DeepseekV3ForCausalLM")
         self.assertEqual(custom.model_type, "jt_deepseek_v3")
-        self.assertEqual(small_config().model_type, "deepseek_v32")
+        self.assertEqual(small_config().model_type, "jt_deepseek_v3")
         self.assertIs(get_model_adapter(small_config().architectures[0]), custom)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fsdp_discovery_uses_jt_identity_and_declared_mtp_unit(self):
+        """Feature: FSDP unit discovery.
+
+        Description: Resolve FSDP units for the JT model through the framework manager.
+        Expectation: The JT adapter applies; each MTP transformer layer is one unit, not split leaves.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        self.assertEqual(FSDP2Manager._get_model_adapter_spec(model).model_type, "jt_deepseek_v3")
+        manager = FSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
+        self.assertEqual(
+            sorted(unit.fqn for unit in manager._find_wrap_modules(model)),
+            ["model.layers.0", "model.layers.1", "mtp.layers.0.transformer_layer"],
+        )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_recipe_config_roundtrip(self):
@@ -158,11 +223,11 @@ class TestCompleteModel(unittest.TestCase):
         recipe_path = Path(__file__).resolve().parents[4] / (
             "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")
         recipe = parse_training_args([str(recipe_path)])
-        config = DeepseekV32Config(**recipe.model.config)
-        self.assertIs(type(config), DeepseekV32Config)
+        config = JTDeepseekV3Config(**recipe.model.config)
+        self.assertIs(type(config), JTDeepseekV3Config)
         self.assertFalse(hasattr(recipe.model, "reference_yaml"))
         self.assertFalse(hasattr(config, "jt_config"))
-        restored = DeepseekV32Config.from_dict(config.to_dict())
+        restored = JTDeepseekV3Config.from_dict(config.to_dict())
         self.assertEqual(restored.to_dict(), config.to_dict())
         self.assertEqual(restored.mlp_layer_types, ["dense", "sparse"])
         self.assertEqual(restored.num_nextn_predict_layers, 1)

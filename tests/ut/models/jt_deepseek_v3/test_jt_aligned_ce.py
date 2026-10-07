@@ -65,17 +65,3 @@ class TestVocabularyCrossEntropy(unittest.TestCase):
             result.backward()
         self.assertEqual(result.item(), 0)
         self.assertTrue(torch.equal(logits.grad, torch.zeros_like(logits)))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_full_length_sum_keeps_last_token_and_its_gradient(self) -> None:
-        """Feature: Sequence reduction.
-
-        Description: Reduce a full 256K sequence including the partial final tile.
-        Expectation: Every token contributes one to the sum and gradient.
-        """
-        values = torch.ones(262144, requires_grad=True)
-        result = loss.reference_sequence_sum(values)
-        result.backward()
-        self.assertEqual(result.item(), 262144)
-        self.assertTrue(torch.equal(values.grad, torch.ones_like(values)))

@@ -29,7 +29,7 @@ import torch.distributed as dist
 import torch_npu
 from torch import nn
 from torch.nn import functional as F
-from transformers import DeepseekV32Config, DeepseekV32ForCausalLM
+from transformers import DeepseekV32ForCausalLM
 from transformers.utils import ModelOutput
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32Attention, DeepseekV32DecoderLayer, DeepseekV32Experts, DeepseekV32MLP,
@@ -47,6 +47,7 @@ from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
+from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 
 
 
@@ -339,7 +340,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         return indices, selected
 
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Execute routed experts using native tensor dtypes."""
+        """Execute routed experts; routing weights are cast to the activation dtype as in EP aggregation."""
         indices, probabilities = self.route(hidden)
         flat = hidden.reshape(-1, hidden.shape[-1])
         outputs = flat.new_zeros(indices.shape[0], indices.shape[1], flat.shape[-1])
@@ -350,7 +351,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             values = F.silu(gate) * up
             values = F.linear(values, self.experts.down_proj[expert])
             outputs = outputs.index_put((tokens, slots), values)
-        return (outputs * probabilities.unsqueeze(-1)).sum(1).reshape(hidden.shape)
+        return (outputs * probabilities.to(outputs.dtype).unsqueeze(-1)).sum(1).reshape(hidden.shape)
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
@@ -427,7 +428,8 @@ def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
     """Compute the masked token mean from the public vocab-parallel CE."""
     mesh = _get_loss_parallel_mesh()
     targets = labels.masked_fill(labels < 0, -100)
-    weights = mask.masked_fill(labels < 0, 0)
+    # The shared text batch supplies an integer 0/1 mask; weight and sum token losses in FP32.
+    weights = mask.float().masked_fill(labels < 0, 0)
     values = logits.reshape(-1, logits.shape[-1])
     if mesh is None:
         if logits.shape[-1] != vocab_size:
@@ -444,7 +446,7 @@ def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     """Reuse HF construction and children; override the reference training orchestration."""
 
-    config_class = DeepseekV32Config
+    config_class = JTDeepseekV3Config
 
     def __init__(self, config: Any) -> None:
         """Construct the HF skeleton with complete, unconditional JT adapters.
@@ -472,6 +474,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             output_norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
         )
         self.loss_group = None
+        # Ranks holding the same attention heads (DP+CP); the JT builder sets it for QK clipping.
+        self.qk_clip_group = None
         self.post_init()
 
     def prepare_model_inputs(
@@ -512,10 +516,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         if use_cache:
             raise ValueError("JT does not support cached decoding")
         losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
+        # ``<token-domain>_loss[/<name>]`` keys: every JT objective is weighted by foundation tokens.
         return JTDeepseekV3Output(loss={
-            "foundation/lm_loss": losses["lm_loss"],
-            "foundation/mtp_loss": losses["mtp_loss"],
-            "foundation/aux_loss": losses["aux_loss"],
+            "foundation_loss/lm": losses["lm_loss"],
+            "foundation_loss/mtp": losses["mtp_loss"],
+            "foundation_loss/aux": losses["aux_loss"],
         })
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
@@ -545,9 +550,10 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT position_ids must match input_ids")
         frequency = position_ids.to(device=input_ids.device, dtype=torch.float32).unsqueeze(-1) * inverse
         frequency = torch.cat((frequency, frequency), dim=-1)
-        attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()),
-                            "actual_seq_len": (sequence_length,)}
         hidden = self.model.embed_tokens(input_ids)
+        # Transformers rotary contract: FP32 frequencies, tables returned in the activation dtype.
+        attention_kwargs = {"position_embeddings": (frequency.cos().to(hidden.dtype), frequency.sin().to(hidden.dtype)),
+                            "actual_seq_len": (sequence_length,)}
         auxiliary = torch.zeros((), device=hidden.device, dtype=torch.float32)
         for layer in self.model.layers:
             hidden = layer(hidden, **attention_kwargs)

@@ -28,7 +28,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 import torch_npu
-from transformers import DeepseekV32Config, PreTrainedModel
+from transformers import PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, local_compute
@@ -39,6 +39,7 @@ from hyper_parallel.models._transformers.model_builder import (
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
+from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
 )
@@ -66,7 +67,7 @@ def build_jt_ep(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: 
     return type(module).forward
 
 
-def _configured_moe_fqns(config: DeepseekV32Config) -> tuple[str, ...]:
+def _configured_moe_fqns(config: JTDeepseekV3Config) -> tuple[str, ...]:
     """Return the configured routed-MoE parents, excluding dense trunk layers."""
     trunk = tuple(
         f"model.layers.{index}.mlp"
@@ -88,7 +89,7 @@ def _has_explicit_ep_override(overrides: dict[str, Any], fqn: str) -> bool:
     )
 
 
-def _with_model_ep_overrides(distributed_setup: Any, config: DeepseekV32Config) -> Any:
+def _with_model_ep_overrides(distributed_setup: Any, config: JTDeepseekV3Config) -> Any:
     """Add only missing configured MoE EP factories as explicit model FQNs."""
     overrides = dict(getattr(distributed_setup, "plan_overrides", None) or {})
     for fqn in _configured_moe_fqns(config):
@@ -145,7 +146,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
 
     torch_npu.npu.set_compile_mode(jit_compile=False)
     torch.use_deterministic_algorithms(True)
-    config = DeepseekV32Config(**config)
+    config = JTDeepseekV3Config(**config)
     setup = _with_model_ep_overrides(distributed_setup, config)
     mesh = setup.mesh_context
     # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
@@ -183,6 +184,9 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         is_hf_model=True,
         **infrastructure_options,
     )
+    dp_cp_mesh = mesh.dp_cp_mesh
+    # QK clipping must use one maximum on every rank that holds the same attention heads.
+    model.qk_clip_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()
     model.build_report = {
         "model_class": type(model).__name__,
         "loaded_state_tensors": len(expected),

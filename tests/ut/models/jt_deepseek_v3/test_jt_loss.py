@@ -62,6 +62,22 @@ class TestJTLoss(unittest.TestCase):
         self.assertEqual(values.grad.abs().sum().item(), 0.)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_integer_batch_mask_matches_float_weights(self):
+        """Feature: Shared batch mask.
+
+        Description: Pass the shared batch's integer mask and folded labels with BF16 logits.
+        Expectation: The loss equals the float-weight result; the weighted sum stays in FP32.
+        """
+        generator = torch.Generator().manual_seed(5)
+        values = torch.randn(1, 4096, 8, generator=generator).to(torch.bfloat16)
+        labels = torch.randint(0, 8, (1, 4096), generator=generator)
+        mask = torch.rand(1, 4096, generator=generator) > 0.1
+        actual = masked_vocab_parallel_loss(values, labels.masked_fill(~mask, -100), mask.to(torch.int64),
+                                            vocab_size=8)
+        expected = masked_vocab_parallel_loss(values, labels, mask.float(), vocab_size=8)
+        self.assertTrue(torch.equal(actual, expected))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_public_parallel_dispatch_and_missing_mesh(self):
         """Feature: Framework CE ownership.
 

@@ -34,13 +34,13 @@ class TestModelOutputLoss(unittest.TestCase):
         Expectation: The mapping is returned unchanged and remains differentiable.
         """
         value = torch.tensor(2., requires_grad=True)
-        losses = {"foundation/aux_loss": value}
+        losses = {"foundation_loss/aux": value}
         result = ModelOutputLoss()(
             model_output=SimpleNamespace(loss=losses),
             labels=torch.full((1, 2), -100),
         )
         self.assertIs(result, losses)
-        result["foundation/aux_loss"].backward()
+        result["foundation_loss/aux"].backward()
         self.assertEqual(value.grad.item(), 1.)
 
 
