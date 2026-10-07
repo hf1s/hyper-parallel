@@ -131,7 +131,13 @@ def initialize_distributed(backend: str = "nccl") -> Any:
 
 
 def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
-    """Create DistributedSetup and build the configured mesh domains."""
+    """Create DistributedSetup and build the configured mesh domains.
+
+    The FSDP strategy is attached when DP or EDP shards or replicates, and also
+    when ``fsdp_config.mix_precision`` declares a compute or output dtype: FSDP is
+    the component that applies that policy, so it then wraps with a single-rank
+    shard group at DP=1 instead of silently computing in the storage dtype.
+    """
     accel = cfg.accelerator if cfg is not None and hasattr(cfg, "accelerator") else None
     if accel is None:
         return DistributedSetup(mesh_context=MeshContext())
@@ -212,8 +218,15 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         else 0
     )
 
+    mix_precision = fsdp_config.mix_precision
+    mixed_precision_declared = (
+        mix_precision.param_dtype is not None or mix_precision.output_dtype is not None
+    )
     fsdp_enabled = dist.is_initialized() and (
-        dp_shard_size > 1 or dp_replicate_size > 1 or edp_shard_size > 1
+        dp_shard_size > 1
+        or dp_replicate_size > 1
+        or edp_shard_size > 1
+        or mixed_precision_declared
     )
     strategy_config = fsdp_config if fsdp_enabled else None
     return DistributedSetup(

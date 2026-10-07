@@ -12,8 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""JT DeepSeek V3 model family."""
+"""Hugging Face configuration for the independently registered JT model family."""
 
-from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
+from transformers import AutoConfig, DeepseekV32Config
+
+
+class JTDeepseekV3Config(DeepseekV32Config):
+    """DeepSeek-V3.2-compatible configuration with an independent JT identity."""
+
+    model_type = "jt_deepseek_v3"
+
+
+AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 
 __all__ = ["JTDeepseekV3Config"]

@@ -20,14 +20,17 @@ from pathlib import Path
 
 import numpy as np
 
+from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
 
 
 class IndexedSupervisedDataset:
-    """Read tokens, pre-shifted labels and explicit loss weights without resampling.
+    """Read tokens and pre-shifted labels, folding a 0/1 loss mask into the labels.
 
     A prefix identifies three standard .bin/.idx pairs: ``.tokens``, ``.labels``
     and ``.loss_mask``. Record order and boundaries must match across streams.
+    Targets whose mask is 0 become ``IGNORE_INDEX``, so the shared text batch
+    derives the loss mask from the labels as for every other text model.
     Tokenization, shifting and supervision selection happen during preparation;
     the shared DataLoader owns sampling and batching.
     """
@@ -59,18 +62,19 @@ class IndexedSupervisedDataset:
         return len(self.readers["tokens"])
 
     def __getitem__(self, index: int) -> dict[str, np.ndarray]:
-        """Return independent arrays with the public indexed batch field names.
+        """Return tokens and labels; targets with a zero mask become ``IGNORE_INDEX``.
 
         Args:
             index: Record index selected by the DataLoader sampler.
         """
         sample = {name: np.array(reader[index], dtype=np.float32 if name == "loss_mask" else np.int64,
                                  copy=True) for name, reader in self.readers.items()}
-        mask = sample["loss_mask"]
+        mask = sample.pop("loss_mask")
         if np.any(sample["tokens"] < 0):
             raise ValueError("Input tokens must be nonnegative")
-        if not np.isfinite(mask).all() or np.any(mask < 0):
-            raise ValueError("Loss weights must be finite and nonnegative")
+        if not np.isin(mask, (0.0, 1.0)).all():
+            raise ValueError("Loss mask values must be 0 or 1")
         if np.any((sample["labels"] < 0) & (mask != 0)):
             raise ValueError("Ignored labels must have zero loss weight")
+        sample["labels"][mask == 0] = IGNORE_INDEX
         return sample

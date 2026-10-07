@@ -14,14 +14,59 @@
 # ============================================================================
 """JT model hooks around the public Muon optimizer."""
 
+# This adapter uses the Torch runtime, like the existing model and Trainer modules.
+# pylint: disable=forbidden-backend-import
+
 import math
 from functools import partial
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3MLAAttention
+
+
+def _value_copies(parameter: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Return every tensor that holds ``parameter``'s value.
+
+    With ``optimizer.fp32_main_params`` the leaf optimizers update an FP32
+    ``main_param`` that the mixed-precision wrapper copies back into the model
+    parameter after the step, so a post-update edit must change both copies.
+
+    Args:
+        parameter: Model parameter, possibly carrying an optimizer ``main_param``.
+
+    Returns:
+        The distinct FP32 main parameter (if any) followed by the model parameter.
+    """
+    main_param = getattr(parameter, "main_param", None)
+    if main_param is None or main_param is parameter:
+        return (parameter,)
+    return main_param, parameter
+
+
+def _replica_maxima(modules: list[JTDeepseekV3MLAAttention], group: Any) -> list[torch.Tensor]:
+    """Return each module's per-head QK maxima over every replica of its heads.
+
+    Ranks in ``group`` hold the same attention heads but see different tokens, so
+    clipping with a rank-local maximum would rescale the replicas differently.
+
+    Args:
+        modules: Attention modules in model order, identical on every rank.
+        group: DP+CP process group, or ``None`` when the heads have no replica.
+
+    Returns:
+        Per-module maxima reduced with MAX over ``group``.
+    """
+    maxima = [module.max_logits_val for module in modules]
+    if group is None or not maxima:
+        return maxima
+    flat = torch.cat([maximum.reshape(-1) for maximum in maxima])
+    dist.all_reduce(flat, op=dist.ReduceOp.MAX, group=group)
+    parts = flat.split([maximum.numel() for maximum in maxima])
+    return [part.view_as(maximum) for part, maximum in zip(parts, maxima)]
 
 
 @torch.no_grad()
@@ -29,22 +74,20 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> None:
     """Clip coupled query/key projections after each optimizer update.
 
     Args:
-        model: JT model with MLA statistics.
+        model: JT model with MLA statistics and the DP+CP ``qk_clip_group`` of its heads.
         threshold: Positive clipping threshold from the optimizer adapter configuration.
     """
-    for _, module in model.named_modules():
-        if not isinstance(module, JTDeepseekV3MLAAttention):
-            continue
-        maximum = module.max_logits_val
+    modules = [module for module in model.modules() if isinstance(module, JTDeepseekV3MLAAttention)]
+    for module, maximum in zip(modules, _replica_maxima(modules, model.qk_clip_group)):
         scale = threshold / maximum.clamp_min(threshold)
-        query = module.q_b_proj.weight.view(
-            module.num_heads, module.qk_nope_head_dim + module.qk_rope_head_dim, -1)
-        query[:, :module.qk_nope_head_dim].mul_(scale.sqrt()[:, None, None])
-        query[:, module.qk_nope_head_dim:].mul_(scale[:, None, None])
-        key_value = module.kv_b_proj.weight.view(module.num_heads, module.qk_nope_head_dim + module.v_head_dim, -1)
-        key_value[:, :module.qk_nope_head_dim].mul_(scale.sqrt()[:, None, None])
-        maximum.zero_()
-
+        for weight in _value_copies(module.q_b_proj.weight):
+            query = weight.view(module.num_heads, module.qk_nope_head_dim + module.qk_rope_head_dim, -1)
+            query[:, :module.qk_nope_head_dim].mul_(scale.sqrt()[:, None, None])
+            query[:, module.qk_nope_head_dim:].mul_(scale[:, None, None])
+        for weight in _value_copies(module.kv_b_proj.weight):
+            key_value = weight.view(module.num_heads, module.qk_nope_head_dim + module.v_head_dim, -1)
+            key_value[:, :module.qk_nope_head_dim].mul_(scale.sqrt()[:, None, None])
+        module.max_logits_val.zero_()
 
 
 @torch.no_grad()
