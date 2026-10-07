@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import copy
-import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,8 +42,6 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
-from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab_parallel_cross_entropy_local
-from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
@@ -422,27 +419,6 @@ class JTDeepseekV3Model(DeepseekV32Model):
         self.post_init()
 
 
-
-def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
-                               mask: torch.Tensor, *, vocab_size: int) -> torch.Tensor:
-    """Compute the masked token mean from the public vocab-parallel CE."""
-    mesh = _get_loss_parallel_mesh()
-    targets = labels.masked_fill(labels < 0, -100)
-    # The shared text batch supplies an integer 0/1 mask; weight and sum token losses in FP32.
-    weights = mask.float().masked_fill(labels < 0, 0)
-    values = logits.reshape(-1, logits.shape[-1])
-    if mesh is None:
-        if logits.shape[-1] != vocab_size:
-            raise ValueError("Vocabulary shards require the public loss_parallel context")
-        token_loss = F.cross_entropy(values, targets.reshape(-1), reduction="none", ignore_index=-100)
-    else:
-        token_loss = vocab_parallel_cross_entropy_local(
-            values, targets.reshape(-1), vocab_size=vocab_size, mesh=mesh,
-            ignore_index=-100, reduction="none")
-    weighted_loss = token_loss.reshape_as(weights) * weights
-    return weighted_loss.sum() / (weights.sum() + 1e-8)
-
-
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     """Reuse HF construction and children; override the reference training orchestration."""
 
@@ -478,29 +454,14 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.qk_clip_group = None
         self.post_init()
 
-    def prepare_model_inputs(
-            self,
-            model_inputs: dict[str, Any],
-            loss_inputs: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Merge the public supervision fields into the JT forward contract."""
-        prepared = dict(model_inputs)
-        for name, value in loss_inputs.items():
-            if name in prepared and prepared[name] is not value:
-                raise ValueError(f"Conflicting model and loss input: {name}")
-            prepared[name] = value
-        return prepared
-
-    def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None,
-                loss_mask: torch.Tensor | None = None, *, labels: torch.Tensor | None = None,
-                position_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None,
-                use_cache: bool = False) -> JTDeepseekV3Output:
+    def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None, *,
+                labels: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
+                attention_mask: torch.Tensor | None = None, use_cache: bool = False) -> JTDeepseekV3Output:
         """Use the same JT semantics for evaluation and Trainer backward.
 
         Args:
             input_ids: Unmodified token IDs.
-            shift_labels: Already-shifted targets from the public text batch.
-            loss_mask: Mask for the pre-shifted targets.
+            shift_labels: Already-shifted targets from the public text batch; masked targets are negative.
             labels: Public batch bookkeeping field; shift_labels owns supervision.
             position_ids: Public sequence positions used to construct RoPE.
             attention_mask: Must be None; this model builds its full causal attention internally.
@@ -509,19 +470,23 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         del labels
         if attention_mask is not None:
             raise ValueError("JT requires attention_mask=None for its full causal sequence")
-        if shift_labels is None or loss_mask is None:
-            raise ValueError("JT training requires explicit shift_labels and loss_mask")
-        if shift_labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
-            raise ValueError("JT input_ids, shift_labels and loss_mask must have matching shapes")
+        if shift_labels is None:
+            raise ValueError("JT training requires explicit shift_labels")
         if use_cache:
             raise ValueError("JT does not support cached decoding")
-        losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
+        # Same rule as the shared text batch's loss mask; JT data folds its 0/1 mask into the labels.
+        losses = self.compute_jt_losses(input_ids, shift_labels, shift_labels >= 0, position_ids=position_ids)
         # ``<token-domain>_loss[/<name>]`` keys: every JT objective is weighted by foundation tokens.
         return JTDeepseekV3Output(loss={
             "foundation_loss/lm": losses["lm_loss"],
             "foundation_loss/mtp": losses["mtp_loss"],
             "foundation_loss/aux": losses["aux_loss"],
         })
+
+    def _token_loss(self, logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Mean causal-LM loss from the framework-selected ``loss_function`` over targets with a nonzero mask."""
+        return self.loss_function(logits=logits, labels=None, vocab_size=self.config.vocab_size,
+                                  shift_labels=labels.masked_fill(mask == 0, -100))
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                          loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None
@@ -559,14 +524,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             hidden = layer(hidden, **attention_kwargs)
             if hasattr(layer.mlp, "auxiliary_loss"):
                 auxiliary = auxiliary + layer.mlp.auxiliary_loss
-        lm_loss = masked_vocab_parallel_loss(
-            self.lm_head(self.model.norm(hidden)), labels, loss_mask,
-            vocab_size=self.config.vocab_size)
+        lm_loss = self._token_loss(self.lm_head(self.model.norm(hidden)), labels, loss_mask)
         mtp_output = self.mtp(
             hidden, input_ids, embedding=self.model.embed_tokens, head=self.lm_head,
             labels=labels, loss_mask=loss_mask, loss_factor=cfg.mtp_loss_factor,
-            decoder_kwargs=attention_kwargs,
-            loss_fn=functools.partial(masked_vocab_parallel_loss, vocab_size=self.config.vocab_size),
+            decoder_kwargs=attention_kwargs, loss_fn=self._token_loss,
             auxiliary_loss=auxiliary, auxiliary_fn=lambda decoder: decoder.mlp.auxiliary_loss,
         )
         mtp_loss, auxiliary = mtp_output.loss, mtp_output.auxiliary_loss

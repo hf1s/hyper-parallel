@@ -22,6 +22,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.nn import functional as F
 
 from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
@@ -29,6 +30,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
 )
 from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiTokenPredictionLayer
+from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
@@ -74,7 +76,7 @@ class TestCompleteModel(unittest.TestCase):
         self.assertIsInstance(model.mtp.layers[0], MultiTokenPredictionLayer)
         self.assertIs(type(model.mtp.execution), DeepseekV3MTPExecution)
         tokens = torch.arange(8).unsqueeze(0)
-        output = model(tokens, (tokens + 1) % 32, torch.ones(1, 8))
+        output = model(tokens, (tokens + 1) % 32)
         self.assertEqual(
             set(output.loss),
             {"foundation_loss/lm", "foundation_loss/mtp", "foundation_loss/aux"},
@@ -126,7 +128,7 @@ class TestCompleteModel(unittest.TestCase):
         try:
             tokens = torch.arange(8).unsqueeze(0)
             with torch.no_grad():
-                output = model(tokens, (tokens + 1) % 32, torch.ones(1, 8))
+                output = model(tokens, (tokens + 1) % 32)
         finally:
             for handle in handles:
                 handle.remove()
@@ -241,24 +243,34 @@ class TestCompleteModel(unittest.TestCase):
 
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_public_batch_fields_reach_model_without_mapping(self):
-        """Feature: Native Trainer input contract.
+    def test_shared_batch_inputs_define_lm_and_mtp_objectives(self):
+        """Feature: Native Trainer input and objective contract.
 
-        Description: Pass bookkeeping labels, shifted labels, mask and positions directly.
-        Expectation: Shifted targets and positions reach the objective unchanged; missing targets fail.
+        Description: Forward the shared text batch's model inputs unchanged; the final target is the valid ID 0.
+        Expectation: LM and MTP losses equal dense CE over the batch mask; MTP has no target past the end.
         """
+        torch.manual_seed(5)
         model = JTDeepseekV3ForCausalLM(small_config())
         tokens = torch.arange(8).unsqueeze(0)
-        shifted, mask = tokens + 1, torch.ones(1, 8)
-        positions = tokens + 2
-        values = {"loss": torch.tensor(3.), "lm_loss": torch.tensor(2.),
-                  "mtp_loss": torch.tensor(0.9), "aux_loss": torch.tensor(0.1)}
-        with patch.object(model, "compute_jt_losses", return_value=values) as compute:
-            model(input_ids=tokens, labels=tokens, shift_labels=shifted, loss_mask=mask,
-                  position_ids=positions, attention_mask=None)
-        self.assertIs(compute.call_args.args[1], shifted)
-        self.assertIs(compute.call_args.kwargs["position_ids"], positions)
+        labels = torch.roll(tokens, -1, 1)
+        labels[0, [2, 5]] = -100
+        mesh = SimpleNamespace(cp_size=1, pp_size=1, tp_size=1, dp_size=1, dp_rank=0, device_mesh=None)
+        batch = TextParallelBatch(mesh, torch.device("cpu"), None, {}, False,
+                                  source_type="indexed", attention_mode="compressed")
+        model_inputs, loss_inputs = batch(iter([{"tokens": tokens, "labels": labels}]))
+        head_outputs = []
+        handle = model.lm_head.register_forward_hook(lambda _module, _inputs, output: head_outputs.append(output))
+        try:
+            output = model(**model_inputs, use_cache=False)
+        finally:
+            handle.remove()
+        lm_logits, mtp_logits = (logits[0].detach() for logits in head_outputs)
+        targets, mask = loss_inputs["shift_labels"][0], loss_inputs["loss_mask"][0].bool()
+        torch.testing.assert_close(output.loss["foundation_loss/lm"], F.cross_entropy(lm_logits[mask], targets[mask]))
+        # The single MTP depth predicts each next target, scaled by the MTP loss factor.
+        expected_mtp = F.cross_entropy(mtp_logits[:-1][mask[1:]], targets[1:][mask[1:]]) * model.config.mtp_loss_factor
+        torch.testing.assert_close(output.loss["foundation_loss/mtp"], expected_mtp)
         with self.assertRaisesRegex(ValueError, "attention_mask=None"):
-            model(input_ids=tokens, shift_labels=shifted, loss_mask=mask, attention_mask=torch.ones_like(tokens))
+            model(**(model_inputs | {"attention_mask": torch.ones_like(tokens)}))
         with self.assertRaisesRegex(ValueError, "explicit shift_labels"):
-            model(input_ids=tokens, labels=tokens, loss_mask=mask)
+            model(input_ids=tokens, labels=labels)
