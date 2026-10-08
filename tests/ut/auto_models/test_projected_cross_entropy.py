@@ -1,0 +1,105 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Projected loss preserves eager CE gradients while bounding retained logits."""
+
+import copy
+import unittest
+
+import torch
+from torch import nn
+from transformers.loss.loss_utils import ForCausalLMLoss
+
+from hyper_parallel.components.losses.projected_cross_entropy import projected_cross_entropy
+from tests.common.mark_utils import arg_mark
+
+
+class TestProjectedCrossEntropy(unittest.TestCase):
+    """Check numerical equivalence, token weighting and checkpoint tensor lifetime."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_loss_and_scaled_gradients(self) -> None:
+        """Uneven chunks, empty chunks and frozen inputs keep the eager objective."""
+        for chunk_size in (1, 3, 20):
+            for frozen_hidden, frozen_head in ((False, False), (True, False), (False, True)):
+                with self.subTest(chunk_size=chunk_size, frozen_hidden=frozen_hidden, frozen_head=frozen_head):
+                    torch.manual_seed(21)
+                    hidden = torch.randn(2, 7, 5, requires_grad=not frozen_hidden)
+                    head = nn.Linear(5, 13)
+                    head.requires_grad_(not frozen_head)
+                    original = hidden.detach().clone()
+                    reference_hidden = hidden.detach().clone().requires_grad_(not frozen_hidden)
+                    reference_head = copy.deepcopy(head)
+                    targets = torch.tensor([[-100, -100, -100, 3, 4, -100, 6],
+                                            [-100, -100, -100, 8, -100, 9, 1]])
+                    actual = projected_cross_entropy(hidden, targets, head=head, loss_fn=ForCausalLMLoss,
+                                                       vocab_size=13, chunk_size=chunk_size)
+                    expected = ForCausalLMLoss(logits=reference_head(reference_hidden), labels=None,
+                                               vocab_size=13, shift_labels=targets)
+                    (actual * 0.37).backward()
+                    (expected * 0.37).backward()
+                    torch.testing.assert_close(actual, expected)
+                    torch.testing.assert_close(hidden, original)
+                    if not frozen_hidden:
+                        torch.testing.assert_close(hidden.grad, reference_hidden.grad)
+                    if not frozen_head:
+                        for parameter, reference in zip(head.parameters(), reference_head.parameters()):
+                            torch.testing.assert_close(parameter.grad, reference.grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_all_ignored_and_retained_graph(self) -> None:
+        """Ignored targets produce zero gradients, including repeated backward."""
+        hidden = torch.randn(1, 5, 3, requires_grad=True)
+        head = nn.Linear(3, 11, bias=False)
+        loss = projected_cross_entropy(hidden, torch.full((1, 5), -100), head=head,
+                                       loss_fn=ForCausalLMLoss, vocab_size=11, chunk_size=2)
+        loss.backward(retain_graph=True)
+        loss.backward()
+        torch.testing.assert_close(loss, torch.zeros_like(loss))
+        torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
+        torch.testing.assert_close(head.weight.grad, torch.zeros_like(head.weight))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_no_logits_saved_and_projection_is_bounded(self) -> None:
+        """Forward retains checkpoint inputs, never [tokens, vocabulary] activations."""
+        hidden = torch.randn(1, 11, 5, requires_grad=True)
+        head = nn.Linear(5, 97, bias=False)
+        projected_lengths = []
+        handle = head.register_forward_hook(lambda _module, _args, output: projected_lengths.append(output.shape[1]))
+        saved_shapes = []
+
+        def save(tensor: torch.Tensor) -> torch.Tensor:
+            saved_shapes.append(tuple(tensor.shape))
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
+            loss = projected_cross_entropy(hidden, torch.zeros(1, 11, dtype=torch.long), head=head,
+                                           loss_fn=ForCausalLMLoss, vocab_size=97, chunk_size=3)
+        loss.backward()
+        handle.remove()
+        self.assertEqual(projected_lengths[:4], [3, 3, 3, 2])
+        self.assertGreater(len(projected_lengths), 4)
+        self.assertLessEqual(max(projected_lengths), 3)
+        self.assertFalse(any(97 in shape for shape in saved_shapes), saved_shapes)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_rejects_invalid_geometry(self) -> None:
+        """Fail before a head call if sequence shards cannot align with labels."""
+        hidden = torch.randn(1, 5, 3)
+        head = nn.Linear(3, 11, bias=False)
+        for chunk_size, parts, length in ((0, 1, 5), (True, 1, 5), (3, 2, 10), (4, 2, 9)):
+            with self.subTest(chunk_size=chunk_size, parts=parts, length=length), self.assertRaises(ValueError):
+                projected_cross_entropy(hidden, torch.zeros(1, length, dtype=torch.long), head=head,
+                                         loss_fn=ForCausalLMLoss, vocab_size=11, chunk_size=chunk_size,
+                                         sequence_parallel_size=parts)

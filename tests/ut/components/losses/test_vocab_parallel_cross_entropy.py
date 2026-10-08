@@ -19,8 +19,19 @@ from unittest.mock import Mock, patch
 
 import torch
 from torch.nn import functional
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from hyper_parallel.components.losses import _vocab_parallel_cross_entropy as loss_module
+from tests.common.mark_utils import arg_mark
+
+
+class _NoScalarExtraction(TorchDispatchMode):
+    """Reject device-to-host scalar reads in the training CE path."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten._local_scalar_dense.default:
+            raise AssertionError("Training CE must not synchronize device scalars to the host")
+        return func(*args, **({} if kwargs is None else kwargs))
 
 
 def _mesh(size: int = 1, rank: int = 0) -> Mock:
@@ -40,6 +51,18 @@ def _identity_reduce(value: torch.Tensor, **_kwargs) -> torch.Tensor:
 
 class TestVocabParallelCrossEntropy(unittest.TestCase):
     """Compare real forward/backward calculations with native cross-entropy."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_training_forward_backward_does_not_extract_device_scalars(self) -> None:
+        """Chunk recomputation must keep masks, counts and indexing entirely on device."""
+        for target in (torch.tensor([0, -100, 4, 2]), torch.full((4,), -100)):
+            logits = torch.randn(4, 5, requires_grad=True)
+            with patch.object(loss_module, "_differentiable_all_reduce", side_effect=_identity_reduce):
+                with _NoScalarExtraction():
+                    loss = loss_module.vocab_parallel_cross_entropy_local(
+                        logits, target, vocab_size=5, mesh=_mesh(), reduction="sum",
+                    )
+                    loss.sum().backward()
 
     def _check_single_rank(self, target: torch.Tensor, weight, reduction: str) -> None:
         """Compare single-rank loss values and scaled gradients with native cross-entropy."""

@@ -36,6 +36,8 @@ from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
 )
 
 from hyper_parallel.components.losses import calculate_mtp_loss, calculate_seq_aux_loss
+from hyper_parallel.components.losses.mtp import iter_mtp_targets
+from hyper_parallel.components.losses.projected_cross_entropy import projected_cross_entropy
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.components.functional.npu_fusion_attention import (
@@ -450,6 +452,12 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             output_norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
         )
         self.loss_group = None
+        self.loss_tp_mesh = None
+        self.loss_sequence_parallel_size = 1
+        self.loss_chunk_size = getattr(config, "loss_chunk_size", 0)
+        if (isinstance(self.loss_chunk_size, bool) or not isinstance(self.loss_chunk_size, int)
+                or self.loss_chunk_size < 0):
+            raise ValueError("loss_chunk_size must be a nonnegative integer; zero disables chunking")
         # Ranks holding the same attention heads (DP+CP); the JT builder sets it for QK clipping.
         self.qk_clip_group = None
         # Ranks holding different batch data (DP+CP); the JT builder sets it to sum expert token counts.
@@ -494,6 +502,14 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                                   shift_labels=labels.masked_fill(mask == 0, -100))
         # causal_lm_loss_parallel returns shape [1]; the Trainer stacks named losses, so keep each one 0-d.
         return loss.reshape(())
+
+    def _projection_loss(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Score hidden states with the configured output-head memory policy."""
+        return projected_cross_entropy(
+            hidden, targets, head=self.lm_head, loss_fn=self.loss_function,
+            vocab_size=self.config.vocab_size, chunk_size=self.loss_chunk_size,
+            sequence_parallel_size=self.loss_sequence_parallel_size, tp_mesh=self.loss_tp_mesh,
+        )
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                          loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None,
@@ -544,12 +560,22 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             hidden = layer(hidden, **attention_kwargs)
             if hasattr(layer.mlp, "auxiliary_loss"):
                 auxiliary = auxiliary + layer.mlp.auxiliary_loss
-        lm_loss = self._token_loss(self.lm_head(self.model.norm(hidden)), labels, loss_mask)
-        mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens, head=self.lm_head,
+        targets = labels.masked_fill(loss_mask == 0, -100)
+        normalized = self.model.norm(hidden)
+        lm_loss = (self._projection_loss(normalized, targets) if self.loss_chunk_size
+                   else self._token_loss(self.lm_head(normalized), labels, loss_mask))
+        mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens,
+                              head=None if self.loss_chunk_size else self.lm_head,
                               decoder_kwargs=attention_kwargs, sequence_ends=sequence_ends)
         for layer in self.mtp.layers:
             auxiliary = auxiliary + layer.transformer_layer.mlp.auxiliary_loss
-        mtp_loss = calculate_mtp_loss(mtp_output.logits, labels.masked_fill(loss_mask == 0, -100),
-                                      self.loss_function, vocab_size=cfg.vocab_size,
-                                      loss_factor=cfg.mtp_loss_factor, sequence_ends=sequence_ends)
+        if self.loss_chunk_size:
+            mtp_loss = torch.zeros_like(lm_loss)
+            depths = len(mtp_output.prediction_hidden_states)
+            for prediction, future_targets in zip(mtp_output.prediction_hidden_states,
+                                                   iter_mtp_targets(targets, depths, sequence_ends=sequence_ends)):
+                mtp_loss = mtp_loss + self._projection_loss(prediction, future_targets) * (cfg.mtp_loss_factor / depths)
+        else:
+            mtp_loss = calculate_mtp_loss(mtp_output.logits, targets, self.loss_function, vocab_size=cfg.vocab_size,
+                                          loss_factor=cfg.mtp_loss_factor, sequence_ends=sequence_ends)
         return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}

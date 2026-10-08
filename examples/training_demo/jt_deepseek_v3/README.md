@@ -44,6 +44,10 @@ dataloader:
 - packed 路径要求 `training.micro_batch_size: 1`、`accelerator.cp_size: 1`。
 - 验证步数：`training.train_iters: 10`；卡数须与 YAML 中的并行策略匹配。
 
+大词表训练可设置 `model.config.loss_chunk_size`：4K 验证使用 1024，256K 使用 16384。
+默认 0 关闭分块；启用 SP 时须为 TP 度数的整数倍。LM/MTP 共用投影与 CE 的分块重计算，
+以额外计算换取更低的输出层显存；公共 CE 的同步优化独立于此开关，不承诺所有路径无 host sync。
+
 ## 3. 启动与日志
 
 通用入口适用于任意 YAML；以下 4 卡命令要求使用相应的并行配置：

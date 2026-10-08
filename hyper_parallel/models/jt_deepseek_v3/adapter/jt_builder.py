@@ -126,6 +126,8 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
     device = torch.device(mesh.device_mesh.device_type, get_device_id())
     model.to(device)
     model.loss_group = mesh.device_mesh["tp"].get_group()
+    model.loss_tp_mesh = mesh.device_mesh["tp"] if mesh.loss_parallel else None
+    model.loss_sequence_parallel_size = mesh.tp_size if mesh.sequence_parallel else 1
     model = apply_model_infrastructure(
         model,
         mesh=mesh,
