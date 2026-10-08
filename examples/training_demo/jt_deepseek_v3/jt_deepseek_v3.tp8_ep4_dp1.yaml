@@ -100,11 +100,17 @@ plan_overrides:
       input: {tp: "shard(1)"}
     out_src: {tp: "shard(1)"}
     out_dst: {tp: "shard(1)"}
+  # Routed MoE layers run EP; layer 0 is the dense first_k_dense_replace layer.
+  - match: "model.layers.[123456789]*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.ep_compute.jt_deepseek_v3_ep_compute_fn
   - match: "mtp.layers.*.transformer_layer.mlp"
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_ep
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.ep_compute.jt_deepseek_v3_ep_compute_fn
 training:
   train_iters: 10
   lr_scheduler_iters: 8
@@ -112,7 +118,6 @@ training:
   global_batch_size: 1
   micro_batch_size: 1
   backend: hccl
-  init_device: cpu
   seed: 42
   enable_full_determinism: false
 accelerator:
@@ -132,7 +137,7 @@ activation_checkpoint:
   mode: "off"
 activation_swap: none
 dataset:
-  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_data.IndexedSupervisedDataset
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.data.dataset.IndexedSupervisedDataset
   data_path: /path/to/supervised_prefix
   sequence_length: 262144
   model_assets:

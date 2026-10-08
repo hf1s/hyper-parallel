@@ -12,17 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Hugging Face configuration for the independently registered JT model family."""
+"""DeepSeek-V3 expert-parallel compute archetype."""
 
-from transformers import AutoConfig, DeepseekV32Config
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.ep_compute import (
+    jt_deepseek_v3_ep_compute_fn,
+)
 
-
-class JTDeepseekV3Config(DeepseekV32Config):
-    """DeepSeek-V3.2-compatible configuration with an independent JT identity."""
-
-    model_type = "jt_deepseek_v3"
-
-
-AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
-
-__all__ = ["JTDeepseekV3Config"]
+__all__ = ["jt_deepseek_v3_ep_compute_fn"]

@@ -24,8 +24,8 @@ from unittest.mock import patch
 import torch
 from torch.nn import functional as F
 
-from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
+    JTDeepseekV3Config,
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3MoE,
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
 )

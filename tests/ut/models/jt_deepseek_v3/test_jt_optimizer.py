@@ -26,9 +26,8 @@ import torch.distributed as dist
 
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.models.jt_deepseek_v3.adapter.runtime import jt_optimizer
-from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
-    JTDeepseekV3ForCausalLM, JTDeepseekV3MLAAttention,
+    JTDeepseekV3Config, JTDeepseekV3ForCausalLM, JTDeepseekV3MLAAttention,
 )
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
 from hyper_parallel.trainer.config import entries_to_module_replacements
