@@ -90,7 +90,7 @@ def _mask_scores_by_group(scores, n_group, topk_group):
     return scores.masked_fill(~score_mask.bool(), float("-inf"))
 
 
-def _sigmoid_group_router(module, hidden_states):
+def _sigmoid_group_router(module, hidden_states, *, return_scores: bool = False):
     """deepseekv3/glm4moe adapter: sigmoid + e_score_correction_bias +
     group-limited topk + (optional) normalization + routed_scaling_factor
     (step-by-step consistent with HF DeepseekV3MoE.route_tokens_to_experts /
@@ -100,6 +100,10 @@ def _sigmoid_group_router(module, hidden_states):
     (n_group/topk_group/top_k/norm_topk_prob/routed_scaling_factor), falling
     back to module.config; when n_group is missing or <=1, the group-limited
     filter is skipped.
+
+    ``return_scores=True`` also returns the unnormalized FP32 sigmoid scores
+    for a differentiable auxiliary objective without caching gate outputs on
+    modules. The default two-output adapter contract remains unchanged.
     """
     gate = getattr(module, "gate", None)
     if gate is None:
@@ -133,6 +137,8 @@ def _sigmoid_group_router(module, hidden_states):
     if _attr("norm_topk_prob", False):
         topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
     topk_w = topk_w * float(_attr("routed_scaling_factor", 1.0))
+    if return_scores:
+        return topk_idx, topk_w, scores
     return topk_idx, topk_w
 
 

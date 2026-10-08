@@ -93,3 +93,5 @@ dataloader:
 切换 256K 使用 `max_seq_len: 262144`。Online 保留短尾窗，由 collator 补齐；两种入口共用
 转换逻辑，但不保证逐步采样顺序一致。恢复训练须保持 DP 度数和 global batch size 不变。
 更多字段映射和数据接口见 [公共数据说明](../../../hyper_parallel/data/README.md#预分词-sft)。
+
+MF Graph O1 的单卡数值复现配置及验证边界见 [4K 对齐说明](REFERENCE_ALIGNMENT.md)。

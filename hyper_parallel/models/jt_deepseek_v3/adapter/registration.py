@@ -14,9 +14,20 @@
 # ============================================================================
 """Lazy registration of the independently constructed JT family."""
 
+from typing import Any
+
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.jt_deepseek_v3.adapter.policies.sharding import build_parameter_sharding_rules
 from hyper_parallel.models.registry import register_custom_model, register_model_adapter
+
+
+def _fp32_modules(model: Any) -> tuple[str, ...]:
+    """Select each precision-sensitive module once through transparent wrappers."""
+    selected = {}
+    for name, module in dict(model.named_modules()).items():
+        if getattr(module, "keep_compute_in_fp32", False):
+            selected.setdefault(id(module), name)
+    return tuple(selected.values())
 
 
 def _load_expert_parallel():
@@ -33,6 +44,7 @@ JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     fsdp_wrap_modules=lambda model: tuple(
         f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers))
     ),
+    fsdp_fp32_modules=_fp32_modules,
 )
 register_model_adapter(JT_DEEPSEEK_V3_ADAPTER_SPEC)
 register_custom_model(

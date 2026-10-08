@@ -27,11 +27,12 @@ from torch.nn import functional as F
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3MoE,
-    JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
+    JTDeepseekV3Attention, JTDeepseekV3MLAAttention, JTDeepseekV3RotaryEmbedding,
 )
 from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiTokenPredictionLayer
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
@@ -59,6 +60,120 @@ def small_config() -> JTDeepseekV3Config:
 
 class TestCompleteModel(unittest.TestCase):
     """Exercise model semantics without a builder, EP adapter or replacement pass."""
+
+    def test_moe_combine_preserves_probability_precision_and_gradients(self):
+        """Feature: Expert aggregation precision.
+
+        Description: Combine BF16 expert values with non-BF16 routing probabilities.
+        Expectation: FP32 products are summed before one BF16 cast; both inputs receive gradients.
+        """
+        moe = JTDeepseekV3MoE(small_config())
+        values = torch.tensor([[[1.0], [2.0]]], dtype=torch.bfloat16, requires_grad=True)
+        probabilities = torch.tensor([[0.501, 0.499]], requires_grad=True)
+        actual = moe._combine_experts(values, probabilities)
+        torch.testing.assert_close(actual, torch.tensor([[1.499]], dtype=torch.bfloat16), rtol=0, atol=0)
+        actual.float().sum().backward()
+        torch.testing.assert_close(probabilities.grad, torch.tensor([[1.0, 2.0]]), rtol=0, atol=0)
+        torch.testing.assert_close(values.grad.squeeze(-1), probabilities.detach().to(torch.bfloat16), rtol=0, atol=0)
+
+    def test_moe_residual_has_only_one_rounding_boundary(self):
+        """Feature: MoE residual accumulation.
+
+        Description: Sum small shared/routed branches with a BF16 residual.
+        Expectation: A representable small branch is not lost to an intermediate BF16 cast.
+        """
+        config = small_config()
+        config.use_pad_tokens = False
+        moe = JTDeepseekV3MoE(config)
+        hidden = torch.zeros(1, 1, 16, dtype=torch.bfloat16)
+        routed = torch.full_like(hidden, 1.0, requires_grad=True)
+        shared = torch.full_like(hidden, 0.003, requires_grad=True)
+        residual = torch.full_like(hidden, -1.0, requires_grad=True)
+        moe.ep_compute = lambda _hidden: routed
+        with patch.object(moe.shared_experts, "forward", return_value=shared):
+            actual = moe(hidden, residual=residual)
+        torch.testing.assert_close(actual, shared, rtol=0, atol=0)
+        actual.float().sum().backward()
+        for value in (routed, shared, residual):
+            torch.testing.assert_close(value.grad, torch.ones_like(value), rtol=0, atol=0)
+
+    def test_partitioned_combine_validates_shape_and_preserves_gradients(self):
+        """Feature: Reference reduction partitions.
+
+        Description: Split token-expert work into ranges ending inside a token.
+        Expectation: Local partial sums are merged without detaching values or probabilities.
+        """
+        config = small_config()
+        config.moe_combine_num_partitions = 4
+        moe = JTDeepseekV3MoE(config)
+        values = torch.arange(42, dtype=torch.float32).reshape(7, 6, 1).requires_grad_()
+        probabilities = torch.full((7, 6), 0.25, requires_grad=True)
+        actual = moe._combine_experts(values, probabilities)
+        expected = values.detach().sum(1) / 4
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual.sum().backward()
+        torch.testing.assert_close(values.grad, torch.full_like(values, 0.25), rtol=0, atol=0)
+        torch.testing.assert_close(probabilities.grad, values.detach().squeeze(-1), rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "token count"):
+            moe._combine_experts(values[:1], probabilities[:1])
+        for invalid in (0, True, 1.5):
+            config.moe_combine_num_partitions = invalid
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                JTDeepseekV3MoE(config)
+
+    def test_precision_units_survive_checkpoint_wrappers(self):
+        """Feature: Mixed precision with recomputation.
+
+        Description: Discover FP32 units after native checkpoint wrappers normalize module names.
+        Expectation: Every returned FQN resolves uniquely to the intended precision-sensitive module.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        _apply_activation_checkpointing(model, "full")
+        manager = FSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
+        units = manager._find_wrap_modules(model)
+        names = {unit.fqn for unit in units}
+        self.assertIn("mtp.layers.0.transformer_layer.self_attn.q_a_layernorm", names)
+        self.assertEqual(len(units), len(names))
+        self.assertEqual(len(units), len({id(unit.module) for unit in units}))
+
+    def test_recomputed_model_runs_consecutive_backward_steps(self):
+        """Feature: Recomputed router state lifetime.
+
+        Description: Run two complete forward/backward steps through checkpoint wrappers.
+        Expectation: Router scores are returned directly and cannot be shadowed by stale wrapper attributes.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        _apply_activation_checkpointing(model, "full")
+        tokens = torch.arange(8).unsqueeze(0)
+        for _ in range(2):
+            output = model(tokens, (tokens + 1) % 32)
+            sum(output.loss.values()).backward()
+            router = model.mtp.layers[0].transformer_layer.mlp.gate
+            self.assertIsNotNone(router.weight.grad)
+            self.assertTrue(torch.isfinite(router.weight.grad).all())
+            model.zero_grad()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_rotary_preserves_fp32_tables_and_activation_dtype(self):
+        """Feature: Rotary mixed precision.
+
+        Description: Rotate BF16 activations using angles that are not representable in BF16.
+        Expectation: The FP32 rotation is rounded once to the activation dtype and retains gradients.
+        """
+        values = torch.tensor([[[[1.5, 1.25, -0.5, 0.75]]]], dtype=torch.bfloat16, requires_grad=True)
+        angles = torch.tensor([[[0.37, 1.29, 0.37, 1.29]]], dtype=torch.float32)
+        cosine, sine = angles.cos(), angles.sin()
+        ordered = torch.tensor([[[[1.5, -0.5, 1.25, 0.75]]]], dtype=torch.float32)
+        rotated = torch.tensor([[[[-1.25, -0.75, 1.5, -0.5]]]], dtype=torch.float32)
+        expected = (ordered * cosine.unsqueeze(1) + rotated * sine.unsqueeze(1)).to(torch.bfloat16)
+
+        actual = JTDeepseekV3RotaryEmbedding()(values, cosine, sine)
+
+        self.assertEqual(actual.dtype, values.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual.float().sum().backward()
+        self.assertIsNotNone(values.grad)
+        self.assertTrue(torch.isfinite(values.grad).all())
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_standalone_forward_backward(self):
@@ -210,10 +325,31 @@ class TestCompleteModel(unittest.TestCase):
         model = JTDeepseekV3ForCausalLM(small_config())
         self.assertEqual(FSDP2Manager._get_model_adapter_spec(model).model_type, "jt_deepseek_v3")
         manager = FSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
+        units = manager._find_wrap_modules(model)
         self.assertEqual(
-            sorted(unit.fqn for unit in manager._find_wrap_modules(model)),
+            sorted(unit.fqn for unit in units if not unit.keep_fp32),
             ["model.layers.0", "model.layers.1", "mtp.layers.0.transformer_layer"],
         )
+        fp32_names = {unit.fqn for unit in units if unit.keep_fp32}
+        self.assertIn("model.layers.1.mlp.gate", fp32_names)
+        self.assertIn("model.norm", fp32_names)
+        self.assertIn("mtp.layers.0.hnorm", fp32_names)
+        self.assertEqual(len({id(unit.module) for unit in units}), len(units))
+
+        manager.fp32_main_params = True
+        policy = manager._build_mixed_precision_policy()
+        with patch("hyper_parallel.distributed._builder.fsdp_adapter.fully_shard") as shard:
+            manager._parallelize_child_units(units, {}, None, None, {"mp_policy": policy})
+        fp32_ids = {id(unit.module) for unit in units if unit.keep_fp32}
+        for call in shard.call_args_list:
+            applied = call.kwargs["mp_policy"]
+            self.assertTrue(applied.apply_grad_on_fp32_main_grad)
+            if id(call.args[0]) in fp32_ids:
+                self.assertEqual(applied.param_dtype, torch.float32)
+                self.assertFalse(applied.cast_forward_inputs)
+                self.assertIsNone(applied.output_dtype)
+            else:
+                self.assertIs(applied, policy)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_recipe_config_roundtrip(self):

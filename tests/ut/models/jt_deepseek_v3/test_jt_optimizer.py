@@ -27,7 +27,7 @@ import torch.distributed as dist
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.models.jt_deepseek_v3.adapter.runtime import jt_optimizer
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
-    JTDeepseekV3Config, JTDeepseekV3ForCausalLM, JTDeepseekV3MLAAttention,
+    JTDeepseekV3Config, JTDeepseekV3ForCausalLM, JTDeepseekV3MLAAttention, JTDeepseekV3Attention,
 )
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
 from hyper_parallel.trainer.config import entries_to_module_replacements
@@ -89,6 +89,49 @@ def two_rank_all_reduce(peer: torch.Tensor) -> Callable[..., None]:
 
 class TestQKClip(unittest.TestCase):
     """QK clipping applied after the optimizer step must agree across replicas."""
+
+    def test_native_attention_is_clipped(self):
+        """Feature: QK clipping without optional projection fusion.
+
+        Description: Populate native attention statistics above the configured threshold.
+        Expectation: Both projection layouts apply the same per-head QK update.
+        """
+        model = JTDeepseekV3ForCausalLM(replaced_model(torch.float32).config)
+        modules = [module for module in model.modules() if isinstance(module, JTDeepseekV3Attention)]
+        originals = []
+        for module in modules:
+            module.max_logits_val = torch.tensor([4 * THRESHOLD, THRESHOLD / 2])
+            originals.append(module.q_b_proj.weight.detach().clone())
+        jt_optimizer.clip_qk(model, THRESHOLD)
+        for module, original in zip(modules, originals):
+            torch.testing.assert_close(module.q_b_proj.weight,
+                                       original * row_factors([0.25, 1.0], True), rtol=0, atol=0)
+
+    def test_reference_muon_layout_is_reversible(self):
+        """Feature: Logical Muon matrix layouts.
+
+        Description: Separate head components, expert Gate/Up and shared Gate/Up.
+        Expectation: Identity matrix updates restore storage order with the reference shared scale.
+        """
+        config = replaced_model(torch.float32).config
+        cases = [
+            ("self_attn.q_b_proj.weight", (16, 8), [(8, 8), (8, 8)]),
+            ("self_attn.kv_b_proj.weight", (16, 8), [(8, 8), (8, 8)]),
+            ("self_attn.kv_a_proj_with_mqa.weight", (12, 16), [(8, 16), (4, 16)]),
+            ("mlp.experts.gate_up_proj", (4, 32, 16), [(4, 16, 16), (4, 16, 16)]),
+            ("mlp.experts.down_proj", (4, 16, 16), [(4, 16, 16)]),
+            ("mlp.shared_experts.linear_fc1.weight", (32, 16), [(16, 16), (16, 16)]),
+        ]
+        for name, shape, expected_shapes in cases:
+            with self.subTest(name=name):
+                values = torch.arange(torch.tensor(shape).prod().item(), dtype=torch.float32).reshape(shape)
+                transform = jt_optimizer._reference_muon_transform(  # pylint: disable=protected-access
+                    name, values, config=config, matched_adamw_rms=0.2)
+                self.assertEqual([tuple(part.shape) for part in transform.tensors], expected_shapes)
+                output = torch.empty_like(values)
+                transform.restore([part.clone() for part in transform.tensors], output)
+                scale = max(expected_shapes[-1][-2:]) ** 0.5 * 0.2
+                torch.testing.assert_close(output, values * scale, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_optimizer_step_clips_projections(self):

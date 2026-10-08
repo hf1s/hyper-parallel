@@ -79,6 +79,7 @@ _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "ns_coefficients": None,
     "ns_epsilon": 1e-10,
     "zeropower_fn": None,
+    "batch_ns": True,
     "momentum_update_fn": None,
     "reshape_fn": None,
     "ns_transform_fn": None,
@@ -95,6 +96,7 @@ class _MuonAdvancedOptions:
     ns_coefficients: Optional[Sequence[Tuple[float, float, float]]]
     ns_epsilon: float
     zeropower_fn: Optional[Callable[..., torch.Tensor]]
+    batch_ns: bool
     momentum_update_fn: Optional[Callable[..., torch.Tensor]]
     reshape_fn: Optional[Callable[..., Any]]
     ns_transform_fn: Optional[Callable[..., Optional[NSInputTransform]]]
@@ -224,6 +226,7 @@ class Muon(BaseDistributedOptimizer):
             ns_coefficients: Optional custom Newton-Schulz coefficients.
             ns_epsilon: Numerical stability term used during normalization.
             zeropower_fn: Optional Newton-Schulz implementation override.
+            batch_ns: Batch compatible NS inputs; disable to preserve each callback input's rank.
             momentum_update_fn: Optional momentum update implementation override.
             reshape_fn: Optional logical-matrix reshape function.
             ns_transform_fn: Optional Newton-Schulz input transformation.
@@ -233,6 +236,8 @@ class Muon(BaseDistributedOptimizer):
             hsdp_replica_count: Optional optimizer-state replica group size.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        if not isinstance(advanced.batch_ns, bool):
+            raise ValueError("batch_ns must be a boolean")
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -267,6 +272,7 @@ class Muon(BaseDistributedOptimizer):
         super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
+        self.batch_ns = advanced.batch_ns
         self.momentum_update_fn = advanced.momentum_update_fn
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
@@ -828,6 +834,10 @@ class Muon(BaseDistributedOptimizer):
         if not tensor_list:
             return []
 
+        if not self.batch_ns:
+            return [self._apply_zeropower(tensor, ns_steps, ns_variant, ns_coefficients, ns_epsilon)
+                    for tensor in tensor_list]
+
         state = {"inputs_3d": [], "slice_sizes": [], "shapes_info": [], "restored_updates": [], "current_idx": 0}
 
         for tensor in tensor_list:
@@ -857,16 +867,7 @@ class Muon(BaseDistributedOptimizer):
         if merged_input.shape[0] == 1:
             merged_input = merged_input.squeeze(0)
 
-        if self.zeropower_fn is None:
-            merged_update = zeropower_via_newtonschulz5(
-                merged_input,
-                steps=ns_steps,
-                ns_variant=ns_variant,
-                epsilon=ns_epsilon,
-                ns_coefficients=ns_coefficients,
-            )
-        else:
-            merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
+        merged_update = self._apply_zeropower(merged_input, ns_steps, ns_variant, ns_coefficients, ns_epsilon)
 
         if merged_input.dim() == 2:
             merged_update = merged_update.unsqueeze(0)
@@ -887,6 +888,21 @@ class Muon(BaseDistributedOptimizer):
 
         del merged_update
         return state["restored_updates"]
+
+    def _apply_zeropower(
+            self,
+            tensor: torch.Tensor,
+            ns_steps: int,
+            ns_variant: str,
+            ns_coefficients: Optional[Sequence[Tuple[float, float, float]]],
+            ns_epsilon: float,
+    ) -> torch.Tensor:
+        """Apply the selected NS implementation without changing the input layout."""
+        if self.zeropower_fn is not None:
+            return self.zeropower_fn(tensor, steps=ns_steps)
+        return zeropower_via_newtonschulz5(
+            tensor, steps=ns_steps, ns_variant=ns_variant,
+            epsilon=ns_epsilon, ns_coefficients=ns_coefficients)
 
     def _split_into_memory_safe_batches(
             self,

@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -60,6 +60,7 @@ class _WrapModuleInfo:
 
     fqn: str
     module: ModuleClass
+    keep_fp32: bool = False
 
 
 def _is_expert_source_mesh(mesh: DeviceMesh | None) -> bool:
@@ -320,6 +321,7 @@ class FSDP2Manager:
     def _find_adapter_declared_wrap_modules(
         cls,
         model: ModuleClass,
+        provider_name: str = "fsdp_wrap_modules",
     ) -> list[_WrapModuleInfo]:
         """Resolve adapter-declared FSDP units outside HF decoder containers.
 
@@ -329,6 +331,7 @@ class FSDP2Manager:
 
         Args:
             model: Root model being wrapped.
+            provider_name: Adapter field declaring the exact child-module FQNs.
 
         Returns:
             Additional FSDP child units selected by model declarations.
@@ -338,13 +341,16 @@ class FSDP2Manager:
                 module in the model tree, or aliases the same module twice.
         """
         adapter_spec = cls._get_model_adapter_spec(model)
-        if adapter_spec is None or adapter_spec.fsdp_wrap_modules is None:
+        provider = getattr(adapter_spec, provider_name, None)
+        if provider is None:
             return []
-
-        declared_fqns = adapter_spec.fsdp_wrap_modules(model)
+        if not callable(provider):
+            raise ValueError(f"ModelAdapterSpec.{provider_name} must be callable")
+        # The dynamically selected adapter callback is validated above.
+        declared_fqns = provider(model)  # pylint: disable=not-callable
         if isinstance(declared_fqns, str) or not isinstance(declared_fqns, Sequence):
             raise ValueError(
-                "ModelAdapterSpec.fsdp_wrap_modules must return a sequence of exact module FQNs"
+                f"ModelAdapterSpec.{provider_name} must return a sequence of exact module FQNs"
             )
         module_by_fqn = dict(model.named_modules())
         declared_wrap_modules = []
@@ -352,17 +358,17 @@ class FSDP2Manager:
         for module_fqn in declared_fqns:
             if not isinstance(module_fqn, str) or not module_fqn:
                 raise ValueError(
-                    "ModelAdapterSpec.fsdp_wrap_modules entries must be non-empty strings"
+                    f"ModelAdapterSpec.{provider_name} entries must be non-empty strings"
                 )
             wrap_module = module_by_fqn.get(module_fqn)
             if wrap_module is None:
                 raise ValueError(
-                    "ModelAdapterSpec.fsdp_wrap_modules declared an unknown module: "
+                    f"ModelAdapterSpec.{provider_name} declared an unknown module: "
                     f"{module_fqn}"
                 )
             if id(wrap_module) in wrapped_module_ids:
                 raise ValueError(
-                    "ModelAdapterSpec.fsdp_wrap_modules aliases one module more than once: "
+                    f"ModelAdapterSpec.{provider_name} aliases one module more than once: "
                     f"{module_fqn}"
                 )
             wrapped_module_ids.add(id(wrap_module))
@@ -428,6 +434,13 @@ class FSDP2Manager:
                 metadata_by_parameter,
                 wrapped_module_ids,
             )
+        )
+        fp32_modules = self._find_adapter_declared_wrap_modules(model, "fsdp_fp32_modules")
+        fp32_ids = {id(unit.module) for unit in fp32_modules}
+        wrap_modules = [replace(unit, keep_fp32=id(unit.module) in fp32_ids) for unit in wrap_modules]
+        wrap_modules.extend(
+            replace(unit, keep_fp32=True) for unit in fp32_modules
+            if id(unit.module) not in wrapped_module_ids
         )
         if not wrap_modules:
             raise ValueError(
@@ -617,6 +630,12 @@ class FSDP2Manager:
                     raise ValueError("Expert TP metadata requires MeshContext.fsdp_moe_mesh")
                 fsdp_sublayer_kwargs, _ = self._build_fully_shard_kwargs(
                     self._build_fsdp_actual_mesh(expert=True)
+                )
+            if wrap_module.keep_fp32:
+                fsdp_sublayer_kwargs = dict(fsdp_sublayer_kwargs)
+                fsdp_sublayer_kwargs["mp_policy"] = replace(
+                    fsdp_sublayer_kwargs["mp_policy"], param_dtype=torch.float32,
+                    cast_forward_inputs=False, output_dtype=None,
                 )
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,

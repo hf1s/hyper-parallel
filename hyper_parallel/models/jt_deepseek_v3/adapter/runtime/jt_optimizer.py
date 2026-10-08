@@ -25,14 +25,91 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.core.optimizer.muon import NSInputTransform
 from hyper_parallel.core.utils.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
+    JTDeepseekV3Attention,
     JTDeepseekV3MLAAttention,
     JTDeepseekV3MoE,
 )
 
 
-def _replica_maxima(modules: list[JTDeepseekV3MLAAttention], group: Any) -> list[torch.Tensor]:
+def _reference_newton_schulz(inputs: torch.Tensor, steps: int) -> torch.Tensor:
+    """Reproduce native Graph O1 BF16 NS arithmetic on logical 2D/3D matrices.
+
+    The graph fuses multiply-add expressions in FP32, with BF16 scalar
+    coefficients and BF16 matmul boundaries. Only 2D normalization retains
+    FP32 intermediates; expert normalization rounds the norm to BF16. Its 2D path
+    evaluates ``(c * A) @ A``, while the expert path evaluates ``c * (A @ A)``.
+    """
+    if inputs.ndim not in (2, 3) or inputs.dtype != torch.bfloat16:
+        raise ValueError("reference Newton-Schulz requires logical BF16 matrices of rank 2 or 3")
+    transposed = inputs.shape[-2] > inputs.shape[-1]
+    value = inputs.mT if transposed else inputs
+    normalization_input = value.float() if inputs.ndim == 2 else value
+    value = (normalization_input / (normalization_input.norm(dim=(-2, -1), keepdim=True) + 1e-7)).bfloat16()
+    # These are the legacy coefficients rounded to BF16 before graph fusion.
+    coeff_a, coeff_b, coeff_c = 3.4375, -4.78125, 2.03125
+    for _ in range(steps):
+        gram = value @ value.mT
+        if inputs.ndim == 2:
+            polynomial = coeff_b * gram.float() + ((coeff_c * gram) @ gram).float()
+        else:
+            polynomial = coeff_b * gram.float() + coeff_c * (gram @ gram).float()
+        value = (coeff_a * value.float() + (polynomial.bfloat16() @ value).float()).bfloat16()
+    return value.mT if transposed else value
+
+
+def _reference_muon_transform(param_name: str, tensor: torch.Tensor, *, config: Any,
+                              matched_adamw_rms: float) -> NSInputTransform:
+    """Expose reference logical matrices through the public reversible NS interface.
+
+    Packed projections are storage layouts, not single Muon matrices. The
+    reference also shares the last logical matrix's scale across each packed
+    parameter. This optional compatibility policy leaves the core optimizer's
+    default per-matrix scaling unchanged.
+    """
+    join_dim, transpose, periodic_shape = 0, False, None
+    if param_name.endswith("experts.gate_up_proj"):
+        parts = list(tensor.transpose(-1, -2).chunk(2, dim=-1))
+        join_dim, transpose = -1, True
+    elif param_name.endswith("experts.down_proj"):
+        parts = [tensor.transpose(-1, -2)]
+        transpose = True
+    elif param_name.endswith("self_attn.q_b_proj.weight"):
+        periodic_shape = (config.num_attention_heads, config.qk_nope_head_dim + config.qk_rope_head_dim, -1)
+        pair = tensor.reshape(periodic_shape).split((config.qk_nope_head_dim, config.qk_rope_head_dim), dim=1)
+        parts = [part.reshape(-1, tensor.shape[-1]) for part in pair]
+    elif param_name.endswith("self_attn.kv_b_proj.weight"):
+        periodic_shape = (config.num_attention_heads, config.qk_nope_head_dim + config.v_head_dim, -1)
+        pair = tensor.reshape(periodic_shape).split((config.qk_nope_head_dim, config.v_head_dim), dim=1)
+        parts = [part.reshape(-1, tensor.shape[-1]) for part in pair]
+    elif param_name.endswith("self_attn.kv_a_proj_with_mqa.weight"):
+        parts = list(tensor.split((config.kv_lora_rank, config.qk_rope_head_dim), dim=0))
+    elif param_name.endswith("self_attn.linear_qkv.weight"):
+        parts = list(tensor.split((config.q_lora_rank, config.kv_lora_rank, config.qk_rope_head_dim), dim=0))
+    elif param_name.endswith("linear_fc1.weight"):
+        parts = list(tensor.chunk(2, dim=0))
+    else:
+        parts = [tensor]
+    scale = math.sqrt(max(parts[-1].shape[-2:])) * matched_adamw_rms
+
+    def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+        """Restore projection/expert storage after independent matrix updates."""
+        if periodic_shape is not None:
+            values = [update.reshape(config.num_attention_heads, -1, tensor.shape[-1]) for update in updates]
+            restored = torch.cat(values, dim=1).reshape_as(output)
+        else:
+            restored = torch.cat(updates, dim=join_dim) if len(updates) > 1 else updates[0]
+            if transpose:
+                restored = restored.transpose(-1, -2)
+        output.copy_(restored * scale)
+
+    return NSInputTransform(tensors=parts, restore=restore)
+
+
+def _replica_maxima(modules: list[JTDeepseekV3Attention | JTDeepseekV3MLAAttention],
+                    group: Any) -> list[torch.Tensor]:
     """Return each module's per-head QK maxima over every replica of its heads.
 
     Ranks in ``group`` hold the same attention heads but see different tokens, so
@@ -62,7 +139,8 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> None:
         model: JT model with MLA statistics and the DP+CP ``qk_clip_group`` of its heads.
         threshold: Positive clipping threshold from the optimizer adapter configuration.
     """
-    modules = [module for module in model.modules() if isinstance(module, JTDeepseekV3MLAAttention)]
+    modules = [module for module in model.modules()
+               if isinstance(module, (JTDeepseekV3Attention, JTDeepseekV3MLAAttention))]
     for module, maximum in zip(modules, _replica_maxima(modules, model.qk_clip_group)):
         scale = threshold / maximum.clamp_min(threshold)
         query = module.q_b_proj.weight.view(
@@ -88,12 +166,14 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
                     tp_group=module.sequence_partition_group, dp_group=model.expert_load_group)
 
 
-def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
+def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float,
+                    reference_muon: bool = False, **kwargs: Any) -> Muon:
     """Build public Muon/AdamW and attach the JT-specific post-update hooks.
 
     Args:
         model: Model whose final FSDP parameter layouts are already prepared.
         qk_clip_threshold: Positive clipping threshold for QK projections.
+        reference_muon: Match native Graph O1 logical matrices, BF16 NS arithmetic and shared scaling.
         **kwargs: Public Muon Builder options from the training recipe.
 
     Returns:
@@ -101,7 +181,17 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     """
     if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
         raise ValueError("qk_clip_threshold must be finite and positive")
+    if not isinstance(reference_muon, bool):
+        raise ValueError("reference_muon must be a boolean")
     muon_config = dict(kwargs["muon_config"])
+    if reference_muon:
+        if any(muon_config.get(name) is not None for name in ("ns_transform_fn", "reshape_fn", "zeropower_fn")):
+            raise ValueError("reference_muon cannot be combined with another Muon layout or NS callback")
+        matched_rms = muon_config.get("matched_adamw_rms", 0.2)
+        muon_config.update(
+            ns_transform_fn=partial(_reference_muon_transform, config=model.config, matched_adamw_rms=matched_rms),
+            zeropower_fn=_reference_newton_schulz, batch_ns=False,
+            matched_adamw_rms=0.0, zero_rms_scale_mode="use_lr")
     builder = Muon(model=model, muon_config=muon_config, **{
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
