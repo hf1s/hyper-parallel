@@ -36,10 +36,14 @@ if [[ ! -e "${REFERENCE_WEIGHTS}" ]]; then
     echo "Reference weights path does not exist: ${REFERENCE_WEIGHTS}" >&2
     exit 1
 fi
-if [[ ! -e "${DATA_PATH}" ]]; then
-    echo "Indexed dataset path does not exist: ${DATA_PATH}" >&2
-    exit 1
-fi
+for field in tokens labels loss_mask; do
+    for extension in bin idx; do
+        if [[ ! -s "${DATA_PATH}.${field}.${extension}" ]]; then
+            echo "Indexed dataset file does not exist or is empty: ${DATA_PATH}.${field}.${extension}" >&2
+            exit 1
+        fi
+    done
+done
 if [[ ! -s "${CONFIG_FILE}" ]]; then
     echo "Recipe does not exist: ${CONFIG_FILE}" >&2
     exit 1

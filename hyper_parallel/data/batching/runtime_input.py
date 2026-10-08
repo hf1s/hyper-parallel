@@ -46,6 +46,26 @@ class IndexedBoundaryResolver:
         """Recover leading-zero ``cu_seq_lens`` from Indexed tokens."""
         input_ids = canonical_batch["input_ids"]
         batch_size, seq_len = input_ids.shape
+        if "cu_seq_lens" in canonical_batch:
+            boundaries = canonical_batch["cu_seq_lens"]
+            if boundaries.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Explicit indexed boundaries must be integer offsets")
+            if boundaries.ndim == 2:
+                if (boundaries.shape[0] != batch_size or boundaries.shape[1] < 2
+                        or torch.any(boundaries[:, 0] != 0) or torch.any(boundaries[:, -1] != seq_len)
+                        or torch.any(boundaries[:, 1:] <= boundaries[:, :-1])):
+                    raise ValueError("Per-record boundaries must strictly increase from zero to sequence length")
+                offsets = torch.arange(batch_size, device=boundaries.device).unsqueeze(1) * seq_len
+                boundaries = torch.cat((boundaries.new_zeros(1), (boundaries[:, 1:] + offsets).reshape(-1)))
+            if boundaries.ndim != 1 or boundaries.numel() < 2:
+                raise ValueError("Explicit indexed boundaries must be global offsets or a matrix of per-record offsets")
+            if (boundaries[0] != 0 or boundaries[-1] != batch_size * seq_len
+                    or torch.any(boundaries[1:] <= boundaries[:-1])):
+                raise ValueError("Explicit indexed boundaries must strictly increase from zero to the batch token count")
+            row_ends = torch.arange(1, batch_size, device=boundaries.device) * seq_len
+            if not torch.isin(row_ends, boundaries).all():
+                raise ValueError("Explicit indexed boundaries must include every batch row end")
+            return boundaries.to(torch.int32)
         token_indices = torch.arange(seq_len, dtype=input_ids.dtype, device=input_ids.device)
 
         seq_ends = []
