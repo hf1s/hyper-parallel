@@ -38,7 +38,6 @@ _EXPORT_TO_MODULE = {
     "PipelinedMhcModule": "mhc",
     "MLAAttention": "mla_attention",
     "DeepseekV3MTP": "mtp",
-    "DeepseekV3MTPExecution": "mtp",
     "MultiTokenPredictionOutput": "mtp",
     "MultiTokenPrediction": "mtp",
     "MultiTokenPredictionLayer": "mtp",

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lazy registration of the independently constructed JT family."""
+"""Architecture and lazy provider registration for JT DeepSeek-V3."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.jt_deepseek_v3.adapter.policies.sharding import build_parameter_sharding_rules
@@ -20,10 +20,11 @@ from hyper_parallel.models.registry import register_custom_model, register_model
 
 
 def _load_expert_parallel():
-    """Return JT's expert-parallel provider lazily."""
-    from hyper_parallel.models.jt_deepseek_v3.adapter.distributed import ep_compute
+    """Return the JT expert-parallel provider lazily."""
+    from hyper_parallel.models.jt_deepseek_v3.adapter.distributed import ep_compute  # pylint: disable=C0415
 
     return ep_compute
+
 
 JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="JTDeepseekV3ForCausalLM",

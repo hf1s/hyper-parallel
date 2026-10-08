@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Complete HF-derived causal model, prediction depths and reference training semantics."""
+"""JT DeepSeek-V3 causal language model built from Transformers DeepSeek-V3.2 components."""
 
 # This model uses the Torch/HF runtime, like the existing Trainer model families.
 # pylint: disable=forbidden-backend-import
@@ -47,7 +47,7 @@ from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTE
 
 
 class JTDeepseekV3Config(DeepseekV32Config):
-    """DeepSeek-V3.2-compatible configuration with an independent JT identity."""
+    """DeepSeek-V3.2 configuration registered as the ``jt_deepseek_v3`` model type."""
 
     model_type = "jt_deepseek_v3"
 
@@ -57,7 +57,7 @@ AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=
 
 @dataclass
 class JTDeepseekV3Output(ModelOutput):
-    """Model output carrying named JT losses without HF first-field remapping."""
+    """Model output holding the named JT training losses."""
 
     # Keep logits first and optional so ModelOutput preserves the named loss
     # mapping instead of interpreting it as a field iterator.
@@ -65,20 +65,36 @@ class JTDeepseekV3Output(ModelOutput):
     loss: dict[str, torch.Tensor] | None = None
 
 
-
 class JTDeepseekV3Experts(DeepseekV32Experts):
-    """Keep HF packed expert tensors and expose Hyper's grouped-compute hook."""
+    """HF packed experts with the grouped-GEMM entry point of expert parallelism."""
 
     def forward_expert_major(self, inputs: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        """Run grouped SwiGLU without an adapter-imposed dtype conversion."""
+        """Run the SwiGLU experts on tokens grouped by local expert.
+
+        Args:
+            inputs: Tokens sorted by local expert, ``[tokens, hidden]``.
+            counts: Number of tokens of each local expert.
+
+        Returns:
+            Expert outputs in the order of ``inputs``.
+        """
         return npu_grouped_swiglu(inputs, self.gate_up_proj, self.down_proj, counts)
 
 
 class JTDeepseekV3RotaryEmbedding(nn.Module):
-    """Apply rotary products without an explicit FP32 conversion."""
+    """Rotary position embedding for the interleaved (``rope_interleave``) channel layout."""
 
     def forward(self, values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Rotate values using the tensors' native arithmetic."""
+        """De-interleave ``values`` and rotate them by the position angles.
+
+        Args:
+            values: Rotary channels in interleaved order, ``[batch, heads, sequence, rope_dim]``.
+            cos: Cosines of the position angles, ``[batch, sequence, rope_dim]``.
+            sin: Sines of the position angles, ``[batch, sequence, rope_dim]``.
+
+        Returns:
+            The rotated channels in half-split order.
+        """
         ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1)
         first, second = ordered.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
@@ -88,19 +104,24 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
                               value: torch.Tensor, attention_mask: Any, dropout: float = 0.0,
                               scaling: float | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
-    """Retain Hyper's NPU attention preparation and collect per-head QK maxima.
+    """Run NPU fused attention and record per-head maxima of the attention logits.
 
-    Reuse the upstream packed-length, option and mask preparation helpers.
-    The observed kernel outputs also supply the QK clipping statistics.
+    Inputs are prepared like the framework's ``npu_fusion_attention_forward``; the
+    kernel's softmax maxima are accumulated into ``module.max_logits_val`` for QK
+    clipping.
 
     Args:
-        module: Attention module owning kernel settings.
-        query: Projected query states.
-        key: Projected key states.
-        value: Projected value states.
+        module: Attention module owning the kernel options and ``max_logits_val``.
+        query: Query states, ``[batch, heads, sequence, head_dim]``.
+        key: Key states, ``[batch, heads, sequence, head_dim]``.
+        value: Value states, ``[batch, heads, sequence, v_head_dim]``.
         attention_mask: Optional attention mask.
         dropout: Attention dropout probability.
-        scaling: Attention score scaling factor.
+        scaling: Attention score scale; ``head_dim ** -0.5`` when ``None``.
+        **kwargs: Packed sequence lengths and attention window options.
+
+    Returns:
+        The attention output, ``[batch, sequence, heads, v_head_dim]``, and ``None``.
     """
     batch_size, _, query_length, head_dim = query.shape
     query_lengths, key_lengths = resolve_packed_sequence_lengths(
@@ -128,15 +149,19 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
 
 @module_replacement
 class JTDeepseekV3MLAAttention(MLAAttention):
-    """Reuse Hyper MLA parameters and projections with reference SP and RoPE boundaries."""
+    """MLA attention on the framework module with JT's rotary embedding and QK-clip statistics.
+
+    Replaces :class:`JTDeepseekV3Attention`; ``q_a_proj`` and ``kv_a_proj_with_mqa``
+    are fused into ``linear_qkv``.
+    """
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "", context: Any = None) -> None:
-        """Initialize the configured components and retained parameter state.
+        """Build the replacement from the attention module it replaces.
 
         Args:
-            module: Module.
-            module_fqn: Module fqn.
-            context: Context.
+            module: The :class:`JTDeepseekV3Attention` being replaced.
+            module_fqn: Fully qualified name of ``module``.
+            context: Replacement context of the build pipeline.
         """
         super().__init__(module=module, module_fqn=module_fqn, context=context)
         if not self.linear_qkv.weight.is_meta:
@@ -149,13 +174,25 @@ class JTDeepseekV3MLAAttention(MLAAttention):
 
     def _project_attention_inputs(self, hidden_states: torch.Tensor, position_embeddings: Any,
                                   past_key_values: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project shared MLA children with the JT SP and rotary boundaries.
+        """Project hidden states to queries, keys and values.
 
-        Separate down projections retain the two input-gradient GEMMs. The
-        current upstream MLA has no split latent-projection extension point.
+        Unlike the parent, the rotary key passes through ``key_rope_gather``, where
+        the recipe gathers the sequence-parallel shards, and both rotary parts use
+        :class:`JTDeepseekV3RotaryEmbedding`.
+
+        Args:
+            hidden_states: Input hidden states, ``[batch, sequence, hidden]``.
+            position_embeddings: Rotary ``(cos, sin)`` tables.
+            past_key_values: Must be ``None``; cached decoding is unsupported.
+
+        Returns:
+            Query, key and value states, each ``[batch, heads, sequence, head_dim]``.
+
+        Raises:
+            ValueError: If ``position_embeddings`` is missing or a cache is given.
         """
         if past_key_values is not None or position_embeddings is None:
-            raise ValueError("Reference MLA requires explicit positions and no KV cache")
+            raise ValueError("JT MLA attention requires position embeddings and no KV cache")
         latent_states = self.linear_qkv(hidden_states)
         query_local, kv_local = latent_states.split(
             (self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim), dim=-1
@@ -181,14 +218,18 @@ class JTDeepseekV3MLAAttention(MLAAttention):
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
                 attention_mask: Any = None, past_key_values: Any = None,
                 actual_seq_len: Any = None, **kwargs: Any) -> tuple[torch.Tensor, Any]:
-        """Use global projected sequence length with Hyper's MLA children and TP output.
+        """Run MLA attention with the NPU fused attention kernel.
 
         Args:
-            hidden_states: Input hidden states.
-            position_embeddings: Explicit rotary frequencies.
+            hidden_states: Input hidden states, ``[batch, sequence, hidden]``.
+            position_embeddings: Rotary ``(cos, sin)`` tables.
             attention_mask: Optional attention mask.
-            past_key_values: Unsupported cached decoding state.
+            past_key_values: Must be ``None``; cached decoding is unsupported.
             actual_seq_len: Packed sequence lengths.
+            **kwargs: Additional attention kernel options.
+
+        Returns:
+            The attention output and ``None`` attention weights.
         """
         query, key, value = self._project_attention_inputs(hidden_states, position_embeddings, past_key_values)
         output, weights = self.attention_interface(
@@ -200,10 +241,15 @@ class JTDeepseekV3MLAAttention(MLAAttention):
 
 
 class JTDeepseekV3Attention(DeepseekV32Attention):
-    """Full causal MLA semantics with HF projection names and no DSA indexer."""
+    """Causal MLA attention with HF DeepSeek-V3 parameter names and no DSA indexer."""
 
     def __init__(self, config: Any, layer_idx: int) -> None:
-        """Construct only the projections used by the configured causal model."""
+        """Build the MLA projections and latent norms.
+
+        Args:
+            config: JT model configuration.
+            layer_idx: Index of the decoder layer.
+        """
         nn.Module.__init__(self)
         self.config, self.layer_idx = config, layer_idx
         self.num_heads = config.num_attention_heads
@@ -226,16 +272,23 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
                 past_key_values: Any = None, attention_mask: Any = None, **kwargs: Any) -> tuple:
-        """Run the complete causal attention before optional high-performance replacement.
+        """Run causal MLA attention: NPU fused attention on NPU, SDPA elsewhere.
 
         Args:
-            hidden_states: Input hidden states.
-            position_embeddings: Explicit rotary frequencies.
-            past_key_values: Unsupported cached decoding state.
-            attention_mask: Optional attention mask.
+            hidden_states: Input hidden states, ``[batch, sequence, hidden]``.
+            position_embeddings: Rotary ``(cos, sin)`` tables.
+            past_key_values: Must be ``None``; cached decoding is unsupported.
+            attention_mask: Optional attention mask; attention is causal when ``None``.
+            **kwargs: Packed sequence lengths for NPU fused attention.
+
+        Returns:
+            The attention output and ``None`` attention weights.
+
+        Raises:
+            ValueError: If ``position_embeddings`` is missing or a cache is given.
         """
         if past_key_values is not None or position_embeddings is None:
-            raise ValueError("Reference attention requires explicit positions and no KV cache")
+            raise ValueError("JT attention requires position embeddings and no KV cache")
         batch, sequence = hidden_states.shape[:2]
         query = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         query = query.reshape(batch, sequence, self.num_heads, self.qk_head_dim).transpose(1, 2)
@@ -259,27 +312,48 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
 
 
 class JTDeepseekV3Gate(DeepseekV32TopkRouter):
-    """Expose HF gate logits to the public router and the model's auxiliary loss."""
+    """HF router projection that keeps its logits for the sequence auxiliary loss."""
 
     def __init__(self, config: Any) -> None:
-        """Keep the HF parameters and bias without duplicating its top-k computation."""
+        """Create the HF router weight and expert bias.
+
+        Args:
+            config: JT model configuration.
+        """
         super().__init__(config)
         self.router_logits = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project router inputs using their native dtype."""
+        """Return the router logits, ``[tokens, num_experts]``, and keep them.
+
+        Args:
+            hidden_states: Router inputs, ``[..., hidden]``.
+        """
         self.router_logits = F.linear(hidden_states.reshape(-1, self.hidden_dim), self.weight)
         return self.router_logits
 
+    def pop_router_logits(self) -> torch.Tensor:
+        """Return the logits of the last forward and release them.
+
+        Callers release the logits through this method: a checkpoint wrapper around
+        the router forwards attribute reads but keeps attribute writes, so assigning
+        ``router_logits`` through the wrapper would hide the logits of later steps.
+        """
+        logits, self.router_logits = self.router_logits, None
+        return logits
+
 
 class JTDeepseekV3MoE(DeepseekV32MoE):
-    """Own routing, balancing and combine semantics independently of EP binding."""
+    """Sigmoid-routed MoE with shared experts, the sequence auxiliary loss and expert-load counts."""
 
-    def __init__(self, config: Any, *, is_mtp: bool = False) -> None:
-        """Construct all expert branches and the standalone routing contract."""
+    def __init__(self, config: Any) -> None:
+        """Build the routed experts, router and shared experts.
+
+        Args:
+            config: JT model configuration.
+        """
         nn.Module.__init__(self)
         self.config = config
-        self.reference_is_mtp = is_mtp
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.experts = JTDeepseekV3Experts(config)
         self.gate = JTDeepseekV3Gate(config)
@@ -293,12 +367,19 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.tokens_per_expert = None
 
     def route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select experts, compute the auxiliary sequence-balancing loss and count routed tokens."""
+        """Select experts for the real tokens, record the auxiliary loss and count routed tokens.
+
+        Args:
+            hidden: Hidden states led by ``padding`` pad tokens, ``[1, padding + tokens, hidden]``.
+
+        Returns:
+            Expert indices and routing weights, ``[padding + tokens, top_k]``; the pad
+            tokens cover every expert with zero weight.
+        """
         padding, config = self.padding, self.config
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
-        scores = self.gate.router_logits.sigmoid()
-        self.gate.router_logits = None
+        scores = self.gate.pop_router_logits().sigmoid()
         self.auxiliary_loss = calculate_seq_aux_loss(
             scores, indices, coeff=config.moe_aux_loss_coeff,
             sequence_partition_group=self.sequence_partition_group)
@@ -315,13 +396,15 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
     def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
         """Move the routing bias toward balanced load once ``tokens_per_expert`` holds global counts.
 
-        ``sync_and_update_expert_bias`` sums the counts over the batch before calling this. Unlike the
-        framework MoE, the step is not re-centered, so the bias matches the reference.
+        :func:`~hyper_parallel.core.utils.moe_utils.sync_and_update_expert_bias` sums the
+        counts over the batch before calling this. Unlike
+        :meth:`hyper_parallel.components.modules.moe.MoE.update_expert_bias`, the step is
+        not re-centered, matching MindFormers.
 
         Args:
             lr: Bias update rate.
-            num_recomputations: Forward executions per optimizer step; a uniform recount leaves the
-                sign update unchanged.
+            num_recomputations: Forward executions per optimizer step; counting every
+                token the same number of times leaves the sign update unchanged.
         """
         del num_recomputations
         counts = self.tokens_per_expert
@@ -329,7 +412,16 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.tokens_per_expert = None
 
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Execute routed experts; routing weights are cast to the activation dtype as in EP aggregation."""
+        """Run the routed experts on this rank without expert parallelism.
+
+        Routing weights are cast to the activation dtype, as in the EP combine.
+
+        Args:
+            hidden: Pad-prefixed hidden states, ``[1, padding + tokens, hidden]``.
+
+        Returns:
+            The weighted routed-expert output, shaped like ``hidden``.
+        """
         indices, probabilities = self.route(hidden)
         flat = hidden.reshape(-1, hidden.shape[-1])
         outputs = flat.new_zeros(indices.shape[0], indices.shape[1], flat.shape[-1])
@@ -344,18 +436,28 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
-        """Expose the routed branch before model-owned shared-expert composition.
+        """Return the routed branch; :meth:`forward` adds the shared experts.
 
         Args:
             owner: MoE module owning the execution.
             hidden: Hidden states.
             routed: Routed expert outputs.
+
+        Returns:
+            ``routed`` unchanged.
         """
         del owner, hidden
         return routed
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run routed and shared experts using native tensor dtypes."""
+        """Run the routed experts on pad-prefixed tokens and add the shared experts.
+
+        Args:
+            hidden_states: Hidden states, ``[1, tokens, hidden]``.
+
+        Returns:
+            The MoE output, shaped like ``hidden_states``.
+        """
         hidden = hidden_states
         if self.padding:
             hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
@@ -364,14 +466,19 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
 
 
 class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
-    """Preserve HF submodules while matching FP32 residual accumulation boundaries."""
+    """Pre-norm decoder layer with MLA attention and a dense or MoE MLP."""
 
-    def __init__(self, config: Any, layer_idx: int, *, is_mtp: bool = False) -> None:
-        """Construct the complete specialized decoder without a later semantic patch."""
+    def __init__(self, config: Any, layer_idx: int) -> None:
+        """Build the attention, MLP and norms of one layer.
+
+        Args:
+            config: JT model configuration.
+            layer_idx: Layer index; ``config.mlp_layer_types[layer_idx]`` selects the MLP.
+        """
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.self_attn = JTDeepseekV3Attention(config, layer_idx)
-        self.mlp = (JTDeepseekV3MoE(config, is_mtp=is_mtp)
+        self.mlp = (JTDeepseekV3MoE(config)
                     if config.mlp_layer_types[layer_idx] == "sparse" else DeepseekV32MLP(config))
         self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -379,9 +486,25 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
     def forward(self, hidden_states: torch.Tensor, attention_mask: Any = None,
                 position_ids: Any = None, past_key_values: Any = None, use_cache: bool = False,
                 position_embeddings: Any = None, **kwargs: Any) -> torch.Tensor:
-        """Run decoder children without explicit dtype conversions."""
+        """Apply the attention and MLP sublayers, each with a residual connection.
+
+        Args:
+            hidden_states: Input hidden states, ``[batch, sequence, hidden]``.
+            attention_mask: Optional attention mask.
+            position_ids: Sequence positions.
+            past_key_values: Must be ``None``; cached decoding is unsupported.
+            use_cache: Must be ``False``.
+            position_embeddings: Rotary ``(cos, sin)`` tables.
+            **kwargs: Attention kernel options.
+
+        Returns:
+            The layer output, shaped like ``hidden_states``.
+
+        Raises:
+            ValueError: If cached decoding is requested.
+        """
         if past_key_values is not None or use_cache:
-            raise ValueError("DeepSeek V3.2 JT does not support cached decoding")
+            raise ValueError("JT does not support cached decoding")
         residual = hidden_states
         branch, _ = self.self_attn(
             self.input_layernorm(residual),
@@ -397,10 +520,14 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
 
 
 class JTDeepseekV3Model(DeepseekV32Model):
-    """Construct specialized decoders directly while retaining the HF model contract."""
+    """DeepSeek-V3.2 base model built from JT decoder layers."""
 
     def __init__(self, config: Any) -> None:
-        """Build HF embeddings and positional state around complete specialized layers."""
+        """Build the token embedding, decoder layers, final norm and HF rotary embedding.
+
+        Args:
+            config: JT model configuration.
+        """
         DeepseekV32PreTrainedModel.__init__(self, config)
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -412,15 +539,19 @@ class JTDeepseekV3Model(DeepseekV32Model):
 
 
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
-    """Reuse HF construction and children; override the reference training orchestration."""
+    """JT DeepSeek-V3 causal LM whose forward returns the LM, MTP and router auxiliary losses."""
 
     config_class = JTDeepseekV3Config
 
     def __init__(self, config: Any) -> None:
-        """Construct the HF skeleton with complete, unconditional JT adapters.
+        """Build the base model, LM head and multi-token-prediction depths.
 
         Args:
-            config: HF configuration carrying the explicit JT contract.
+            config: JT model configuration.
+
+        Raises:
+            ValueError: If the configuration needs an unsupported activation, routing
+                group or RoPE type.
         """
         DeepseekV32PreTrainedModel.__init__(self, config)
         if config.hidden_act != "silu":
@@ -437,11 +568,10 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         mtp_config.mlp_layer_types = ["sparse"] * depth
         self.mtp = DeepseekV3MTP(
             hidden_size=config.hidden_size, num_layers=depth,
-            decoder_factory=lambda index: JTDeepseekV3Decoder(mtp_config, index, is_mtp=True),
+            decoder_factory=lambda index: JTDeepseekV3Decoder(mtp_config, index),
             norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
             output_norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
         )
-        self.loss_group = None
         # Ranks holding the same attention heads (DP+CP); the JT builder sets it for QK clipping.
         self.qk_clip_group = None
         # Ranks holding different batch data (DP+CP); the JT builder sets it to sum expert token counts.
@@ -451,15 +581,23 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None, *,
                 labels: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
                 attention_mask: torch.Tensor | None = None, use_cache: bool = False) -> JTDeepseekV3Output:
-        """Use the same JT semantics for evaluation and Trainer backward.
+        """Compute the JT training losses of one batch.
 
         Args:
-            input_ids: Unmodified token IDs.
-            shift_labels: Already-shifted targets from the public text batch; masked targets are negative.
-            labels: Public batch bookkeeping field; shift_labels owns supervision.
-            position_ids: Public sequence positions used to construct RoPE.
-            attention_mask: Must be None; this model builds its full causal attention internally.
-            use_cache: Whether cached decoding is requested.
+            input_ids: Token IDs, ``[1, sequence]``.
+            shift_labels: Targets already shifted by one token; negative targets are ignored.
+            labels: Unused; ``shift_labels`` carries the supervision.
+            position_ids: Sequence positions for RoPE.
+            attention_mask: Must be ``None``; the model always applies full causal attention.
+            use_cache: Must be ``False``.
+
+        Returns:
+            Output whose ``loss`` maps ``foundation_loss/lm``, ``foundation_loss/mtp`` and
+            ``foundation_loss/aux`` to 0-d losses.
+
+        Raises:
+            ValueError: If ``attention_mask`` is given, ``shift_labels`` is missing or cached
+                decoding is requested.
         """
         del labels
         if attention_mask is not None:
@@ -485,16 +623,21 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         return loss.reshape(())
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
-                         loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None
-                         ) -> dict[str, torch.Tensor]:
-
-        """Compute model-specific LM, MTP and router losses on pre-shifted labels.
+                          loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None
+                          ) -> dict[str, torch.Tensor]:
+        """Compute the LM, MTP and router auxiliary losses on pre-shifted labels.
 
         Args:
-            input_ids: Unmodified token IDs.
-            labels: Already-shifted target token IDs.
-            loss_mask: Mask for the pre-shifted targets.
-            position_ids: Optional public batch positions for RoPE.
+            input_ids: Token IDs, ``[1, sequence]``.
+            labels: Targets already shifted by one token.
+            loss_mask: Mask of the supervised targets.
+            position_ids: Optional sequence positions for RoPE.
+
+        Returns:
+            ``lm_loss``, ``mtp_loss`` and ``aux_loss`` as 0-d tensors.
+
+        Raises:
+            ValueError: If the inputs are not one sequence with matching shapes.
         """
         cfg = self.config
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -502,7 +645,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         sequence_length = input_ids.shape[1]
         if labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
             raise ValueError("Tokens, pre-shifted labels and loss mask must have identical shapes")
-        # The reference's NumPy FP32 inverse frequencies; torch.pow rounds some entries differently.
+        # NumPy FP32 inverse frequencies match MindFormers bitwise; torch.pow rounds some entries differently.
         dim = cfg.qk_rope_head_dim
         inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         inverse = torch.from_numpy(inverse.astype(np.float32)).to(input_ids.device)

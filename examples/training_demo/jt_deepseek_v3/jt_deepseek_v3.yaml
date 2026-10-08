@@ -1,5 +1,5 @@
-# Run the configured JT model through the standard Trainer training loop.
-# Model fields are native HF/JT options; reference weights are converted offline.
+# JT DeepSeek V3: 8-rank TP8 / EP8 / DP1 training with the standard Trainer.
+# Model fields are HF/JT configuration options; reference_weights holds the offline-converted model.npz.
 model:
   _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_model
   config:
@@ -37,7 +37,7 @@ model:
     use_cache: false
     attention_bias: false
     mlp_bias: false
-    # Model-owned MTP and routing options, not a foreign configuration document.
+    # JT multi-token prediction and MoE routing options.
     num_nextn_predict_layers: 1
     mtp_loss_factor: 0.3
     use_pad_tokens: true
@@ -49,7 +49,7 @@ loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
 model_init_dtype: float32
 plan_overrides:
-  # The base model is executable; replacements select accelerated JT operators.
+  # Replace the HF-named attention with the NPU-accelerated JT MLA attention.
   - match:
       - "model.layers.*.self_attn"
       - "mtp.layers.*.transformer_layer.self_attn"
@@ -121,7 +121,7 @@ training:
   micro_batch_size: 1
   backend: hccl
   seed: 42
-  # The configured model adapter retains the NPU execution policy.
+  # build_jt_model enables torch deterministic algorithms itself.
   enable_full_determinism: false
 accelerator:
   tp_size: 8

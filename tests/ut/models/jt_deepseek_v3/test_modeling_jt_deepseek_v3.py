@@ -29,7 +29,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3MoE,
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
 )
-from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiTokenPredictionLayer
+from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
@@ -74,7 +74,6 @@ class TestCompleteModel(unittest.TestCase):
         self.assertIsInstance(model.model.layers[1].mlp, JTDeepseekV3MoE)
         self.assertEqual(model.model.layers[1].mlp.ep_compute, model.model.layers[1].mlp.local_routed_forward)
         self.assertIsInstance(model.mtp.layers[0], MultiTokenPredictionLayer)
-        self.assertIs(type(model.mtp.execution), DeepseekV3MTPExecution)
         tokens = torch.arange(8).unsqueeze(0)
         output = model(tokens, (tokens + 1) % 32)
         self.assertEqual(
@@ -163,13 +162,12 @@ class TestCompleteModel(unittest.TestCase):
         self.assertIs(model.model.layers[0].self_attn.q_a_layernorm,
                       previous["model.layers.0.self_attn.q_a_layernorm"])
 
-
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_replacement_loads_converted_reference_state(self):
         """Feature: Offline checkpoint loading.
 
-        Description: Load arrays that already use the model's final parameter layout.
-        Expectation: Every materialized parameter is loaded exactly.
+        Description: Load arrays that already use the model's final parameter layout and differ from its state.
+        Expectation: Every materialized parameter and buffer holds the loaded values exactly.
         """
         config = small_config()
         recipe_path = Path(__file__).resolve().parents[4] / (
@@ -180,9 +178,12 @@ class TestCompleteModel(unittest.TestCase):
             plan = compile_module_replacements(candidate, rules)
             apply_module_replacements(candidate, plan, weights_mapping=[])
         candidate.to_empty(device="cpu")
-        arrays = {name: value.detach().numpy().copy() for name, value in candidate.state_dict().items()}
-        loaded = _load_reference_state(candidate, arrays)
-        self.assertEqual(set(loaded), set(arrays))
+        generator = torch.Generator().manual_seed(0)
+        arrays = {name: torch.randn(value.shape, generator=generator).to(value.dtype).numpy()
+                  for name, value in candidate.state_dict().items()}
+        _load_reference_state(candidate, arrays)
+        for name, value in candidate.state_dict().items():
+            self.assertEqual(value.detach().numpy().tobytes(), arrays[name].tobytes(), name)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_family_registration_does_not_replace_standard_deepseek(self):
@@ -240,7 +241,6 @@ class TestCompleteModel(unittest.TestCase):
         self.assertEqual(restored.moe_aux_loss_coeff, 0.0001)
         self.assertEqual(restored.rope_parameters["rope_theta"], 5000000)
         self.assertIs(get_model_adapter(restored.architectures[0]), get_model_adapter("jt_deepseek_v3"))
-
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_shared_batch_inputs_define_lm_and_mtp_objectives(self):

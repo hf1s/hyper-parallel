@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""JT model hooks around the public Muon optimizer."""
+"""JT DeepSeek-V3 optimizer: public Muon/AdamW with the QK-clip and routing-bias post-step hook."""
 
 # This adapter uses the Torch runtime, like the existing model and Trainer modules.
 # pylint: disable=forbidden-backend-import
@@ -76,7 +76,7 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> None:
 
 @torch.no_grad()
 def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
-    """Apply model-owned updates after all public optimizer leaves complete."""
+    """Clip the QK projections and update the routing biases after an optimizer step."""
     del optimizer, args, kwargs
     clip_qk(model, threshold)
     config = model.config
@@ -89,15 +89,18 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
 
 
 def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
-    """Build public Muon/AdamW and attach the JT-specific post-update hooks.
+    """Build the Muon/AdamW optimizer and register the JT post-step hook.
 
     Args:
         model: Model whose final FSDP parameter layouts are already prepared.
         qk_clip_threshold: Positive clipping threshold for QK projections.
-        **kwargs: Public Muon Builder options from the training recipe.
+        **kwargs: Muon builder options from the training recipe.
 
     Returns:
-        The unmodified public Muon Builder.
+        The Muon builder.
+
+    Raises:
+        ValueError: If ``qk_clip_threshold`` is not finite and positive.
     """
     if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
         raise ValueError("qk_clip_threshold must be finite and positive")
