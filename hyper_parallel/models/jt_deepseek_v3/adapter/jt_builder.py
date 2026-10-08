@@ -39,8 +39,8 @@ from hyper_parallel.models._transformers.model_builder import (
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
-from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
+    JTDeepseekV3Config,
     JTDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
@@ -53,7 +53,6 @@ def build_jt_ep(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: 
     if ep_mesh is None:
         raise ValueError("JT requires an EP mesh")
     module.ep_group = ep_mesh.get_group("ep")
-    module.ep_world = ep_mesh["ep"].size()
     executor = build_ep_compute(
         module,
         ep_mesh,
@@ -90,7 +89,12 @@ def _has_explicit_ep_override(overrides: dict[str, Any], fqn: str) -> bool:
 
 
 def _with_model_ep_overrides(distributed_setup: Any, config: JTDeepseekV3Config) -> Any:
-    """Add only missing configured MoE EP factories as explicit model FQNs."""
+    """Add only missing configured MoE EP factories as explicit model FQNs.
+
+    Without expert parallelism the MoE layers keep the model's local routed forward.
+    """
+    if distributed_setup.mesh_context.ep_size <= 1:
+        return distributed_setup
     overrides = dict(getattr(distributed_setup, "plan_overrides", None) or {})
     for fqn in _configured_moe_fqns(config):
         if _has_explicit_ep_override(overrides, fqn):
@@ -143,9 +147,10 @@ def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray])
 def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
                     distributed_setup: Any, **infrastructure_options: Any) -> PreTrainedModel:
     """Load the native JT model and an offline-converted model.npz artifact."""
-
+    if distributed_setup.mesh_context.cp_size > 1:
+        raise ValueError("JT does not support context parallelism: MTP token shifting and its full "
+                         "causal attention require each rank to hold the complete sequence")
     torch_npu.npu.set_compile_mode(jit_compile=False)
-    torch.use_deterministic_algorithms(True)
     config = JTDeepseekV3Config(**config)
     setup = _with_model_ep_overrides(distributed_setup, config)
     mesh = setup.mesh_context

@@ -24,11 +24,10 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch_npu
 from torch import nn
 from torch.nn import functional as F
-from transformers import DeepseekV32ForCausalLM
+from transformers import AutoConfig, DeepseekV32Config, DeepseekV32ForCausalLM
 from transformers.utils import ModelOutput
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32Attention, DeepseekV32DecoderLayer, DeepseekV32Experts, DeepseekV32MLP,
@@ -36,6 +35,7 @@ from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32RotaryEmbedding, DeepseekV32TopkRouter,
 )
 
+from hyper_parallel.components.losses import calculate_mtp_loss, calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.components.functional.npu_fusion_attention import (
@@ -44,8 +44,15 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
-from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
 
+
+class JTDeepseekV3Config(DeepseekV32Config):
+    """DeepSeek-V3.2-compatible configuration with an independent JT identity."""
+
+    model_type = "jt_deepseek_v3"
+
+
+AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 
 
 @dataclass
@@ -251,35 +258,6 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         return self.o_proj(output.reshape(batch, sequence, -1)), None
 
 
-
-
-class _ModelParallelMean(torch.autograd.Function):
-    """Replicate one global mean while differentiating each local contribution once."""
-
-    @staticmethod
-    def forward(ctx: Any, value: torch.Tensor, group: Any) -> torch.Tensor:
-        """Average equally weighted contributions across the model-parallel group."""
-        ctx.world_size = dist.get_world_size(group)
-        result = value.clone()
-        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
-        return result / ctx.world_size
-
-    @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """Scale the local derivative without summing identical output replicas."""
-        return gradient / ctx.world_size, None
-
-
-def _model_parallel_mean(value: torch.Tensor, group: Any = None) -> torch.Tensor:
-    """Reduce a partitioned objective; absent an explicit group, keep it local.
-
-    Contributions must be equally weighted, with the same upstream derivative
-    on all ranks. This does not implement DDP averaging or independently
-    consumed all-reduce outputs; uneven token partitions need explicit weights.
-    """
-    return value if group is None else _ModelParallelMean.apply(value, group)
-
-
 class JTDeepseekV3Gate(DeepseekV32TopkRouter):
     """Expose HF gate logits to the public router and the model's auxiliary loss."""
 
@@ -307,28 +285,20 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.gate = JTDeepseekV3Gate(config)
         self.shared_experts = DeepseekV32MLP(
             config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
-        self.ep_group, self.ep_world = None, 1
+        self.ep_group = None
         self.ep_compute = self.local_routed_forward
         self.auxiliary_loss = None
         self.expert_load = None
 
     def route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Select experts and compute the auxiliary sequence-balancing loss."""
-        group, world, padding = self.ep_group, self.ep_world, self.padding
-        config = self.config
+        padding, config = self.padding, self.config
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
         scores = self.gate.router_logits.sigmoid()
         self.gate.router_logits = None
-        frequency = torch.bincount(indices.flatten(), minlength=config.n_routed_experts)
-        frequency = frequency / indices.numel()
-        if group is not None:
-            dist.all_reduce(frequency, group=group)
-        frequency = frequency / world
-        self.expert_load = frequency.detach()
-        normalized = scores / (scores.sum(-1, keepdim=True) + 1e-20)
-        self.auxiliary_loss = (normalized.mean(0) * frequency).sum() * scores.shape[-1] * config.moe_aux_loss_coeff
-        self.auxiliary_loss = _model_parallel_mean(self.auxiliary_loss, group)
+        self.auxiliary_loss, self.expert_load = calculate_seq_aux_loss(
+            scores, indices, coeff=config.moe_aux_loss_coeff, sequence_partition_group=self.ep_group)
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
@@ -508,6 +478,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         sequence_length = input_ids.shape[1]
         if labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
             raise ValueError("Tokens, pre-shifted labels and loss mask must have identical shapes")
+        # The reference's NumPy FP32 inverse frequencies; torch.pow rounds some entries differently.
         dim = cfg.qk_rope_head_dim
         inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         inverse = torch.from_numpy(inverse.astype(np.float32)).to(input_ids.device)
@@ -527,12 +498,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             if hasattr(layer.mlp, "auxiliary_loss"):
                 auxiliary = auxiliary + layer.mlp.auxiliary_loss
         lm_loss = self._token_loss(self.lm_head(self.model.norm(hidden)), labels, loss_mask)
-        mtp_output = self.mtp(
-            hidden, input_ids, embedding=self.model.embed_tokens, head=self.lm_head,
-            labels=labels, loss_mask=loss_mask, loss_factor=cfg.mtp_loss_factor,
-            decoder_kwargs=attention_kwargs, loss_fn=self._token_loss,
-            auxiliary_loss=auxiliary, auxiliary_fn=lambda decoder: decoder.mlp.auxiliary_loss,
-        )
-        mtp_loss, auxiliary = mtp_output.loss, mtp_output.auxiliary_loss
-        return {"loss": (lm_loss + auxiliary) + mtp_loss, "lm_loss": lm_loss,
-                "mtp_loss": mtp_loss, "aux_loss": auxiliary}
+        mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens, head=self.lm_head,
+                              decoder_kwargs=attention_kwargs)
+        for layer in self.mtp.layers:
+            auxiliary = auxiliary + layer.transformer_layer.mlp.auxiliary_loss
+        mtp_loss = calculate_mtp_loss(mtp_output.logits, labels.masked_fill(loss_mask == 0, -100),
+                                      self.loss_function, vocab_size=cfg.vocab_size,
+                                      loss_factor=cfg.mtp_loss_factor)
+        return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}

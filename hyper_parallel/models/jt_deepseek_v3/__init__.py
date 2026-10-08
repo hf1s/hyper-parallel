@@ -13,7 +13,3 @@
 # limitations under the License.
 # ============================================================================
 """JT DeepSeek V3 model family."""
-
-from hyper_parallel.models.jt_deepseek_v3.configuration_jt_deepseek_v3 import JTDeepseekV3Config
-
-__all__ = ["JTDeepseekV3Config"]

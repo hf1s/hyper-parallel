@@ -14,41 +14,60 @@
 # ============================================================================
 """Multi-Token-Prediction auxiliary loss objective."""
 
+from collections.abc import Callable, Sequence
+
+# AutoModels loss components implement the Transformers/PyTorch Trainer API.
+# pylint: disable-next=forbidden-backend-import
 import torch
-from torch import nn
+# pylint: disable-next=forbidden-backend-import
+import torch.nn.functional as F
+
+from hyper_parallel.data.constants import IGNORE_INDEX
 
 
-def calculate_mtp_loss(  # pylint: disable=unused-argument
-    mtp_per_depth_logits: list[torch.Tensor],
-    mtp_per_depth_h: list[torch.Tensor],
-    labels: torch.Tensor,
-    loss_fn: nn.Module,
+def calculate_mtp_loss(
+    mtp_per_depth_logits: Sequence[torch.Tensor],
+    shift_labels: torch.Tensor,
+    loss_fn: Callable[..., torch.Tensor],
+    *,
+    vocab_size: int,
+    loss_factor: float = 1.0,
+    ignore_index: int = IGNORE_INDEX,
 ) -> torch.Tensor:
-    """Multi-Token-Prediction auxiliary loss.
+    """DeepSeek-V3 Multi-Token-Prediction loss ``loss_factor / D * sum_k L_k``.
 
-    Computes CE per depth and sums them.
+    Depth ``k`` (1-based) predicts the token ``k`` positions after the main
+    next-token target, so its targets are ``shift_labels`` shifted left by
+    ``k`` and padded with ``ignore_index`` without wrapping.
 
     Args:
-        mtp_per_depth_logits: Per-depth logits from the MTP heads.
-        mtp_per_depth_h: Per-depth hidden states. Reserved for future MTP
-            variants that condition the loss on hidden states; currently
-            unused.
-        labels: Target token indices.
-        loss_fn: Loss module applied per depth.
+        mtp_per_depth_logits: Logits of depths ``1..D``, each aligned position by
+            position with ``shift_labels``. Vocabulary-sharded logits are accepted
+            when ``loss_fn`` supports them.
+        shift_labels: Main LM targets already shifted by one token, as produced
+            by the shared text batch; ignored targets hold ``ignore_index``.
+        loss_fn: Causal-LM loss with the Transformers ``loss_function``
+            signature, such as a model's ``loss_function`` (``ForCausalLMLoss``,
+            or ``causal_lm_loss_parallel`` under loss parallelism).
+        vocab_size: Global vocabulary size.
+        loss_factor: Total MTP weight, divided equally across depths.
+        ignore_index: Target value excluded from every depth.
 
     Returns:
-        Summed MTP loss over all depths.
+        The weighted 0-d MTP loss; zero when no depth is given.
+
+    Raises:
+        ValueError: If a depth's logits are not aligned with ``shift_labels``.
     """
-    total_mtp_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
-    for logits in mtp_per_depth_logits:
-        logits_shifted = logits[..., :-1, :].contiguous()
-        labels_shifted = labels[..., 1:].contiguous()
-        depth_loss = loss_fn(
-            logits_shifted.view(-1, logits_shifted.size(-1)),
-            labels_shifted.view(-1),
-        )
-        total_mtp_loss = total_mtp_loss + depth_loss
-    return total_mtp_loss
+    total = torch.zeros((), device=shift_labels.device, dtype=torch.float32)
+    depths = len(mtp_per_depth_logits)
+    for depth, logits in enumerate(mtp_per_depth_logits, start=1):
+        if logits.shape[:-1] != shift_labels.shape:
+            raise ValueError("MTP logits must align with shift_labels position by position")
+        targets = F.pad(shift_labels[..., depth:], (0, depth), value=ignore_index)
+        depth_loss = loss_fn(logits=logits, labels=None, vocab_size=vocab_size, shift_labels=targets)
+        total = total + depth_loss.reshape(()) * (loss_factor / depths)
+    return total
 
 
 __all__ = ["calculate_mtp_loss"]
