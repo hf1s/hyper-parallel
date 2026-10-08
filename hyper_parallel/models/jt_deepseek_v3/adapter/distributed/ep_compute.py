@@ -33,7 +33,6 @@ def jt_deepseek_v3_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mes
     del mesh, tp_mesh, cp_mesh
     if ep_mesh is None:
         raise ValueError("JT requires an EP mesh")
-    module.ep_group = ep_mesh.get_group("ep")
     executor = build_ep_compute(
         module,
         ep_mesh,

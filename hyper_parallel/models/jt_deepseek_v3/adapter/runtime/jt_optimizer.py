@@ -69,6 +69,28 @@ def _replica_maxima(modules: list[JTDeepseekV3MLAAttention], group: Any) -> list
     return [part.view_as(maximum) for part, maximum in zip(parts, maxima)]
 
 
+def _global_expert_loads(modules: list[torch.nn.Module], group: Any) -> list[torch.Tensor]:
+    """Return each MoE module's expert load averaged over the global batch.
+
+    The forward averages loads only over the shards of one sequence. Every replica of
+    the expert bias must take the same update, so the batch shards are averaged here.
+
+    Args:
+        modules: MoE modules in model order, identical on every rank.
+        group: DP+CP process group, or ``None`` when the batch is not partitioned.
+
+    Returns:
+        Per-module expert loads averaged over ``group``.
+    """
+    loads = [module.expert_load for module in modules]
+    if group is None or not loads:
+        return loads
+    stacked = torch.stack(loads)
+    dist.all_reduce(stacked, group=group)
+    stacked /= dist.get_world_size(group)
+    return list(stacked.unbind())
+
+
 @torch.no_grad()
 def clip_qk(model: torch.nn.Module, threshold: float) -> None:
     """Clip coupled query/key projections after each optimizer update.
@@ -97,11 +119,11 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
     clip_qk(model, threshold)
     config = model.config
     if config.moe_router_enable_expert_bias:
-        for module in model.modules():
-            if getattr(module, "expert_load", None) is not None:
-                direction = (1 / config.n_routed_experts - module.expert_load).sign()
-                module.gate.e_score_correction_bias.add_(direction, alpha=config.moe_router_bias_update_rate)
-                module.expert_load.zero_()
+        modules = [module for module in model.modules() if getattr(module, "expert_load", None) is not None]
+        for module, load in zip(modules, _global_expert_loads(modules, model.expert_load_group)):
+            direction = (1 / config.n_routed_experts - load).sign()
+            module.gate.e_score_correction_bias.add_(direction, alpha=config.moe_router_bias_update_rate)
+            module.expert_load.zero_()
 
 
 

@@ -285,7 +285,8 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.gate = JTDeepseekV3Gate(config)
         self.shared_experts = DeepseekV32MLP(
             config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
-        self.ep_group = None
+        # Ranks holding shards of the same sequences (TP with sequence parallelism); the JT builder sets it.
+        self.sequence_partition_group = None
         self.ep_compute = self.local_routed_forward
         self.auxiliary_loss = None
         self.expert_load = None
@@ -298,7 +299,8 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         scores = self.gate.router_logits.sigmoid()
         self.gate.router_logits = None
         self.auxiliary_loss, self.expert_load = calculate_seq_aux_loss(
-            scores, indices, coeff=config.moe_aux_loss_coeff, sequence_partition_group=self.ep_group)
+            scores, indices, coeff=config.moe_aux_loss_coeff,
+            sequence_partition_group=self.sequence_partition_group)
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
@@ -422,6 +424,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.loss_group = None
         # Ranks holding the same attention heads (DP+CP); the JT builder sets it for QK clipping.
         self.qk_clip_group = None
+        # Ranks holding different batch data (DP+CP); the JT builder sets it to average expert loads.
+        self.expert_load_group = None
         self.post_init()
 
     def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None, *,
