@@ -24,10 +24,6 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
     )
 
     return [
-        # Fused MLA down-projection (q_a_proj + kv_a_proj_with_mqa) after the attention replacement.
-        (["linear_qkv"], ParamRole.REPLICATED),
-        # Shared experts run on each rank's sequence shard with full weights.
-        (["shared_experts"], ParamRole.REPLICATED),
         (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
     ]

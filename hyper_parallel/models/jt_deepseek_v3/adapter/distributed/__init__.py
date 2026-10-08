@@ -12,4 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V3 optimizer runtime: the Muon builder and its post-update hooks."""
+"""DeepSeek-V3 expert-parallel compute archetype."""
+
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.ep_compute import (
+    jt_deepseek_v3_ep_compute_fn,
+)
+
+__all__ = ["jt_deepseek_v3_ep_compute_fn"]

@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 from hyper_parallel.data.tools.io import IndexedDatasetBuilder
-from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_data import IndexedSupervisedDataset
+from hyper_parallel.models.jt_deepseek_v3.adapter.data.dataset import IndexedSupervisedDataset
 from hyper_parallel.data.batching import FixedBatchDataLoader, TextParallelBatch
 from tests.common.mark_utils import arg_mark
 
