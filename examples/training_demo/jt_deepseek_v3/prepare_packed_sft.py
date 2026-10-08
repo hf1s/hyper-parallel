@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Compatibility import for the shared supervised indexed dataset."""
+"""Compatibility entry point for the common pre-tokenized SFT exporter."""
 
-from hyper_parallel.data.indexed.indexed_supervised_dataset import IndexedSupervisedDataset
+from hyper_parallel.data.tools.prepare_packed_sft import convert_sft, main
 
-__all__ = ["IndexedSupervisedDataset"]
+__all__ = ["convert_sft", "main"]
+
+
+if __name__ == "__main__":
+    main()

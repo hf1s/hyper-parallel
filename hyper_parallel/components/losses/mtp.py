@@ -14,6 +14,8 @@
 # ============================================================================
 """Multi-Token-Prediction auxiliary loss objective."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
@@ -23,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.components.modules.mtp import shift_mtp_sequence
 
 
 def calculate_mtp_loss(
@@ -33,6 +36,7 @@ def calculate_mtp_loss(
     vocab_size: int,
     loss_factor: float = 1.0,
     ignore_index: int = IGNORE_INDEX,
+    sequence_ends: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """DeepSeek-V3 Multi-Token-Prediction loss ``loss_factor / D * sum_k L_k``.
 
@@ -52,6 +56,7 @@ def calculate_mtp_loss(
         vocab_size: Global vocabulary size.
         loss_factor: Total MTP weight, divided equally across depths.
         ignore_index: Target value excluded from every depth.
+        sequence_ends: Optional exclusive document ends, validated by the model.
 
     Returns:
         The weighted 0-d MTP loss; zero when no depth is given.
@@ -61,11 +66,21 @@ def calculate_mtp_loss(
     """
     total = torch.zeros((), device=shift_labels.device, dtype=torch.float32)
     depths = len(mtp_per_depth_logits)
+    packed_targets = shift_labels
     for depth, logits in enumerate(mtp_per_depth_logits, start=1):
         if logits.shape[:-1] != shift_labels.shape:
             raise ValueError("MTP logits must align with shift_labels position by position")
-        targets = F.pad(shift_labels[..., depth:], (0, depth), value=ignore_index)
-        depth_loss = loss_fn(logits=logits, labels=None, vocab_size=vocab_size, shift_labels=targets)
+        if sequence_ends is None:
+            targets = F.pad(shift_labels[..., depth:], (0, depth), value=ignore_index)
+        else:
+            packed_targets = shift_mtp_sequence(packed_targets, sequence_ends=sequence_ends, pad_value=ignore_index)
+            targets = packed_targets
+        loss_kwargs = {}
+        if sequence_ends is not None:
+            # Short documents may have no valid target at deeper MTP depths.
+            loss_kwargs["num_items_in_batch"] = (targets != ignore_index).sum().clamp_min(1)
+        depth_loss = loss_fn(logits=logits, labels=None, vocab_size=vocab_size,
+                             shift_labels=targets, **loss_kwargs)
         total = total + depth_loss.reshape(()) * (loss_factor / depths)
     return total
 

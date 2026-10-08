@@ -76,13 +76,20 @@ class MultiTokenPredictionLayer(nn.Module):
         return torch.cat((self.hnorm(hidden), self.enorm(embedding)), dim=-1)
 
 
-def shift_mtp_sequence(value: torch.Tensor) -> torch.Tensor:
-    """Shift a global batch/sequence tensor left, padding with zero without wrapping.
+def shift_mtp_sequence(value: torch.Tensor, *, sequence_ends: tuple[int, ...] | None = None,
+                       pad_value: int = 0) -> torch.Tensor:
+    """Shift a global batch/sequence tensor left, padding document ends without wrapping.
 
     Args:
         value: Complete batch/sequence tensor to shift.
+        sequence_ends: Optional exclusive ends of independent packed documents.
+        pad_value: Value replacing the last element of every document.
     """
-    return torch.cat((value[:, 1:], torch.zeros_like(value[:, :1])), dim=1)
+    shifted = torch.cat((value[:, 1:], torch.full_like(value[:, :1], pad_value)), dim=1)
+    if sequence_ends is not None:
+        indices = torch.tensor(sequence_ends, device=value.device, dtype=torch.int64) - 1
+        shifted = shifted.index_fill(1, indices, pad_value)
+    return shifted
 
 
 @dataclass
@@ -126,7 +133,8 @@ class DeepseekV3MTPExecution(nn.Module):
 
     def forward(self, layers: nn.ModuleList, hidden: torch.Tensor, input_ids: torch.Tensor,
                 embedding: nn.Module, head: nn.Module,
-                decoder_kwargs: Mapping[str, Any] | None = None) -> MultiTokenPredictionOutput:
+                decoder_kwargs: Mapping[str, Any] | None = None,
+                sequence_ends: tuple[int, ...] | None = None) -> MultiTokenPredictionOutput:
         """Shift future tokens and run independent depths, returning each depth's logits.
 
         Args:
@@ -136,10 +144,12 @@ class DeepseekV3MTPExecution(nn.Module):
             embedding: The main model's shared token embedding; not registered here.
             head: Shared output head, including any shared output normalization.
             decoder_kwargs: Causal attention/position arguments for every decoder.
+            sequence_ends: Optional exclusive document ends, validated by the model.
 
         Note:
-            Each row must be one independent, unpartitioned sequence. Packed
-            document boundaries and context-parallel token shifts are not implemented.
+            Each row must contain complete sequences. When sequence_ends is supplied,
+            future-token shifts stop at each document boundary. Context-parallel
+            token shifts are not implemented.
             Depth ``k`` logits are aligned with the main targets and score the
             token ``k`` positions later; ``calculate_mtp_loss`` applies that shift.
         """
@@ -148,7 +158,7 @@ class DeepseekV3MTPExecution(nn.Module):
         decoder_kwargs = {} if decoder_kwargs is None else decoder_kwargs
         logits = []
         for layer in layers:
-            input_ids = shift_mtp_sequence(input_ids)
+            input_ids = shift_mtp_sequence(input_ids, sequence_ends=sequence_ends)
             combined = self.fuse_inputs(layer, hidden, embedding(input_ids))
             raw_hidden = layer.transformer_layer(layer.eh_proj(combined), **decoder_kwargs)
             prediction_hidden = layer.final_layernorm(raw_hidden)

@@ -191,6 +191,23 @@ DataLoader owner 读取 batch
 `FixedBatchDataLoader` 固定每批样本数；`TokenBatchLoader` 按 token budget 从候选池选择
 可变数量的完整样本。二者都不会把单条超长样本静默截断。
 
+### 预分词 SFT
+
+`text.pretokenized_sft.PreTokenizedSFTTransform` 接收预分词的 `input_ids`、已移位 `labels`，
+以及可选的 `cu_seqlens` 和二值 `loss_mask`。无边界字段时视为一个文档；已有边界必须从 0
+严格递增到记录长度。该 transform 不调用 tokenizer，不重复移位标签，按 `max_seq_len` 产生
+不重叠窗口，保留尾窗，跳过无有效监督窗口。`TextPackingCollator` 再次合并样本时保留内部边界。
+
+运行期读取使用已有 `build_online_text_mapping_dataset` + `TokenBatchLoader`，由已有机制负责
+source split/blend、DP 采样、窗口 buffer 恢复和并行 batch。也可用
+`python -m hyper_parallel.data.tools.prepare_packed_sft` 预先导出四组 `.bin/.idx`，
+由公共 `IndexedSupervisedDataset(packed=True)` 读取。离线导出与在线 transform 共用处理逻辑；
+定长导出要求原始记录长度可整除窗口长度。示例见
+[`JT packed SFT`](../../examples/training_demo/jt_deepseek_v3/README.md)。
+
+预分词字段处理属于数据层。Trainer 只通过已有配置接口组装这些组件；模型 runtime adapter
+负责将公共边界转换为模型前向参数及验证模型特有限制。
+
 ## 5. Omni transform 生命周期
 
 `OmniDataTransform` 采用 Energon 风格的 hook 组合。实现类必须满足以下三种模式之一：
