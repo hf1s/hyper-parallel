@@ -38,6 +38,7 @@ from hyper_parallel.models._transformers.model_builder import (
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
     JTDeepseekV3ForCausalLM,
+    JTDeepseekV3MoE,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
@@ -68,6 +69,26 @@ def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray])
     if model.model.embed_tokens.weight is model.lm_head.weight:
         raise ValueError("JT embedding and LM head must not be tied")
     return expected
+
+
+def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
+    """Bind the process groups over which the model reduces its training statistics.
+
+    Args:
+        model: Sharded JT model.
+        mesh: Runtime mesh context of the training job.
+    """
+    dp_cp_mesh = mesh.dp_cp_mesh
+    replica_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()
+    # QK clipping must use one maximum on every rank that holds the same attention heads.
+    model.qk_clip_group = replica_group
+    # Reference router statistics: the aux-loss expert fractions average the sequence-parallel shards
+    # of one sequence, and the bias update sums the expert token counts of the global batch.
+    model.expert_load_group = replica_group
+    sequence_group = mesh.device_mesh["tp"].get_group() if mesh.sequence_parallel and mesh.tp_size > 1 else None
+    for module in model.modules():
+        if isinstance(module, JTDeepseekV3MoE):
+            module.sequence_partition_group = sequence_group
 
 
 def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
@@ -116,9 +137,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         is_hf_model=True,
         **infrastructure_options,
     )
-    dp_cp_mesh = mesh.dp_cp_mesh
-    # QK clipping must use one maximum on every rank that holds the same attention heads.
-    model.qk_clip_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()
+    _bind_statistics_groups(model, mesh)
     model.build_report = {
         "model_class": type(model).__name__,
         "loaded_state_tensors": len(expected),

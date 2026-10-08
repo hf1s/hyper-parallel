@@ -56,7 +56,7 @@ def calculate_seq_aux_loss(
     *,
     coeff: float,
     sequence_partition_group: Optional[Any] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """DeepSeek-V3 complementary sequence-wise aux loss ``coeff * E * sum_i(f_i * P_i)``.
 
     ``f_i`` is the fraction of routed slots assigned to expert ``i``, averaged
@@ -77,8 +77,7 @@ def calculate_seq_aux_loss(
             shards of the same sequence; ``None`` keeps the statistics local.
 
     Returns:
-        The 0-d aux loss and the detached per-expert load fractions ``f``,
-        shaped ``[num_experts]``, for auxiliary-loss-free bias updates.
+        The 0-d aux loss.
     """
     num_experts = scores.shape[-1]
     load = torch.bincount(selected_experts.flatten(), minlength=num_experts)
@@ -88,7 +87,7 @@ def calculate_seq_aux_loss(
         load = load / dist.get_world_size(sequence_partition_group)
     normalized = scores / (scores.sum(-1, keepdim=True) + 1e-20)
     loss = (normalized.mean(0) * load).sum() * num_experts * coeff
-    return _replicated_group_mean(loss, sequence_partition_group), load.detach()
+    return _replicated_group_mean(loss, sequence_partition_group)
 
 
 __all__ = ["calculate_seq_aux_loss"]
