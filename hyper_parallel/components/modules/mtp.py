@@ -94,10 +94,11 @@ def shift_mtp_sequence(value: torch.Tensor, *, sequence_ends: tuple[int, ...] | 
 
 @dataclass
 class MultiTokenPredictionOutput:
-    """Per-depth prediction logits and the final raw recurrent state."""
+    """Per-depth logits or prediction states, and the final raw recurrent state."""
 
     logits: tuple[torch.Tensor, ...]
     hidden_states: torch.Tensor
+    prediction_hidden_states: tuple[torch.Tensor, ...] = ()
 
 
 class DeepseekV3MTPExecution(nn.Module):
@@ -132,7 +133,7 @@ class DeepseekV3MTPExecution(nn.Module):
         return raw_hidden
 
     def forward(self, layers: nn.ModuleList, hidden: torch.Tensor, input_ids: torch.Tensor,
-                embedding: nn.Module, head: nn.Module,
+                embedding: nn.Module, head: nn.Module | None,
                 decoder_kwargs: Mapping[str, Any] | None = None,
                 sequence_ends: tuple[int, ...] | None = None) -> MultiTokenPredictionOutput:
         """Shift future tokens and run independent depths, returning each depth's logits.
@@ -142,7 +143,7 @@ class DeepseekV3MTPExecution(nn.Module):
             hidden: Main trunk state, before its final output normalization.
             input_ids: Complete global token IDs, shaped [batch, sequence].
             embedding: The main model's shared token embedding; not registered here.
-            head: Shared output head, including any shared output normalization.
+            head: Shared output head; None returns per-depth states for a fused or chunked loss.
             decoder_kwargs: Causal attention/position arguments for every decoder.
             sequence_ends: Optional exclusive document ends, validated by the model.
 
@@ -157,14 +158,18 @@ class DeepseekV3MTPExecution(nn.Module):
             raise ValueError("MTP requires nonempty [batch, sequence] global token IDs")
         decoder_kwargs = {} if decoder_kwargs is None else decoder_kwargs
         logits = []
+        prediction_states = []
         for layer in layers:
             input_ids = shift_mtp_sequence(input_ids, sequence_ends=sequence_ends)
             combined = self.fuse_inputs(layer, hidden, embedding(input_ids))
             raw_hidden = layer.transformer_layer(layer.eh_proj(combined), **decoder_kwargs)
             prediction_hidden = layer.final_layernorm(raw_hidden)
             hidden = self.recurrent_state(raw_hidden, prediction_hidden)
-            logits.append(head(prediction_hidden))
-        return MultiTokenPredictionOutput(tuple(logits), hidden)
+            if head is None:
+                prediction_states.append(prediction_hidden)
+            else:
+                logits.append(head(prediction_hidden))
+        return MultiTokenPredictionOutput(tuple(logits), hidden, tuple(prediction_states))
 
 
 class MultiTokenPrediction(nn.Module):

@@ -16,16 +16,30 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
 # pylint: disable-next=forbidden-backend-import
 import torch
-# pylint: disable-next=forbidden-backend-import
-import torch.nn.functional as F
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.components.modules.mtp import shift_mtp_sequence
+
+
+def iter_mtp_targets(shift_labels: torch.Tensor, depths: int, *, ignore_index: int = IGNORE_INDEX,
+                     sequence_ends: tuple[int, ...] | None = None) -> Iterator[torch.Tensor]:
+    """Yield aligned targets for successive prediction depths without crossing documents.
+
+    Args:
+        shift_labels: Main LM targets already shifted by one token.
+        depths: Number of additional prediction depths.
+        ignore_index: Padding value excluded from the objective.
+        sequence_ends: Optional exclusive packed document ends.
+    """
+    targets = shift_labels
+    for _ in range(depths):
+        targets = shift_mtp_sequence(targets, sequence_ends=sequence_ends, pad_value=ignore_index)
+        yield targets
 
 
 def calculate_mtp_loss(
@@ -66,15 +80,11 @@ def calculate_mtp_loss(
     """
     total = torch.zeros((), device=shift_labels.device, dtype=torch.float32)
     depths = len(mtp_per_depth_logits)
-    packed_targets = shift_labels
-    for depth, logits in enumerate(mtp_per_depth_logits, start=1):
+    for logits, targets in zip(mtp_per_depth_logits,
+                               iter_mtp_targets(shift_labels, depths, ignore_index=ignore_index,
+                                                sequence_ends=sequence_ends)):
         if logits.shape[:-1] != shift_labels.shape:
             raise ValueError("MTP logits must align with shift_labels position by position")
-        if sequence_ends is None:
-            targets = F.pad(shift_labels[..., depth:], (0, depth), value=ignore_index)
-        else:
-            packed_targets = shift_mtp_sequence(packed_targets, sequence_ends=sequence_ends, pad_value=ignore_index)
-            targets = packed_targets
         loss_kwargs = {}
         if sequence_ends is not None:
             # Short documents may have no valid target at deeper MTP depths.

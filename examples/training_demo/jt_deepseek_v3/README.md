@@ -59,7 +59,19 @@ bash examples/training_demo/jt_deepseek_v3/run_jt_deepseek_v3.sh \
 
 日志位于 `output/training_demo/jt_deepseek_v3/run_<配置名>.log`。
 
-本改动只接通文档边界及文档内 MTP，不包含分块 loss 或大词表 256K 显存优化。
+大词表长序列训练可在模型配置中启用输出层分块：
+
+```yaml
+model:
+  config:
+    loss_chunk_size: 16384
+```
+
+默认值 `0` 保留完整 logits 路径。正整数表示每次投影的全局序列长度上限；
+开启 sequence parallel 时须为 TP 度数的整数倍。LM 和每层 MTP 共用同一实现，
+投影及 CE 一起重计算，避免保存完整 `[序列长度, 词表大小]` 激活。
+分块大小仅影响显存和速度，不改变文档边界、预移位标签或有效 token 的归一化。
+256K 配合大词表时建议启用；仅使用基础数据适配并不保证完整 logits 能放入单卡显存。
 
 ## 直接读取原始数据（可选）
 
