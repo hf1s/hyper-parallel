@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V3 EP archetype factory: the model's own routing and shared-expert combine.
+"""JT DeepSeek-V3 expert-parallel compute on the framework EP skeleton.
 
-The family composes its routed branch through the public ``build_ep_compute``
-skeleton; the recipe binds it to the routed MoE layers with ``when: ep``
+The JT MoE router and routed-branch combine run through the public
+``build_ep_compute``; recipes bind it to the routed MoE layers with ``when: ep``
 ``plan_overrides`` entries.
 """
 
@@ -29,7 +29,11 @@ from hyper_parallel.distributed.recipe_spec import local_compute
 @local_compute
 def jt_deepseek_v3_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
                                  ep_mesh: Any) -> Callable:
-    """Bind public EP execution using the JT model routing contract."""
+    """Bind expert-parallel execution of a JT MoE layer to ``ep_mesh``.
+
+    Raises:
+        ValueError: If no expert-parallel mesh is given.
+    """
     del mesh, tp_mesh, cp_mesh
     if ep_mesh is None:
         raise ValueError("JT requires an EP mesh")

@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-style sequential multi-token prediction for the Torch runtime."""
+"""DeepSeek-style sequential multi-token prediction for the Torch runtime.
+
+Depth ``k`` fuses the previous depth's output state with the embeddings of the
+tokens shifted ``k`` positions left, runs its own decoder and output norm, and
+feeds the result both to the shared output head and to depth ``k + 1``, as in
+Megatron-LM and MindFormers. The objective lives in
+:func:`hyper_parallel.components.losses.calculate_mtp_loss`.
+"""
 
 # This adapter uses the Torch/HF runtime, like the existing model and Trainer modules.
 # pylint: disable=forbidden-backend-import
@@ -29,12 +36,11 @@ from torch import nn
 
 
 class MultiTokenPredictionLayer(nn.Module):
-    """Fuse next-token embeddings and trunk states using injected components.
+    """Fuse next-token embeddings and the previous state using injected components.
 
-    Norms, decoder and projection can be supplied by the model. The enclosing
-    DeepseekV3MTP owns token shifting and ``components.losses.calculate_mtp_loss``
-    owns the objective. This layer alone imposes no model-specific dtype or
-    distributed defaults.
+    Norms, decoder and projection are supplied by the model. The enclosing
+    :class:`MultiTokenPrediction` owns token shifting and depth chaining. This
+    layer imposes no model-specific dtype or distributed defaults.
     """
 
     def __init__(self, *, embedding_norm: nn.Module, hidden_norm: nn.Module,
@@ -43,10 +49,10 @@ class MultiTokenPredictionLayer(nn.Module):
 
         Args:
             embedding_norm: Normalization for future-token embeddings.
-            hidden_norm: Normalization for trunk states.
+            hidden_norm: Normalization for the previous state.
             projection: Embedding/hidden fusion projection.
             decoder: Model-provided decoder.
-            output_norm: Prediction output normalization.
+            output_norm: Normalization of this depth's output state.
         """
         super().__init__()
         self.enorm = embedding_norm
@@ -57,23 +63,15 @@ class MultiTokenPredictionLayer(nn.Module):
 
     def forward(self, hidden: torch.Tensor, embedding: torch.Tensor,
                 **decoder_kwargs: Any) -> torch.Tensor:
-        """Return the next prediction state without creating logits or losses.
+        """Return this depth's output state, consumed by the head and the next depth.
 
         Args:
-            hidden: Trunk hidden states.
-            embedding: Next-token embedding states.
+            hidden: Previous state: the trunk output or the previous depth's output.
+            embedding: Embeddings of the shifted future tokens.
+            **decoder_kwargs: Causal attention and position arguments of the decoder.
         """
-        combined = self.fuse_inputs(hidden, embedding)
+        combined = torch.cat((self.hnorm(hidden), self.enorm(embedding)), dim=-1)
         return self.final_layernorm(self.transformer_layer(self.eh_proj(combined), **decoder_kwargs))
-
-    def fuse_inputs(self, hidden: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
-        """Normalize and concatenate states without model-specific precision casts.
-
-        Args:
-            hidden: Trunk hidden states.
-            embedding: Next-token embedding states.
-        """
-        return torch.cat((self.hnorm(hidden), self.enorm(embedding)), dim=-1)
 
 
 def shift_mtp_sequence(value: torch.Tensor) -> torch.Tensor:
@@ -87,54 +85,30 @@ def shift_mtp_sequence(value: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class MultiTokenPredictionOutput:
-    """Per-depth prediction logits and the final raw recurrent state."""
+    """Per-depth prediction logits and the last depth's output state."""
 
     logits: tuple[torch.Tensor, ...]
     hidden_states: torch.Tensor
 
 
-class DeepseekV3MTPExecution(nn.Module):
-    """Run the DeepSeek V3 prediction depths and return their logits.
+class MultiTokenPrediction(nn.Module):
+    """Own the prediction depths and chain them over shifted future tokens."""
 
-    Layers stay owned by the parent MTP. Keeping execution as a parameter-free
-    sibling allows replacing its precision policy independently of accelerated
-    Attention modules inside those layers.
-    """
+    def __init__(self, layers: list[MultiTokenPredictionLayer]) -> None:
+        """Register independent depths without duplicating the shared embedding/head."""
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
 
-    @staticmethod
-    def fuse_inputs(layer: MultiTokenPredictionLayer, hidden: torch.Tensor,
-                    embedding: torch.Tensor) -> torch.Tensor:
-        """Use the public layer's normalization and hidden-then-embedding fusion.
-
-        Args:
-            layer: Components for the current depth.
-            hidden: Previous decoder state.
-            embedding: Future-token embedding.
-        """
-        return layer.fuse_inputs(hidden, embedding)
-
-    @staticmethod
-    def recurrent_state(raw_hidden: torch.Tensor, prediction_hidden: torch.Tensor) -> torch.Tensor:
-        """Pass the decoder output to the next depth, before output-head normalization.
-
-        Args:
-            raw_hidden: Decoder output before prediction normalization.
-            prediction_hidden: Normalized state supplied to the output head.
-        """
-        del prediction_hidden
-        return raw_hidden
-
-    def forward(self, layers: nn.ModuleList, hidden: torch.Tensor, input_ids: torch.Tensor,
+    def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor, *,
                 embedding: nn.Module, head: nn.Module,
                 decoder_kwargs: Mapping[str, Any] | None = None) -> MultiTokenPredictionOutput:
-        """Shift future tokens and run independent depths, returning each depth's logits.
+        """Shift future tokens and run the depths in order, returning each depth's logits.
 
         Args:
-            layers: Independently parameterized MTP depths owned by the parent.
             hidden: Main trunk state, before its final output normalization.
             input_ids: Complete global token IDs, shaped [batch, sequence].
             embedding: The main model's shared token embedding; not registered here.
-            head: Shared output head, including any shared output normalization.
+            head: Shared output head.
             decoder_kwargs: Causal attention/position arguments for every decoder.
 
         Note:
@@ -147,34 +121,11 @@ class DeepseekV3MTPExecution(nn.Module):
             raise ValueError("MTP requires nonempty [batch, sequence] global token IDs")
         decoder_kwargs = {} if decoder_kwargs is None else decoder_kwargs
         logits = []
-        for layer in layers:
+        for layer in self.layers:
             input_ids = shift_mtp_sequence(input_ids)
-            combined = self.fuse_inputs(layer, hidden, embedding(input_ids))
-            raw_hidden = layer.transformer_layer(layer.eh_proj(combined), **decoder_kwargs)
-            prediction_hidden = layer.final_layernorm(raw_hidden)
-            hidden = self.recurrent_state(raw_hidden, prediction_hidden)
-            logits.append(head(prediction_hidden))
+            hidden = layer(hidden, embedding(input_ids), **decoder_kwargs)
+            logits.append(head(hidden))
         return MultiTokenPredictionOutput(tuple(logits), hidden)
-
-
-class MultiTokenPrediction(nn.Module):
-    """Own prediction depths and run the complete DeepSeek MTP forward."""
-
-    def __init__(self, layers: list[MultiTokenPredictionLayer]) -> None:
-        """Register independent depths without duplicating the shared embedding/head."""
-        super().__init__()
-        self.layers = nn.ModuleList(layers)
-        self.execution = DeepseekV3MTPExecution()
-
-    def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor,
-                **kwargs: Any) -> MultiTokenPredictionOutput:
-        """Run the public execution contract with this module's registered layers.
-
-        Args:
-            hidden: Main trunk state before its final output normalization.
-            input_ids: Complete global input token IDs.
-        """
-        return self.execution(self.layers, hidden, input_ids, **kwargs)
 
 
 class DeepseekV3MTP(MultiTokenPrediction):
@@ -197,8 +148,9 @@ class DeepseekV3MTP(MultiTokenPrediction):
             decoder_factory: Creates one independent causal decoder for each depth.
             rms_norm_eps: Epsilon for the default Torch RMSNorm.
             norm_factory: Optional optimized or precision-specific fusion normalization.
-            output_norm_factory: Optional per-depth output norm; by default the shared
-                head passed to forward owns output normalization, as in DeepSeek V3.
+            output_norm_factory: Optional per-depth output norm, applied before the
+                head and the next depth; by default the depth output is not
+                normalized, so the head passed to forward must normalize.
         """
         if hidden_size <= 0 or num_layers < 0:
             raise ValueError("MTP hidden_size must be positive and num_layers nonnegative")

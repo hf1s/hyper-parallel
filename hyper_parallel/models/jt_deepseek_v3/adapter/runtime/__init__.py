@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V3 optimizer runtime: the Muon builder and its post-update hooks."""
+"""JT DeepSeek-V3 optimizer runtime: the Muon builder and its post-step hook."""

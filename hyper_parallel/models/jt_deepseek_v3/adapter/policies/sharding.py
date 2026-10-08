@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Declare DeepSeek-V2/V3 MLA parameter sharding roles."""
+"""JT DeepSeek-V3 tensor-parallel parameter policies."""
 
 from typing import Any
 
@@ -27,5 +27,6 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
         (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
     ]
+
 
 __all__ = ["build_parameter_sharding_rules"]

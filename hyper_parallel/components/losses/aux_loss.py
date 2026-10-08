@@ -59,34 +59,44 @@ def calculate_seq_aux_loss(
 ) -> torch.Tensor:
     """DeepSeek-V3 complementary sequence-wise aux loss ``coeff * E * sum_i(f_i * P_i)``.
 
-    ``f_i`` is the fraction of routed slots assigned to expert ``i``, averaged
-    over ``sequence_partition_group``; ``P_i`` is the mean over local tokens of
-    each token's affinities normalized across all ``E`` experts. The returned
-    value is the mean over the group and every rank differentiates only its own
-    tokens. Unlike the top-k-weight load-balance loss of
-    :class:`~hyper_parallel.components.modules.moe.MoE`, ``P_i`` uses the
-    affinities of every expert.
+    For each sequence, ``f_i`` is the fraction of routed slots assigned to expert
+    ``i`` and ``P_i`` is the mean over its tokens of each token's affinities
+    normalized across all ``E`` experts; the loss is averaged over the sequences.
+    Unlike the top-k-weight load-balance loss of
+    :class:`~hyper_parallel.components.modules.moe.MoE`, ``P_i`` uses the affinities
+    of every expert.
+
+    When the sequences are partitioned across ``sequence_partition_group``, ``f_i``
+    is averaged over the group and the returned loss is the group mean replicated
+    on every rank, each rank differentiating only its own tokens. Unlike the
+    per-rank partial value of the MoE load-balance loss, this value is complete on
+    every rank, so it can be reported and added to a replicated objective.
 
     Args:
-        scores: Router affinities of all experts, ``[tokens, num_experts]``,
-            for example sigmoid scores before top-k selection.
-        selected_experts: Selected expert indices, ``[tokens, top_k]``.
+        scores: Router affinities of every expert, ``[..., tokens, num_experts]``,
+            for example sigmoid scores before top-k selection; leading dimensions
+            index independent sequences, and a 2-D input is one sequence.
+        selected_experts: Selected expert indices, ``[..., tokens, top_k]``, with the
+            same leading dimensions as ``scores``.
         coeff: Aux loss coefficient.
-        sequence_partition_group: Optional process group spanning the
-            sequence-partition dimension, whose ranks hold different token
-            shards of the same sequence; ``None`` keeps the statistics local.
+        sequence_partition_group: Optional process group whose ranks hold different
+            token shards of the same sequences; ``None`` keeps the statistics local.
 
     Returns:
         The 0-d aux loss.
     """
     num_experts = scores.shape[-1]
-    load = torch.bincount(selected_experts.flatten(), minlength=num_experts)
-    load = load / selected_experts.numel()
+    num_sequences = scores.shape[:-2].numel()
+    slots = selected_experts.reshape(num_sequences, -1)
+    offsets = torch.arange(num_sequences, device=slots.device).unsqueeze(-1) * num_experts
+    counts = torch.bincount((slots + offsets).flatten(), minlength=num_sequences * num_experts)
+    load = counts.view(num_sequences, num_experts) / slots.shape[-1]
     if sequence_partition_group is not None:
         dist.all_reduce(load, group=sequence_partition_group)
         load = load / dist.get_world_size(sequence_partition_group)
     normalized = scores / (scores.sum(-1, keepdim=True) + 1e-20)
-    loss = (normalized.mean(0) * load).sum() * num_experts * coeff
+    affinity = normalized.reshape(num_sequences, -1, num_experts).mean(-2)
+    loss = (affinity * load).sum(-1).mean() * num_experts * coeff
     return _replicated_group_mean(loss, sequence_partition_group)
 
 

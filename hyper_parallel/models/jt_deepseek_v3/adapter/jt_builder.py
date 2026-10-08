@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Configured model and exported weights adapted to Hyper's model build pipeline."""
+"""Build the JT model from its configuration and converted ``model.npz`` weights."""
 
 # This adapter uses the Torch/HF runtime, like the existing model and Trainer modules.
 # pylint: disable=forbidden-backend-import
@@ -43,8 +43,17 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 
-def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray]) -> dict:
-    """Load already-converted recipe weights without renaming or reshaping tensors."""
+def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray]) -> None:
+    """Load converted weights that already use the model's parameter names and layouts.
+
+    Args:
+        model: Materialized JT model.
+        arrays: Weights read from ``model.npz``, keyed by state-dict name.
+
+    Raises:
+        ValueError: If names, shapes or dtypes differ, a loaded value differs, or the
+            embedding and LM head are tied.
+    """
     expected = model.state_dict()
     if set(expected) != set(arrays):
         raise ValueError(
@@ -68,7 +77,6 @@ def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray])
             raise ValueError(f"Loaded tensor differs: {name}")
     if model.model.embed_tokens.weight is model.lm_head.weight:
         raise ValueError("JT embedding and LM head must not be tied")
-    return expected
 
 
 def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
@@ -82,8 +90,8 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
     replica_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()
     # QK clipping must use one maximum on every rank that holds the same attention heads.
     model.qk_clip_group = replica_group
-    # Reference router statistics: the aux-loss expert fractions average the sequence-parallel shards
-    # of one sequence, and the bias update sums the expert token counts of the global batch.
+    # Router statistics: the aux-loss expert fractions average the sequence-parallel shards of one
+    # sequence, and the bias update sums the expert token counts of the global batch.
     model.expert_load_group = replica_group
     sequence_group = mesh.device_mesh["tp"].get_group() if mesh.sequence_parallel and mesh.tp_size > 1 else None
     for module in model.modules():
@@ -93,7 +101,20 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
 
 def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
                     distributed_setup: Any, **infrastructure_options: Any) -> PreTrainedModel:
-    """Load the native JT model and an offline-converted model.npz artifact."""
+    """Build the JT model and load its converted ``model.npz`` weights.
+
+    Args:
+        config: JT model configuration fields.
+        reference_weights: Directory containing ``model.npz``.
+        distributed_setup: Trainer distributed setup.
+        **infrastructure_options: Options forwarded to ``apply_model_infrastructure``.
+
+    Returns:
+        The sharded JT model.
+
+    Raises:
+        ValueError: If context parallelism is enabled or the weights do not match the model.
+    """
     if distributed_setup.mesh_context.cp_size > 1:
         raise ValueError("JT does not support context parallelism: MTP token shifting and its full "
                          "causal attention require each rank to hold the complete sequence")
@@ -116,16 +137,12 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
             context=_build_replacement_context(distributed_setup, None),
         )
     model.to_empty(device="cpu")
-    # Rotary buffers are nonpersistent; restore their deterministic reference state after to_empty().
-    model.model.rotary_emb = type(model.model.rotary_emb)(config)
     with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
         arrays = {name: archive[name] for name in archive.files}
-
-    expected = _load_reference_state(model, arrays)
+    _load_reference_state(model, arrays)
 
     device = torch.device(mesh.device_mesh.device_type, get_device_id())
     model.to(device)
-    model.loss_group = mesh.device_mesh["tp"].get_group()
     model = apply_model_infrastructure(
         model,
         mesh=mesh,
@@ -138,9 +155,4 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         **infrastructure_options,
     )
     _bind_statistics_groups(model, mesh)
-    model.build_report = {
-        "model_class": type(model).__name__,
-        "loaded_state_tensors": len(expected),
-        "all_loaded_values_exact": True,
-    }
     return model

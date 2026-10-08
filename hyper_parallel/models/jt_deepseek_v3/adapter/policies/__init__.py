@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V3 sharding and execution policies."""
+"""JT DeepSeek-V3 tensor-parallel parameter policies."""
