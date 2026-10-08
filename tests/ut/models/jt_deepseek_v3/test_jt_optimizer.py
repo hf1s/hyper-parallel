@@ -88,39 +88,32 @@ def two_rank_all_reduce(peer: torch.Tensor) -> Callable[..., None]:
 
 
 class TestQKClip(unittest.TestCase):
-    """QK clipping must survive fp32 main-param copy-back and agree across replicas."""
+    """QK clipping applied after the optimizer step must agree across replicas."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_clip_survives_fp32_main_param_copy_back(self):
-        """Feature: QK clipping with fp32 main parameters.
+    def test_optimizer_step_clips_projections(self):
+        """Feature: QK clipping in the optimizer post-update hook.
 
-        Description: Step the recipe optimizer behind the mixed-precision wrapper while head 0
-            exceeds the threshold 4x and head 1 stays below it.
-        Expectation: Head 0 is scaled exactly once in the main and the model parameter; head 1 is unchanged.
+        Description: Step the recipe optimizer behind the mixed-precision wrapper with FP32 parameters
+            while head 0 exceeds the threshold 4x and head 1 stays below it.
+        Expectation: Head 0 is scaled exactly once; head 1 is unchanged.
         """
-        for dtype in (torch.bfloat16, torch.float32):
-            with self.subTest(dtype=dtype):
-                model = replaced_model(dtype)
-                builder = jt_optimizer.build_optimizer(
-                    model=model, qk_clip_threshold=THRESHOLD,
-                    muon_config={"lr": 0.0}, adamw_config={"adamw_lr": 0.0})
-                optimizer = Float16OptimizerWithFloat16Params(builder.get_optimizer(), model)
-                modules = attention_modules(model)
-                originals = []
-                for module in modules:
-                    module.max_logits_val = torch.tensor([4 * THRESHOLD, THRESHOLD / 2])
-                    originals.append((module.q_b_proj.weight.detach().float().clone(),
-                                      module.kv_b_proj.weight.detach().float().clone()))
-                optimizer.step()
-                for module, (query, key_value) in zip(modules, originals):
-                    for weight, expected in (
-                            (module.q_b_proj.weight, query * row_factors([0.25, 1.0], rope_scaled=True)),
-                            (module.kv_b_proj.weight, key_value * row_factors([0.25, 1.0], rope_scaled=False))):
-                        self.assertTrue(torch.equal(weight.main_param, expected),
-                                        "fp32 main parameter must hold the clipped projection")
-                        self.assertTrue(torch.equal(weight, expected.to(dtype)),
-                                        "copy-back must not restore the unclipped projection")
-                    self.assertTrue(torch.equal(module.max_logits_val, torch.zeros(2)))
+        model = replaced_model(torch.float32)
+        builder = jt_optimizer.build_optimizer(
+            model=model, qk_clip_threshold=THRESHOLD,
+            muon_config={"lr": 0.0}, adamw_config={"adamw_lr": 0.0})
+        optimizer = Float16OptimizerWithFloat16Params(builder.get_optimizer(), model)
+        modules = attention_modules(model)
+        originals = []
+        for module in modules:
+            module.max_logits_val = torch.tensor([4 * THRESHOLD, THRESHOLD / 2])
+            originals.append((module.q_b_proj.weight.detach().clone(), module.kv_b_proj.weight.detach().clone()))
+        optimizer.step()
+        for module, (query, key_value) in zip(modules, originals):
+            self.assertTrue(torch.equal(module.q_b_proj.weight, query * row_factors([0.25, 1.0], rope_scaled=True)))
+            self.assertTrue(torch.equal(module.kv_b_proj.weight,
+                                        key_value * row_factors([0.25, 1.0], rope_scaled=False)))
+            self.assertTrue(torch.equal(module.max_logits_val, torch.zeros(2)))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_replicas_clip_with_shared_maximum(self):

@@ -289,24 +289,44 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.sequence_partition_group = None
         self.ep_compute = self.local_routed_forward
         self.auxiliary_loss = None
-        self.expert_load = None
+        # Routed-token counts since the last bias update; the optimizer hook sums them over the batch.
+        self.tokens_per_expert = None
 
     def route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select experts and compute the auxiliary sequence-balancing loss."""
+        """Select experts, compute the auxiliary sequence-balancing loss and count routed tokens."""
         padding, config = self.padding, self.config
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
         scores = self.gate.router_logits.sigmoid()
         self.gate.router_logits = None
-        self.auxiliary_loss, self.expert_load = calculate_seq_aux_loss(
+        self.auxiliary_loss = calculate_seq_aux_loss(
             scores, indices, coeff=config.moe_aux_loss_coeff,
             sequence_partition_group=self.sequence_partition_group)
+        counts = torch.bincount(indices.reshape(-1), minlength=config.n_routed_experts).float()
+        self.tokens_per_expert = counts if self.tokens_per_expert is None else self.tokens_per_expert + counts
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
             indices = torch.cat((pad_ids, indices))
             selected = torch.cat((selected.new_zeros(padding, selected.shape[-1]), selected))
         return indices, selected
+
+    @torch.no_grad()
+    def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
+        """Move the routing bias toward balanced load once ``tokens_per_expert`` holds global counts.
+
+        ``sync_and_update_expert_bias`` sums the counts over the batch before calling this. Unlike the
+        framework MoE, the step is not re-centered, so the bias matches the reference.
+
+        Args:
+            lr: Bias update rate.
+            num_recomputations: Forward executions per optimizer step; a uniform recount leaves the
+                sign update unchanged.
+        """
+        del num_recomputations
+        counts = self.tokens_per_expert
+        self.gate.e_score_correction_bias.add_((counts.mean() - counts).sign(), alpha=lr)
+        self.tokens_per_expert = None
 
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Execute routed experts; routing weights are cast to the activation dtype as in EP aggregation."""
@@ -424,7 +444,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.loss_group = None
         # Ranks holding the same attention heads (DP+CP); the JT builder sets it for QK clipping.
         self.qk_clip_group = None
-        # Ranks holding different batch data (DP+CP); the JT builder sets it to average expert loads.
+        # Ranks holding different batch data (DP+CP); the JT builder sets it to sum expert token counts.
         self.expert_load_group = None
         self.post_init()
 

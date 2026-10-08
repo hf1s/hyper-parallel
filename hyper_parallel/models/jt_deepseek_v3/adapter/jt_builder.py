@@ -83,7 +83,7 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
     # QK clipping must use one maximum on every rank that holds the same attention heads.
     model.qk_clip_group = replica_group
     # Reference router statistics: the aux-loss expert fractions average the sequence-parallel shards
-    # of one sequence, and the bias update averages the expert loads of the global batch.
+    # of one sequence, and the bias update sums the expert token counts of the global batch.
     model.expert_load_group = replica_group
     sequence_group = mesh.device_mesh["tp"].get_group() if mesh.sequence_parallel and mesh.tp_size > 1 else None
     for module in model.modules():
