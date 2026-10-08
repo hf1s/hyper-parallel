@@ -36,6 +36,7 @@ from hyper_parallel.distributed.activation_checkpoint import _apply_activation_c
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.fsdp import JTFSDP2Manager
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from hyper_parallel.trainer.config.parser import parse_training_args
@@ -167,7 +168,7 @@ class TestCompleteModel(unittest.TestCase):
         """
         model = JTDeepseekV3ForCausalLM(small_config())
         _apply_activation_checkpointing(model, "full")
-        manager = FSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
+        manager = JTFSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
         units = manager._find_wrap_modules(model)
         names = {unit.fqn for unit in units}
         self.assertIn("mtp.layers.0.transformer_layer.self_attn.q_a_layernorm", names)
@@ -357,18 +358,21 @@ class TestCompleteModel(unittest.TestCase):
     def test_fsdp_discovery_uses_jt_identity_and_declared_mtp_unit(self):
         """Feature: FSDP unit discovery.
 
-        Description: Resolve FSDP units for the JT model through the framework manager.
-        Expectation: The JT adapter applies; each MTP transformer layer is one unit, not split leaves.
+        Description: Resolve JT units and apply FP32 only through the model-local manager.
+        Expectation: The shared manager has ordinary block units; JT alone adds its precision units.
         """
         model = JTDeepseekV3ForCausalLM(small_config())
         self.assertEqual(FSDP2Manager._get_model_adapter_spec(model).model_type, "jt_deepseek_v3")
         manager = FSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
         units = manager._find_wrap_modules(model)
         self.assertEqual(
-            sorted(unit.fqn for unit in units if not unit.keep_fp32),
+            sorted(unit.fqn for unit in units),
             ["model.layers.0", "model.layers.1", "mtp.layers.0.transformer_layer"],
         )
-        fp32_names = {unit.fqn for unit in units if unit.keep_fp32}
+        manager = JTFSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
+        units = manager._find_wrap_modules(model)
+        fp32_units = [unit for unit in units if getattr(unit.module, "keep_compute_in_fp32", False)]
+        fp32_names = {unit.fqn for unit in fp32_units}
         self.assertIn("model.layers.1.mlp.gate", fp32_names)
         self.assertIn("model.norm", fp32_names)
         self.assertIn("mtp.layers.0.hnorm", fp32_names)
@@ -378,7 +382,7 @@ class TestCompleteModel(unittest.TestCase):
         policy = manager._build_mixed_precision_policy()
         with patch("hyper_parallel.distributed._builder.fsdp_adapter.fully_shard") as shard:
             manager._parallelize_child_units(units, {}, None, None, {"mp_policy": policy})
-        fp32_ids = {id(unit.module) for unit in units if unit.keep_fp32}
+        fp32_ids = {id(unit.module) for unit in fp32_units}
         for call in shard.call_args_list:
             applied = call.kwargs["mp_policy"]
             self.assertTrue(applied.apply_grad_on_fp32_main_grad)

@@ -46,7 +46,6 @@ def test_compute_batched_ns_updates_accepts_plain_parameter_without_sharding():
     optimizer.reshape_fn = None
     optimizer.ns_transform_fn = None
     optimizer.zeropower_fn = None
-    optimizer.batch_ns = True
     parameter = torch.nn.Parameter(torch.ones(2, 2))
     ns_inputs = {parameter: torch.ones(2, 2)}
     group = _plain_ns_group()
@@ -63,7 +62,6 @@ def test_compute_batched_ns_updates_with_transform_accepts_plain_parameter():
     optimizer.reshape_fn = None
     optimizer.ns_transform_fn = lambda param_fqn, ns_input: None
     optimizer.zeropower_fn = None
-    optimizer.batch_ns = True
     parameter = torch.nn.Parameter(torch.ones(2, 2))
     ns_inputs = {parameter: torch.ones(2, 2)}
     group = _plain_ns_group()
@@ -78,25 +76,6 @@ def test_muon_rejects_invalid_ns_variant():
     """ns_variant outside legacy/asym5/custom must raise."""
     with pytest.raises(ValueError, match="ns_variant"):
         Muon([torch.nn.Parameter(torch.ones(2, 2))], ns_variant="unknown")
-
-
-def test_unbatched_ns_preserves_logical_matrix_rank():
-    """A custom NS callback must distinguish a matrix from a one-expert batch."""
-    optimizer = Muon.__new__(Muon)
-    optimizer.batch_ns = False
-    inputs = [torch.ones(2, 4), torch.ones(2, 4), torch.ones(1, 2, 4)]
-    optimizer.zeropower_fn = MagicMock(side_effect=lambda value, steps: value + steps)
-    outputs = optimizer._compute_batched_ns_outputs_for_tensors(inputs, 5)  # pylint: disable=protected-access
-    assert [tuple(call.args[0].shape) for call in optimizer.zeropower_fn.call_args_list] == [
-        (2, 4), (2, 4), (1, 2, 4)]
-    for original, output in zip(inputs, outputs):
-        torch.testing.assert_close(output, original + 5, rtol=0, atol=0)
-
-
-def test_muon_rejects_non_boolean_batch_ns():
-    """Configuration strings must not silently enable NS batching."""
-    with pytest.raises(ValueError, match="batch_ns must be a boolean"):
-        Muon([torch.nn.Parameter(torch.ones(2, 2))], batch_ns="false")
 
 
 def test_muon_rejects_ns_coefficients_without_custom_variant():

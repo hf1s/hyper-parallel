@@ -90,6 +90,30 @@ def two_rank_all_reduce(peer: torch.Tensor) -> Callable[..., None]:
 class TestQKClip(unittest.TestCase):
     """QK clipping applied after the optimizer step must agree across replicas."""
 
+    def test_reference_muon_preserves_logical_rank_locally(self):
+        """Feature: Model-local reference optimizer.
+
+        Description: Build standard and reference policies for the same JT model.
+        Expectation: Only the reference leaf preserves 2D versus one-expert 3D callback inputs.
+        """
+        model = replaced_model(torch.float32)
+        config = {"muon_config": {"lr": 0.0}, "adamw_config": {"adamw_lr": 0.0}}
+        ordinary = jt_optimizer.build_optimizer(model=model, qk_clip_threshold=THRESHOLD, **config)
+        reference = jt_optimizer.build_optimizer(
+            model=model, qk_clip_threshold=THRESHOLD, reference_muon=True, **config)
+        ordinary_leaf = ordinary.get_optimizer().optimizers_dict["muon"]
+        reference_leaf = reference.get_optimizer().optimizers_dict["muon"]
+        self.assertIs(type(ordinary_leaf), jt_optimizer.CoreMuon)
+        self.assertIs(type(reference_leaf), jt_optimizer._JTReferenceMuon)  # pylint: disable=protected-access
+        self.assertFalse(hasattr(ordinary_leaf, "batch_ns"))
+        inputs = [torch.ones(2, 4), torch.ones(2, 4), torch.ones(1, 2, 4)]
+        with patch.object(reference_leaf, "zeropower_fn", side_effect=lambda value, steps: value + steps) as callback:
+            outputs = reference_leaf._compute_batched_ns_outputs_for_tensors(inputs, 5)  # pylint: disable=protected-access
+        self.assertEqual([tuple(call.args[0].shape) for call in callback.call_args_list],
+                         [(2, 4), (2, 4), (1, 2, 4)])
+        for original, output in zip(inputs, outputs):
+            torch.testing.assert_close(output, original + 5, rtol=0, atol=0)
+
     def test_native_attention_is_clipped(self):
         """Feature: QK clipping without optional projection fusion.
 

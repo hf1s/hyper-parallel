@@ -19,13 +19,18 @@
 
 import math
 from functools import partial
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.optim.builders import Muon
-from hyper_parallel.core.optimizer.muon import NSInputTransform
+from hyper_parallel.components.optim.parameter_groups import get_adamw_param_groups, split_muon_adamw_params
+from hyper_parallel.core.optimizer import _build_configured_optimizer, _filter_optimizer_config
+from hyper_parallel.core.optimizer.adamw import AdamW
+from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
+from hyper_parallel.core.optimizer.muon import Muon as CoreMuon, NSInputTransform
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.utils.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Attention,
@@ -58,6 +63,45 @@ def _reference_newton_schulz(inputs: torch.Tensor, steps: int) -> torch.Tensor:
             polynomial = coeff_b * gram.float() + coeff_c * (gram @ gram).float()
         value = (coeff_a * value.float() + (polynomial.bfloat16() @ value).float()).bfloat16()
     return value.mT if transposed else value
+
+
+class _JTReferenceMuon(CoreMuon):
+    """Preserve logical matrix rank only for JT's Graph O1 numerical policy."""
+
+    def _compute_batched_ns_outputs_for_tensors(
+            self, tensor_list, ns_steps, ns_variant="asym5", ns_coefficients=None, ns_epsilon=1e-10):
+        del ns_variant, ns_coefficients, ns_epsilon
+        return [self.zeropower_fn(tensor, steps=ns_steps) for tensor in tensor_list]
+
+
+class _JTReferenceMuonBuilder:
+    """Compose standard AdamW with the JT-local Muon scheduling specialization."""
+
+    def __init__(self, muon_config: dict, adamw_config: dict, model: torch.nn.Module,
+                 extra_adamw_name_keywords: Optional[list[str]] = None,
+                 no_decay_params: Optional[list[str]] = None) -> None:
+        """Reuse shared parameter grouping and compose the JT reference leaf."""
+        self.muon_config, self.adamw_config, self.model = muon_config, adamw_config, model
+        matrices, others, _, _ = split_muon_adamw_params(model, extra_adamw_name_keywords or ())
+        if not matrices:
+            raise ValueError("Muon requires at least one eligible matrix parameter")
+        adamw_groups, _ = get_adamw_param_groups(
+            model, weight_decay=adamw_config.get("adamw_weight_decay", 1e-2),
+            no_decay_params=no_decay_params, allowed_param_ids=[id(parameter) for parameter in others])
+        detect_dtensor_backend(adamw_groups, matrices)
+        optimizers = {}
+        # Reuse the factory's key normalization and defaults; only the Muon class varies.
+        if adamw_groups:
+            optimizers["adamw"] = _build_configured_optimizer(
+                "adamw", AdamW, adamw_groups, _filter_optimizer_config("adamw", AdamW, adamw_config))
+        optimizers["muon"] = _build_configured_optimizer(
+            "muon", _JTReferenceMuon, matrices,
+            _filter_optimizer_config("muon", _JTReferenceMuon, muon_config))
+        self.optimizer = ChainedOptimizer(model, optimizers, flatten=bool(adamw_groups))
+
+    def get_optimizer(self) -> ChainedOptimizer:
+        """Return the standard chained optimizer runtime."""
+        return self.optimizer
 
 
 def _reference_muon_transform(param_name: str, tensor: torch.Tensor, *, config: Any,
@@ -167,7 +211,7 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
 
 
 def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float,
-                    reference_muon: bool = False, **kwargs: Any) -> Muon:
+                    reference_muon: bool = False, **kwargs: Any) -> Union[Muon, _JTReferenceMuonBuilder]:
     """Build public Muon/AdamW and attach the JT-specific post-update hooks.
 
     Args:
@@ -177,7 +221,7 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float,
         **kwargs: Public Muon Builder options from the training recipe.
 
     Returns:
-        The unmodified public Muon Builder.
+        The standard builder, or its JT-local reference specialization.
     """
     if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
         raise ValueError("qk_clip_threshold must be finite and positive")
@@ -190,9 +234,10 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float,
         matched_rms = muon_config.get("matched_adamw_rms", 0.2)
         muon_config.update(
             ns_transform_fn=partial(_reference_muon_transform, config=model.config, matched_adamw_rms=matched_rms),
-            zeropower_fn=_reference_newton_schulz, batch_ns=False,
+            zeropower_fn=_reference_newton_schulz,
             matched_adamw_rms=0.0, zero_rms_scale_mode="use_lr")
-    builder = Muon(model=model, muon_config=muon_config, **{
+    builder_type = _JTReferenceMuonBuilder if reference_muon else Muon
+    builder = builder_type(model=model, muon_config=muon_config, **{
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
     optimizer = builder.get_optimizer()

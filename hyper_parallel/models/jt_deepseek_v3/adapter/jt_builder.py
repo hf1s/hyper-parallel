@@ -40,6 +40,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
     JTDeepseekV3MoE,
 )
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.fsdp import JTFSDP2Manager
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 
@@ -106,7 +107,9 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         distributed_setup, module_replacements=(),
         strategy_config=distributed_setup.strategy_config or FSDP2Config(),
     )
-    planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
+    planner, _ = instantiate_infrastructure(distributed_setup=framework_setup)
+    fsdp = JTFSDP2Manager(
+        framework_setup.strategy_config, mesh, fp32_main_params=framework_setup.fp32_main_params)
     with torch.device("meta"):
         model = JTDeepseekV3ForCausalLM(config)
         model, _ = _apply_module_replacement_actions(

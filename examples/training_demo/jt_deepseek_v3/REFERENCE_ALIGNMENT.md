@@ -40,7 +40,7 @@ Dense 的 `plan_overrides` 额外匹配 `model.layers.0.mlp`，复用已有融�
 
 | 配置或实现 | 作用 |
 | --- | --- |
-| Router / RMSNorm 的 `fsdp_fp32_modules` | FSDP 保留实时 FP32 参数及计算，梯度仍回传，不保存冻结参数副本 |
+| JT 的 `JTFSDP2Manager` | 局部选择 Router / RMSNorm 的 FP32 子单元；复用公共 FSDP 的分片、梯度缩放和预取，不保存冻结参数副本 |
 | FP32 RoPE、融合 SwiGLU、FP32 MoE 概率与残差合并 | 与参考的转换边界一致，减少额外 BF16 舍入 |
 | 原生 Q/KV 下投影 | 分开的 GEMM；此配置不启用 MLA 融合投影替换 |
 | `reset_position_ids: false` | 匹配参考的全局位置；attention 仍按 packed 边界隔离 |
@@ -48,7 +48,7 @@ Dense 的 `plan_overrides` 额外匹配 `model.layers.0.mlp`，复用已有融�
 | `moe_combine_num_partitions: 40` | 复现此次 O1 融合归约的分块求和顺序；默认 1 |
 | `moe_combine_group_size` | 相邻专家先组成 FP32 部分和；默认 1，hidden 3072 的参考配置设为 3，且须整除 top-k |
 | `optimizer.reference_muon: true` | 按逻辑矩阵执行 Muon，匹配 O1 BF16 系数、归一化、乘加顺序及共享缩放；默认关闭 |
-| Muon `batch_ns: false` | 保留每个 NS 回调输入的原始维数，区分二维投影与三维专家；公共优化器默认仍批量执行 |
+| JT 的 `_JTReferenceMuon` | 在参考模式下保留 NS 输入原始维数，区分二维投影与三维专家；公共 Muon 实现和配置接口不变 |
 
 `reference_muon` 使用 legacy 五轮 NS。二维归一化保留 FP32 中间值，三维专家归一化
 保留 BF16 范数边界；二维多项式计算 `(c * A) @ A`，三维计算 `c * (A @ A)`。
@@ -61,6 +61,27 @@ Dense 的 `plan_overrides` 额外匹配 `model.layers.0.mlp`，复用已有融�
 这是显式数值策略，不根据 hidden 或输入数据自动猜测参考编译器的调度。
 本轮只验证上述 4K 单卡结构；不据此声称 256K 或所有并行组合通过。
 
+## 改动范围与 PyNative 参考
+
+对齐代码集中在 `models/jt_deepseek_v3/`。公共 Muon、公共 router、FSDP manager、
+`ModelAdapterSpec` 均恢复到对齐前版本。JT 自己计算路由分数与辅助 loss；
+局部 FSDP manager 只选择精度子单元和策略，仍调用公共实现管理参数、梯度与通信；
+参考 Muon 只重写 NS 张量的调度方法，其更新、状态、分布式通信及 AdamW 继续复用公共实现。
+未开启 `reference_muon` 时仍使用原来的公共 optimizer builder。
+
+审查参考固定为 MF master [`44a47972`](https://github.com/mindspore-ai/mindformers/tree/44a47972f9ebd5ba746433588b99ed2068d419d7)，
+当次读取的 GitHub / AtomGit master 一致：
+
+- [PyNative Router](https://github.com/mindspore-ai/mindformers/blob/44a47972f9ebd5ba746433588b99ed2068d419d7/mindformers/pynative/transformers/moe/router.py)：路由分数及辅助目标属于模块自己的前向逻辑。
+- [PyNative FSDP 组装](https://github.com/mindspore-ai/mindformers/blob/44a47972f9ebd5ba746433588b99ed2068d419d7/mindformers/pynative/base_models/gpt/parallelize.py)：模型组装层选择 wrap 单元和精度策略。
+- [PyNative Muon](https://github.com/mindspore-ai/mindformers/blob/44a47972f9ebd5ba746433588b99ed2068d419d7/mindformers/pynative/optimizer/muon.py)及
+  [布局工具](https://github.com/mindspore-ai/mindformers/blob/44a47972f9ebd5ba746433588b99ed2068d419d7/mindformers/pynative/optimizer/muon_utils.py)：按模型布局拆分逻辑矩阵，求解后恢复。
+
+这里参考职责划分，没有把最新 PyNative 当成旧 Graph O1 的同一数值算法。
+最新 PyNative 使用 FP32 范数及 `clamp(norm, min=eps)`、融合 addmm/baddbmm、逐逻辑块缩放；
+指定 Graph O1 基线的二维/三维归一化、融合舍入和 packed 参数共享缩放不同。
+这些差异只在 JT 的显式参考模式中保留，不改公共优化器来强制复现旧图编译器。
+
 ## 已完成验证
 
 在 910B 上，MF Graph O1 / MindSpore 2.7.2 / CANN 8.5.0 与
@@ -70,6 +91,7 @@ HP / torch、PTA 2.12 / CANN 9.2.0-beta.2 比较：
 - 0 Dense / hidden 5120：首步总 loss 均为 `16.920595169067383`，100 步最大绝对差 `0.0043659210205078125`。
 - 1 Dense / hidden 3072：首步总 loss 均为 `16.338472366333008`，100 步最大绝对差 `0.0038080215454101562`。
 - 两组首步总 loss 完全一致，各分量不要求逐位一致；100 步所有总 loss 绝对差均小于 `0.005`。
+- 公共改动收回 JT 后，两组均重新训练 100 步；各自的 loss 分量、总 loss、梯度范数原始记录与收敛前逐字节相同。
 - 二维及真实专家尺寸 `[8, 1536, 5120]` 的五轮 NS 独立复算与原生参考逐元素一致。
 
 这是已完成的两组训练对比，不承诺其他初始化、数据顺序或环境也达到相同误差。

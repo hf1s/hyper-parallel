@@ -45,7 +45,6 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
 
 class JTDeepseekV3Config(DeepseekV32Config):
@@ -284,7 +283,7 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
 
 
 class JTDeepseekV3Gate(DeepseekV32TopkRouter):
-    """Expose HF gate logits to the public router and the model's auxiliary loss."""
+    """Project live FP32 logits for JT routing and its auxiliary loss."""
 
     keep_compute_in_fp32 = True
 
@@ -325,7 +324,13 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """Select experts, compute the auxiliary sequence-balancing loss and count routed tokens."""
         padding, config = self.padding, self.config
         hidden = hidden[:, padding:]
-        indices, selected, scores = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden, return_scores=True)
+        scores = self.gate(hidden).float().sigmoid()
+        indices = (scores + self.gate.e_score_correction_bias).topk(
+            config.num_experts_per_tok, dim=-1, sorted=False)[1]
+        selected = scores.gather(1, indices)
+        if config.norm_topk_prob:
+            selected = selected / (selected.sum(dim=-1, keepdim=True) + 1e-20)
+        selected = selected * config.routed_scaling_factor
         self.auxiliary_loss = calculate_seq_aux_loss(
             scores, indices, coeff=config.moe_aux_loss_coeff,
             sequence_partition_group=self.sequence_partition_group)
