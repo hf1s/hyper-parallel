@@ -121,6 +121,44 @@ class TestCompleteModel(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "positive integer"):
                 JTDeepseekV3MoE(config)
 
+    def test_grouped_combine_preserves_rounding_and_gradients(self):
+        """Feature: Grouped reference reduction.
+
+        Description: Sum cancellation-sensitive products in two groups of three.
+        Expectation: Group rounding is retained and gradients reach both inputs.
+        """
+        config = small_config()
+        config.moe_combine_group_size = 3
+        moe = JTDeepseekV3MoE(config)
+        values = torch.tensor([[[2**24], [1], [-2**24], [1], [1], [1]]],
+                              dtype=torch.bfloat16, requires_grad=True)
+        probabilities = torch.ones(1, 6, requires_grad=True)
+        actual = moe._combine_experts(values, probabilities)
+        torch.testing.assert_close(actual, torch.tensor([[3.0]], dtype=torch.bfloat16), rtol=0, atol=0)
+        actual.float().sum().backward()
+        torch.testing.assert_close(values.grad, torch.ones_like(values), rtol=0, atol=0)
+        torch.testing.assert_close(probabilities.grad, values.detach().float().squeeze(-1), rtol=0, atol=0)
+
+    def test_grouped_combine_partitions_and_validation(self):
+        """Feature: Grouped reduction partitions and validation.
+
+        Description: Partition grouped work across token boundaries and reject invalid sizes.
+        Expectation: Partitions count groups and unsupported group sizes fail explicitly.
+        """
+        config = small_config()
+        config.moe_combine_group_size = 3
+        config.moe_combine_num_partitions = 4
+        moe = JTDeepseekV3MoE(config)
+        values = torch.tensor([2**24, 1, -2**24], dtype=torch.float32).repeat(7, 4).reshape(7, 12, 1)
+        probabilities = torch.ones(7, 12)
+        torch.testing.assert_close(moe._combine_experts(values, probabilities), torch.zeros(7, 1), rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            moe._combine_experts(values[:, :5], probabilities[:, :5])
+        for invalid in (0, -1, True, 1.5):
+            config.moe_combine_group_size = invalid
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                JTDeepseekV3MoE(config)
+
     def test_precision_units_survive_checkpoint_wrappers(self):
         """Feature: Mixed precision with recomputation.
 

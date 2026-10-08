@@ -306,6 +306,10 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         if (isinstance(self.combine_partitions, bool) or not isinstance(self.combine_partitions, int)
                 or self.combine_partitions < 1):
             raise ValueError("moe_combine_num_partitions must be a positive integer")
+        self.combine_group_size = getattr(config, "moe_combine_group_size", 1)
+        if (isinstance(self.combine_group_size, bool) or not isinstance(self.combine_group_size, int)
+                or self.combine_group_size < 1):
+            raise ValueError("moe_combine_group_size must be a positive integer")
         self.experts = JTDeepseekV3Experts(config)
         self.gate = JTDeepseekV3Gate(config)
         self.shared_experts = DeepseekV32MLP(
@@ -375,20 +379,27 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
     def _combine_experts(self, outputs: torch.Tensor, probabilities: torch.Tensor) -> torch.Tensor:
         """Accumulate FP32 products, optionally reproducing partitioned reference reductions.
 
-        More than one partition is a numerical-validation option: contiguous
-        token-expert work ranges first accumulate locally, then merge their
-        partial sums. A token may cross at most one partition boundary.
+        These numerical-validation options describe the reference reduction
+        schedule. Consecutive expert products first form groups; contiguous
+        token-group ranges accumulate locally before merging partial sums.
+        A token may cross at most one partition boundary. Defaults retain
+        the ordinary FP32 sum without grouping or partition boundaries.
         """
         products = outputs.float() * probabilities.float().unsqueeze(-1)
+        tokens, topk, hidden = products.shape
+        if topk % self.combine_group_size:
+            raise ValueError("moe_combine_group_size must divide the number of selected experts")
+        groups = topk // self.combine_group_size
+        if self.combine_group_size > 1:
+            products = products.reshape(tokens, groups, self.combine_group_size, hidden).sum(2)
         combined = products.sum(1)
         if self.combine_partitions > 1:
-            tokens, topk = probabilities.shape
-            count = tokens * topk
+            count = tokens * groups
             tile = (count + self.combine_partitions - 1) // self.combine_partitions
-            if tile < topk:
+            if tile < groups:
                 raise ValueError("moe_combine_num_partitions cannot exceed the token count")
-            for split in range(1, topk):
-                rows = [boundary // topk for boundary in range(tile, count, tile) if boundary % topk == split]
+            for split in range(1, groups):
+                rows = [boundary // groups for boundary in range(tile, count, tile) if boundary % groups == split]
                 if rows:
                     row_indices = torch.tensor(rows, device=outputs.device, dtype=torch.int64)
                     selected = products[row_indices]

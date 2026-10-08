@@ -1,0 +1,146 @@
+model:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_model
+  config:
+    vocab_size: 152064
+    hidden_size: 3072
+    intermediate_size: 12288
+    moe_intermediate_size: 1536
+    num_hidden_layers: 2
+    num_attention_heads: 128
+    n_shared_experts: 2
+    n_routed_experts: 8
+    routed_scaling_factor: 2.827
+    kv_lora_rank: 512
+    q_lora_rank: 1536
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    qk_nope_head_dim: 128
+    n_group: 1
+    topk_group: 1
+    num_experts_per_tok: 6
+    norm_topk_prob: true
+    hidden_act: silu
+    max_position_embeddings: 262400
+    initializer_range: 0.02
+    rms_norm_eps: 1.0e-06
+    num_nextn_predict_layers: 1
+    mtp_loss_factor: 0.3
+    use_pad_tokens: true
+    moe_aux_loss_coeff: 0.0001
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 0.001
+    attention_dropout: 0.0
+    first_k_dense_replace: 1
+    architectures:
+    - JTDeepseekV3ForCausalLM
+    num_key_value_heads: 128
+    rope_parameters:
+      rope_type: default
+      rope_theta: 5000000
+    rope_interleave: true
+    tie_word_embeddings: false
+    use_cache: false
+    attention_bias: false
+    mlp_bias: false
+    mlp_layer_types:
+    - dense
+    - sparse
+    layer_types:
+    - full_attention
+    - full_attention
+    loss_chunk_size: 0
+    moe_combine_num_partitions: 40
+    moe_combine_group_size: 3
+    mtp_reset_on_document: false
+  reference_weights: /workspace/weights/jt-mf-o1-dense-native
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+model_init_dtype: float32
+plan_overrides:
+- match:
+  - model.layers.0.mlp
+  - model.layers.*.mlp.shared_experts
+  - mtp.layers.*.transformer_layer.mlp.shared_experts
+  module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32MLP
+  exact_type: true
+  replace_module:
+    _target_: hyper_parallel.components.modules.swiglu_mlp.SwiGLUMLP
+training:
+  train_iters: 100
+  lr_scheduler_iters: 23550
+  max_grad_norm: 1.0
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  seed: 42
+  enable_full_determinism: false
+accelerator:
+  tp_size: 1
+  ep_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+activation_checkpoint:
+  mode: full
+activation_swap: none
+dataset:
+  _target_: hyper_parallel.data.indexed.indexed_supervised_dataset.IndexedSupervisedDataset
+  data_path: /workspace/datasets/demo-4k/train
+  sequence_length: 4096
+  model_assets:
+    tokenizer: null
+  data_transform: null
+  packed: true
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_default_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: compressed
+    reset_position_ids: false
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.data.runtime.JTPackedRuntime
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+optimizer:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.build_optimizer
+  fp32_main_params: true
+  reference_muon: true
+  muon_config:
+    lr: 2.4e-05
+    weight_decay: 0.1
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    ns_variant: legacy
+    ns_epsilon: 1.0e-07
+    matched_adamw_rms: 0.2
+  adamw_config:
+    adamw_lr: 2.4e-05
+    adamw_weight_decay: 0.1
+    adamw_betas:
+    - 0.9
+    - 0.95
+    adamw_eps: 1.0e-08
+  qk_clip_threshold: 100.0
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 2.4e-05
+    min_lr: 2.4e-06
+    lr_warmup_steps: 50
+    lr_decay_ratio: 1.0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: /workspace/output/jt-mf-o1/checkpoints

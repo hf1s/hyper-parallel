@@ -6,7 +6,12 @@
 
 ## 使用
 
-复制 `jt_deepseek_v3.mf_o1_single_card.yaml`，修改两处路径：
+选择并复制对应 YAML，修改两处路径：
+
+| YAML | 结构 | hidden |
+| --- | --- | --- |
+| `jt_deepseek_v3.mf_o1_single_card.yaml` | 0 Dense + 1 MoE + 1 MTP | 5120 |
+| `jt_deepseek_v3.mf_o1_dense_single_card.yaml` | 1 Dense + 1 MoE + 1 MTP | 3072 |
 
 - `model.reference_weights`：含 `model.npz` 的目录，权重须匹配当前结构及投影布局。
 - `dataset.data_path`：4K indexed 数据公共前缀，包含 tokens、labels、loss_mask、cu_seqlens 四组 bin/idx。
@@ -24,7 +29,10 @@ torchrun --master_addr=127.0.0.1 --master_port=29972 --nproc_per_node=1 \
   2>&1 | tee /workspace/logs/jt-mf-o1-4k.log
 ```
 
-配置为 0 Dense + 1 MoE + 1 MTP、hidden 5120、8 路由专家、2 共享专家、4K、单卡、100 步。
+两份配置均为 8 路由专家、2 共享专家、4K、单卡、100 步。运行 Dense 版本时替换上述 YAML 路径。
+Dense 版本为容纳新增层只缩小 hidden；vocab、FFN intermediate、MLA 维度、head 数及优化器参数保持一致。
+Dense 的 `plan_overrides` 额外匹配 `model.layers.0.mlp`，复用已有融合 SwiGLU。
+重新初始化或转换对应结构的完整权重，不能直接复用另一份配置的 `model.npz`。
 权重和数据不随源码分发；更换自己的数据可正常训练，但不能据此复现指定参考的逐步 loss。
 构建器会校验权重名称、形状、dtype 和加载后的值，禁止缺失参数被随机初始化。
 
@@ -38,6 +46,7 @@ torchrun --master_addr=127.0.0.1 --master_port=29972 --nproc_per_node=1 \
 | `reset_position_ids: false` | 匹配参考的全局位置；attention 仍按 packed 边界隔离 |
 | `mtp_reset_on_document: false` | 匹配参考的全局 MTP 移位；默认仍在文档内移位 |
 | `moe_combine_num_partitions: 40` | 复现此次 O1 融合归约的分块求和顺序；默认 1 |
+| `moe_combine_group_size` | 相邻专家先组成 FP32 部分和；默认 1，hidden 3072 的参考配置设为 3，且须整除 top-k |
 | `optimizer.reference_muon: true` | 按逻辑矩阵执行 Muon，匹配 O1 BF16 系数、归一化、乘加顺序及共享缩放；默认关闭 |
 | Muon `batch_ns: false` | 保留每个 NS 回调输入的原始维数，区分二维投影与三维专家；公共优化器默认仍批量执行 |
 
@@ -46,8 +55,11 @@ torchrun --master_addr=127.0.0.1 --master_port=29972 --nproc_per_node=1 \
 系数在融合乘加前舍入到 BF16，矩阵乘法输出仍为 BF16。
 
 这是一组显式的数值复现选项，不是跨硬件、跨编译器的逐位一致性保证。
-40 个分块来自已观测的参考内核，其他设备或编译配置需要重新核验。
-本轮仅验证 4K、单卡、0 Dense + 1 MoE + 1 MTP；不据此声称 256K 或所有并行组合通过。
+40 个分块和组大小来自已观测的参考内核，其他设备或编译配置需要重新核验。
+组大小 3 / top-k 6 时计算 `((p0+p1)+p2)+((p3+p4)+p5)`，其中 `pi` 是 FP32 专家输出与概率的乘积；
+分块按 token-group 工作量计算，最终才转回激活 dtype。组大小 1 保持第一份配置的求和顺序。
+这是显式数值策略，不根据 hidden 或输入数据自动猜测参考编译器的调度。
+本轮只验证上述 4K 单卡结构；不据此声称 256K 或所有并行组合通过。
 
 ## 已完成验证
 
@@ -55,9 +67,10 @@ torchrun --master_addr=127.0.0.1 --master_port=29972 --nproc_per_node=1 \
 HP / torch、PTA 2.12 / CANN 9.2.0-beta.2 比较：
 
 - 每步校验 tokens、按 loss_mask 折叠的监督 targets 及 packed 边界，100 步全部相同。
-- 首步总 loss 均为 `16.920595169067383`；首步各分量不要求逐位一致。
-- 100 步最大总 loss 绝对差为 `0.0043659210205078125`，全部小于 `0.005`。
+- 0 Dense / hidden 5120：首步总 loss 均为 `16.920595169067383`，100 步最大绝对差 `0.0043659210205078125`。
+- 1 Dense / hidden 3072：首步总 loss 均为 `16.338472366333008`，100 步最大绝对差 `0.0038080215454101562`。
+- 两组首步总 loss 完全一致，各分量不要求逐位一致；100 步所有总 loss 绝对差均小于 `0.005`。
 - 二维及真实专家尺寸 `[8, 1536, 5120]` 的五轮 NS 独立复算与原生参考逐元素一致。
 
-这是已完成的一组训练对比，不承诺其他初始化、数据顺序或环境也达到相同误差。
+这是已完成的两组训练对比，不承诺其他初始化、数据顺序或环境也达到相同误差。
 参考数据下沉模式下须在模型入口记录实际训练输入，不能把 Dataset 初始化预读当成训练步。
