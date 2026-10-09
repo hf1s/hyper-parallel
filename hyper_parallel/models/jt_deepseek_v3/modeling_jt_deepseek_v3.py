@@ -383,7 +383,10 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.auxiliary_loss = calculate_seq_aux_loss(
             scores, indices, coeff=config.moe_aux_loss_coeff,
             sequence_partition_group=self.sequence_partition_group)
-        counts = torch.bincount(indices.reshape(-1), minlength=config.n_routed_experts).float()
+        flat_indices = indices.reshape(-1)
+        # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
+        counts = flat_indices.new_zeros(config.n_routed_experts, dtype=torch.float32).scatter_add_(
+            0, flat_indices, flat_indices.new_ones(flat_indices.shape, dtype=torch.float32))
         self.tokens_per_expert = counts if self.tokens_per_expert is None else self.tokens_per_expert + counts
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)

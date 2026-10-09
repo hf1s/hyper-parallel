@@ -89,7 +89,10 @@ def calculate_seq_aux_loss(
     num_sequences = scores.shape[:-2].numel()
     slots = selected_experts.reshape(num_sequences, -1)
     offsets = torch.arange(num_sequences, device=slots.device).unsqueeze(-1) * num_experts
-    counts = torch.bincount((slots + offsets).flatten(), minlength=num_sequences * num_experts)
+    index = (slots + offsets).flatten()
+    # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
+    counts = index.new_zeros(num_sequences * num_experts, dtype=torch.float32).scatter_add_(
+        0, index, index.new_ones(index.shape, dtype=torch.float32))
     load = counts.view(num_sequences, num_experts) / slots.shape[-1]
     if sequence_partition_group is not None:
         dist.all_reduce(load, group=sequence_partition_group)
