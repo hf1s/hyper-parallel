@@ -44,7 +44,8 @@ def _get_sequence_parallel_size(mesh_context: Any | None) -> int:
 class TextPackingCollator:
     """Pack unpadded Online text samples and emit ``cu_seq_lens``.
 
-    Only ``input_ids`` and pre-shifted ``labels`` are packed here. Unified
+    Existing per-sample ``cu_seq_lens`` are preserved when packing again.
+    ``input_ids`` and pre-shifted ``labels`` are concatenated here. Unified
     ``get_batch`` constructs loss, position, mask, and CP runtime fields.
     """
 
@@ -82,11 +83,19 @@ class TextPackingCollator:
             packed_batch["input_ids"] = torch.cat((input_ids, input_padding), dim=-1)
             packed_batch["labels"] = torch.cat((packed_batch["labels"], label_padding), dim=-1)
 
-        seq_lens = model_samples[0]["input_ids"].new_tensor(
-            [model_sample["input_ids"].shape[-1] for model_sample in model_samples]
-        )
-        zero = seq_lens.new_zeros(1)
-        seq_ends = seq_lens.cumsum(dim=0)
+        sample_ends = []
+        offset = 0
+        for sample in model_samples:
+            tokens = sample["input_ids"]
+            boundaries = torch.as_tensor(sample.get("cu_seq_lens", [0, tokens.numel()]), device=tokens.device)
+            if (boundaries.dtype not in (torch.int32, torch.int64) or boundaries.ndim != 1
+                    or boundaries.numel() < 2 or boundaries[0] != 0 or boundaries[-1] != tokens.numel()
+                    or torch.any(boundaries[1:] <= boundaries[:-1])):
+                raise ValueError("Sample boundaries must strictly increase from zero to its token count")
+            sample_ends.append(boundaries[1:].to(torch.int64) + offset)
+            offset += tokens.numel()
+        seq_ends = torch.cat(sample_ends)
+        zero = seq_ends.new_zeros(1)
         if pad_len:
             # Represent the alignment tail as one synthetic packed sequence so
             # attention metadata covers every physical Q/KV token. Its labels

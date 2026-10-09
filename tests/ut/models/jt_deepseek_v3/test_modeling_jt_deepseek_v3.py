@@ -15,7 +15,6 @@
 """Complete standalone model construction and optional acceleration boundaries."""
 # pylint: disable=protected-access
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 import unittest
@@ -37,7 +36,7 @@ from hyper_parallel.models.replacement import compile_module_replacements, apply
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from hyper_parallel.trainer.config.parser import parse_training_args
+from tests.common.jt_config import jt_test_config
 from tests.common.mark_utils import arg_mark
 
 
@@ -146,9 +145,7 @@ class TestCompleteModel(unittest.TestCase):
         self.assertEqual(sum(isinstance(m, JTDeepseekV3Attention) for m in previous.values()), 3)
         original_q = model.model.layers[0].self_attn.q_a_proj.weight.detach().clone()
         original_kv = model.model.layers[0].self_attn.kv_a_proj_with_mqa.weight.detach().clone()
-        recipe_path = Path(__file__).resolve().parents[4] / (
-            "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")
-        recipe = parse_training_args([str(recipe_path)])
+        recipe = jt_test_config()
         rules = entries_to_module_replacements(recipe.plan_overrides)
         self.assertEqual(len(rules), 1)
         plan = compile_module_replacements(model, rules)
@@ -170,9 +167,7 @@ class TestCompleteModel(unittest.TestCase):
         Expectation: Every materialized parameter and buffer holds the loaded values exactly.
         """
         config = small_config()
-        recipe_path = Path(__file__).resolve().parents[4] / (
-            "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")
-        rules = entries_to_module_replacements(parse_training_args([str(recipe_path)]).plan_overrides)
+        rules = entries_to_module_replacements(jt_test_config().plan_overrides)
         with torch.device("meta"):
             candidate = JTDeepseekV3ForCausalLM(config)
             plan = compile_module_replacements(candidate, rules)
@@ -217,15 +212,13 @@ class TestCompleteModel(unittest.TestCase):
         )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_native_recipe_config_roundtrip(self):
+    def test_native_config_roundtrip(self):
         """Feature: Native model configuration.
 
-        Description: Build and serialize the recipe's HF configuration without a reference YAML.
+        Description: Build and serialize native JT configuration without an example YAML.
         Expectation: Model dimensions, JT options and independent adapter identity survive.
         """
-        recipe_path = Path(__file__).resolve().parents[4] / (
-            "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")
-        recipe = parse_training_args([str(recipe_path)])
+        recipe = jt_test_config()
         config = JTDeepseekV3Config(**recipe.model.config)
         self.assertIs(type(config), JTDeepseekV3Config)
         self.assertFalse(hasattr(recipe.model, "reference_yaml"))
