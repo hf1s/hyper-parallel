@@ -47,14 +47,16 @@ def calculate_mtp_loss(
         shift_labels: Main LM targets already shifted by one token, as produced
             by the shared text batch; ignored targets hold ``ignore_index``.
         loss_fn: Causal-LM loss with the Transformers ``loss_function``
-            signature, such as a model's ``loss_function`` (``ForCausalLMLoss``,
-            or ``causal_lm_loss_parallel`` under loss parallelism).
+            signature that accepts ``num_items_in_batch``, such as a model's
+            ``loss_function`` (``ForCausalLMLoss``, or ``causal_lm_loss_parallel``
+            under loss parallelism).
         vocab_size: Global vocabulary size.
         loss_factor: Total MTP weight, divided equally across depths.
         ignore_index: Target value excluded from every depth.
 
     Returns:
-        The weighted 0-d MTP loss; zero when no depth is given.
+        The weighted 0-d MTP loss; zero when no depth is given. A depth whose
+        targets are all ``ignore_index`` contributes zero.
 
     Raises:
         ValueError: If a depth's logits are not aligned with ``shift_labels``.
@@ -65,7 +67,10 @@ def calculate_mtp_loss(
         if logits.shape[:-1] != shift_labels.shape:
             raise ValueError("MTP logits must align with shift_labels position by position")
         targets = F.pad(shift_labels[..., depth:], (0, depth), value=ignore_index)
-        depth_loss = loss_fn(logits=logits, labels=None, vocab_size=vocab_size, shift_labels=targets)
+        # Each depth averages over its own valid targets; one without any adds zero instead of 0/0.
+        depth_loss = loss_fn(logits=logits, labels=None, vocab_size=vocab_size, shift_labels=targets,
+                             num_items_in_batch=(targets != ignore_index).sum().clamp_min(1),
+                             ignore_index=ignore_index)
         total = total + depth_loss.reshape(()) * (loss_factor / depths)
     return total
 

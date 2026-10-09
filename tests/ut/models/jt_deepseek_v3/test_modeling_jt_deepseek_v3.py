@@ -274,3 +274,24 @@ class TestCompleteModel(unittest.TestCase):
             model(**(model_inputs | {"attention_mask": torch.ones_like(tokens)}))
         with self.assertRaisesRegex(ValueError, "explicit shift_labels"):
             model(input_ids=tokens, labels=labels)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_row_without_targets_has_zero_lm_and_mtp_losses(self):
+        """Feature: Native Trainer objective contract.
+
+        Description: Forward a row whose shifted labels are all ignored, with two MTP depths.
+        Expectation: The LM and MTP losses are zero instead of NaN, and every gradient stays finite.
+        """
+        torch.manual_seed(5)
+        config = small_config()
+        config.num_nextn_predict_layers = 2
+        model = JTDeepseekV3ForCausalLM(config)
+        tokens = torch.arange(8).unsqueeze(0)
+        losses = model(tokens, torch.full_like(tokens, -100)).loss
+        self.assertEqual(losses["foundation_loss/lm"].item(), 0.0)
+        self.assertEqual(losses["foundation_loss/mtp"].item(), 0.0)
+        sum(losses.values()).backward()
+        for name, parameter in model.named_parameters():
+            if parameter.grad is not None:
+                with self.subTest(parameter=name):
+                    self.assertTrue(torch.isfinite(parameter.grad).all())

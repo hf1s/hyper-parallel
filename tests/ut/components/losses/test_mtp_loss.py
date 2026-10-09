@@ -60,6 +60,23 @@ class TestMultiTokenPredictionLoss(unittest.TestCase):
             calculate_mtp_loss([torch.zeros(1, 4, 7)], torch.zeros(1, 5, dtype=torch.long),
                                ForCausalLMLoss, vocab_size=7)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_depth_without_targets_contributes_zero(self):
+        """Feature: MTP loss.
+
+        Description: Score two depths of a sequence where only depth 1 has a valid target.
+        Expectation: Depth 2 adds zero and receives zero gradient instead of turning the loss into NaN.
+        """
+        generator = torch.Generator().manual_seed(1)
+        logits = [torch.randn(1, 4, 7, generator=generator).requires_grad_() for _ in range(2)]
+        shift_labels = torch.tensor([[-100, 3, -100, -100]])
+
+        loss = calculate_mtp_loss(logits, shift_labels, ForCausalLMLoss, vocab_size=7, loss_factor=0.3)
+        loss.backward()
+
+        torch.testing.assert_close(loss, 0.15 * F.cross_entropy(logits[0][0, :1].detach(), torch.tensor([3])))
+        torch.testing.assert_close(logits[1].grad, torch.zeros_like(logits[1]))
+
 
 if __name__ == "__main__":
     unittest.main()
