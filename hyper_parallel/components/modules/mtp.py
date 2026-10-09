@@ -74,13 +74,14 @@ class MultiTokenPredictionLayer(nn.Module):
         return self.final_layernorm(self.transformer_layer(self.eh_proj(combined), **decoder_kwargs))
 
 
-def shift_mtp_sequence(value: torch.Tensor) -> torch.Tensor:
+def shift_mtp_sequence(value: torch.Tensor, *, pad_value: int = 0) -> torch.Tensor:
     """Shift a global batch/sequence tensor left, padding with zero without wrapping.
 
     Args:
         value: Complete batch/sequence tensor to shift.
+        pad_value: Fill value beyond the global sequence tail.
     """
-    return torch.cat((value[:, 1:], torch.zeros_like(value[:, :1])), dim=1)
+    return torch.cat((value[:, 1:], torch.full_like(value[:, :1], pad_value)), dim=1)
 
 
 @dataclass
@@ -101,28 +102,37 @@ class MultiTokenPrediction(nn.Module):
 
     def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor, *,
                 embedding: nn.Module, head: nn.Module,
-                decoder_kwargs: Mapping[str, Any] | None = None) -> MultiTokenPredictionOutput:
+                decoder_kwargs: Mapping[str, Any] | None = None,
+                shift_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+                sequence_end_mask: torch.Tensor | None = None) -> MultiTokenPredictionOutput:
         """Shift future tokens and run the depths in order, returning each depth's logits.
 
         Args:
             hidden: Main trunk state, before its final output normalization.
-            input_ids: Complete global token IDs, shaped [batch, sequence].
+            input_ids: Local or complete token IDs, shaped [batch, sequence].
             embedding: The main model's shared token embedding; not registered here.
             head: Shared output head.
             decoder_kwargs: Causal attention/position arguments for every decoder.
+            shift_fn: One-token left shift, including partition halos when needed.
+            sequence_end_mask: Document-tail positions whose future embeddings must be zero.
 
         Note:
-            Each row must be one independent, unpartitioned sequence. Packed
-            document boundaries and context-parallel token shifts are not implemented.
+            The default shift treats each row as one unpartitioned sequence. A custom
+            shift and document-tail mask support partitioned or packed inputs.
             Depth ``k`` logits are aligned with the main targets and score the
             token ``k`` positions later; ``calculate_mtp_loss`` applies that shift.
         """
         if input_ids.ndim != 2 or input_ids.numel() == 0:
             raise ValueError("MTP requires nonempty [batch, sequence] global token IDs")
         decoder_kwargs = {} if decoder_kwargs is None else decoder_kwargs
+        if sequence_end_mask is not None and sequence_end_mask.shape != input_ids.shape:
+            raise ValueError("MTP document-tail mask must match input_ids")
+        shift_fn = shift_mtp_sequence if shift_fn is None else shift_fn
         logits = []
         for layer in self.layers:
-            input_ids = shift_mtp_sequence(input_ids)
+            input_ids = shift_fn(input_ids)
+            if sequence_end_mask is not None:
+                input_ids = input_ids.masked_fill(sequence_end_mask, 0)
             hidden = layer(hidden, embedding(input_ids), **decoder_kwargs)
             logits.append(head(hidden))
         return MultiTokenPredictionOutput(tuple(logits), hidden)
