@@ -43,6 +43,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
@@ -96,10 +97,13 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         Returns:
             The rotated channels in half-split order.
         """
-        ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1)
+        # The channel permutation is local to each attention head.
+        local_values = values.to_local() if isinstance(values, DTensor) else values
+        ordered = torch.cat((local_values[..., ::2], local_values[..., 1::2]), dim=-1)
         first, second = ordered.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-        return ordered * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)
+        result = ordered * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)
+        return DTensor.from_local_with_layout(result, values.layout) if isinstance(values, DTensor) else result
 
 
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
@@ -140,8 +144,9 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         actual_seq_qlen=query_lengths, actual_seq_kvlen=key_lengths,
         softmax_layout="TND" if layout == "TND" else "")
     with torch.no_grad():
+        max_logits = result[1].to_local() if isinstance(result[1], DTensor) else result[1]
         # TND kernels otherwise return statistics in NTD order.
-        maximum = result[1].amax(dim=(0, 2) if layout == "TND" else (0, 2, 3))
+        maximum = max_logits.amax(dim=(0, 2) if layout == "TND" else (0, 2, 3))
         if module.max_logits_val is None:
             module.max_logits_val = torch.zeros_like(maximum)
         module.max_logits_val.copy_(torch.maximum(module.max_logits_val, maximum))
@@ -417,7 +422,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
             indices = torch.cat((pad_ids, indices))
-            selected = torch.cat((selected.new_zeros(padding, selected.shape[-1]), selected))
+            selected = torch.cat((selected.new_zeros((padding, selected.shape[-1])), selected))
         return indices, selected
 
     def routing_statistics(self, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
@@ -462,7 +467,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """
         indices, probabilities = self.route(hidden)
         flat = hidden.reshape(-1, hidden.shape[-1])
-        outputs = flat.new_zeros(indices.shape[0], indices.shape[1], flat.shape[-1])
+        outputs = flat.new_zeros((indices.shape[0], indices.shape[1], flat.shape[-1]))
         for expert in range(self.experts.num_experts):
             tokens, slots = torch.where(indices == expert)
             pair = F.linear(flat[tokens], self.experts.gate_up_proj[expert])
@@ -498,7 +503,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """
         hidden = hidden_states
         if self.padding:
-            hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
+            hidden = torch.cat((hidden.new_zeros((1, self.padding, hidden.shape[-1])), hidden), dim=1)
         routed = self.ep_compute(hidden)
         return routed[:, self.padding:] + self.shared_experts(hidden_states)
 
