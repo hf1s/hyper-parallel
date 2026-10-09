@@ -41,6 +41,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3MoE,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import configure_context_parallel
 
 
 def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray]) -> None:
@@ -90,13 +91,13 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
     replica_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()
     # QK clipping must use one maximum on every rank that holds the same attention heads.
     model.qk_clip_group = replica_group
-    # Router statistics: the aux-loss expert fractions average the sequence-parallel shards of one
-    # sequence, and the bias update sums the expert token counts of the global batch.
+    # Bias updates sum unique token counts; auxiliary gradients must also average TP replicas.
     model.expert_load_group = replica_group
     sequence_group = mesh.device_mesh["tp"].get_group() if mesh.sequence_parallel and mesh.tp_size > 1 else None
     for module in model.modules():
         if isinstance(module, JTDeepseekV3MoE):
             module.sequence_partition_group = sequence_group
+            module.auxiliary_loss_group = mesh.device_mesh["tp"].get_group() if mesh.tp_size > 1 else None
 
 
 def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
@@ -113,11 +114,8 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         The sharded JT model.
 
     Raises:
-        ValueError: If context parallelism is enabled or the weights do not match the model.
+        ValueError: If the weights or explicit context-parallel plan do not match the model.
     """
-    if distributed_setup.mesh_context.cp_size > 1:
-        raise ValueError("JT does not support context parallelism: MTP token shifting and its full "
-                         "causal attention require each rank to hold the complete sequence")
     torch_npu.npu.set_compile_mode(jit_compile=False)
     torch.use_deterministic_algorithms(True)
     config = JTDeepseekV3Config(**config)
@@ -155,4 +153,5 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         **infrastructure_options,
     )
     _bind_statistics_groups(model, mesh)
+    configure_context_parallel(model, mesh)
     return model
