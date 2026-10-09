@@ -42,6 +42,11 @@ def _normalize_layernorm_args(input_tensor, normalized_shape, weight=None, bias=
 class NormDistributedOp(DistributedOp):
     """Distributed implementation for RmsNorm operator."""
 
+    @staticmethod
+    def _replicated_layout(reference_layout: Layout, ndim: int) -> Layout:
+        """Represent a plain pure-DP tensor on the DTensor mesh."""
+        return Layout.from_device_mesh(reference_layout.mesh)(*(["None"] * ndim))
+
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
         Preprocess arguments for RmsNorm operator.
@@ -55,9 +60,23 @@ class NormDistributedOp(DistributedOp):
         """
         args, kwargs = _normalize_rmsnorm_args(*args, **kwargs)
         x, gamma, epsilon = args
-        local_args = (x.to_local(), gamma.to_local(), epsilon)
+        x_layout = x._layout if hasattr(x, "_layout") else None
+        gamma_layout = gamma._layout if hasattr(gamma, "_layout") else None
+        if x_layout is None and gamma_layout is None:
+            raise ValueError(
+                f"For {self.op_name}, at least one input must be a DTensor"
+            )
+        if x_layout is None:
+            x_layout = self._replicated_layout(gamma_layout, x.ndim)
+        if gamma_layout is None:
+            gamma_layout = self._replicated_layout(x_layout, gamma.ndim)
+        local_args = (
+            x.to_local() if hasattr(x, "_layout") else x,
+            gamma.to_local() if hasattr(gamma, "_layout") else gamma,
+            epsilon,
+        )
         local_kwargs = {}
-        cache_values = [x.layout, gamma.layout]
+        cache_values = [x_layout, gamma_layout]
         return local_args, local_kwargs, cache_values
 
     def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
@@ -127,6 +146,11 @@ class NormDistributedOp(DistributedOp):
 class LayerNormDistributedOp(DistributedOp):
     """Distributed implementation for torch.nn.functional.layer_norm."""
 
+    @staticmethod
+    def _replicated_layout(reference_layout: Layout, ndim: int) -> Layout:
+        """Represent a plain pure-DP tensor on the DTensor mesh."""
+        return Layout.from_device_mesh(reference_layout.mesh)(*("None" for _ in range(ndim)))
+
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
         Preprocess arguments for layer_norm operator.
@@ -147,8 +171,15 @@ class LayerNormDistributedOp(DistributedOp):
         elif isinstance(normalized_shape, list):
             normalized_shape = tuple(normalized_shape)
 
+        input_layout = input_tensor._layout if hasattr(input_tensor, "_layout") else None
+        weight_layout = weight._layout if weight is not None and hasattr(weight, "_layout") else None
+        bias_layout = bias._layout if bias is not None and hasattr(bias, "_layout") else None
+        reference_layout = input_layout or weight_layout or bias_layout
+        if input_layout is None and reference_layout is not None:
+            input_layout = self._replicated_layout(reference_layout, input_tensor.ndim)
+
         local_args = [
-            input_tensor.to_local(),
+            input_tensor.to_local() if hasattr(input_tensor, "_layout") else input_tensor,
             normalized_shape,
             weight.to_local() if weight is not None and hasattr(weight, 'to_local') else weight,
             bias.to_local() if bias is not None and hasattr(bias, 'to_local') else bias,
@@ -156,7 +187,7 @@ class LayerNormDistributedOp(DistributedOp):
         ]
         local_kwargs = {}
 
-        cache_values = [input_tensor.layout, normalized_shape]
+        cache_values = [input_layout, normalized_shape]
         return tuple(local_args), local_kwargs, cache_values
 
     def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:

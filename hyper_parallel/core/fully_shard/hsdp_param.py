@@ -321,6 +321,8 @@ class HSDPParamV2:
         if (
             isinstance(self.mesh_info, FSDPMeshInfo)
             and self._spmd_shard_mesh_dim is not None
+            # A size-one shard axis owns the complete dimension.
+            and self.mesh_info.shard_mesh_size > 1
         ):
             # If TP/EP already shards the same tensor dimension, fully_shard must
             # use StridedShard so the unified placement preserves the intended
@@ -862,7 +864,8 @@ class HSDPParamV2:
     @property
     def unsharded_param(self) -> nn.Parameter:
         """Return the full unsharded parameter after all-gather."""
-        return self._unsharded_param
+        # Prefetch can allocate storage without materializing this wrapper.
+        return getattr(self, "_unsharded_param", self.sharded_param)
 
     @property
     def unsharded_grad_data(self) -> torch.Tensor:
