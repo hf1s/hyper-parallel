@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
 # pylint: disable-next=forbidden-backend-import
@@ -25,6 +25,34 @@ import torch
 import torch.nn.functional as F
 
 from hyper_parallel.data.constants import IGNORE_INDEX
+
+
+def iter_mtp_targets(
+    shift_labels: torch.Tensor,
+    depths: int,
+    *,
+    ignore_index: int = IGNORE_INDEX,
+    shift_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    sequence_end_mask: torch.Tensor | None = None,
+) -> Iterator[torch.Tensor]:
+    """Yield future targets using the same document and partition boundaries.
+
+    Args:
+        shift_labels: Pre-shifted main LM labels.
+        depths: Number of future prediction depths.
+        ignore_index: Padding label excluded from the loss.
+        shift_fn: One-token shift including partition halos, if needed.
+        sequence_end_mask: Local document tails where future targets are ignored.
+    """
+    if sequence_end_mask is not None and sequence_end_mask.shape != shift_labels.shape:
+        raise ValueError("MTP document-tail mask must match shift_labels")
+    targets = shift_labels
+    for _ in range(depths):
+        targets = (F.pad(targets[..., 1:], (0, 1), value=ignore_index)
+                   if shift_fn is None else shift_fn(targets))
+        if sequence_end_mask is not None:
+            targets = targets.masked_fill(sequence_end_mask, ignore_index)
+        yield targets
 
 
 def calculate_mtp_loss(
@@ -69,16 +97,11 @@ def calculate_mtp_loss(
     """
     total = torch.zeros((), device=shift_labels.device, dtype=torch.float32)
     depths = len(mtp_per_depth_logits)
-    if sequence_end_mask is not None and sequence_end_mask.shape != shift_labels.shape:
-        raise ValueError("MTP document-tail mask must match shift_labels")
-    targets = shift_labels
-    for logits in mtp_per_depth_logits:
+    targets_by_depth = iter_mtp_targets(shift_labels, depths, ignore_index=ignore_index,
+                                        shift_fn=shift_fn, sequence_end_mask=sequence_end_mask)
+    for logits, targets in zip(mtp_per_depth_logits, targets_by_depth):
         if logits.shape[:-1] != shift_labels.shape:
             raise ValueError("MTP logits must align with shift_labels position by position")
-        targets = (F.pad(targets[..., 1:], (0, 1), value=ignore_index)
-                   if shift_fn is None else shift_fn(targets))
-        if sequence_end_mask is not None:
-            targets = targets.masked_fill(sequence_end_mask, ignore_index)
         # Each depth averages over its own valid targets; one without any adds zero instead of 0/0.
         depth_loss = loss_fn(logits=logits, labels=None, vocab_size=vocab_size, shift_labels=targets,
                              num_items_in_batch=(targets != ignore_index).sum().clamp_min(1),

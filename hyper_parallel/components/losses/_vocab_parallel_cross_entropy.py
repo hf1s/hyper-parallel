@@ -189,7 +189,7 @@ def distributed_nll_loss_forward(
     reduction: str,
     vocab_start: int,
     vocab_end: int,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor]:
     """K2: Index target + optional weight + reduction.
 
     Args:
@@ -202,7 +202,7 @@ def distributed_nll_loss_forward(
         vocab_end: End index of this vocab shard.
 
     Returns:
-        Tuple of (loss, total_weight, target_mask, vocab_start_tensor).
+        Tuple of (loss, total_weight).
     """
     batch_size = target.numel()
 
@@ -213,52 +213,21 @@ def distributed_nll_loss_forward(
     ignore_mask = target_flat != ignore_index
     target_mask = target_mask & ignore_mask
 
-    if reduction == "none":
-        loss = torch.zeros(batch_size, dtype=log_probs.dtype, device=log_probs.device)
-    else:
-        loss = torch.zeros(1, dtype=log_probs.dtype, device=log_probs.device)
+    # Fixed-size gathers keep checkpoint recomputation on device: boolean
+    # compaction and Python tests of masks would synchronize every loss chunk.
+    local_target = torch.where(target_mask, target_flat - vocab_start, torch.zeros_like(target_flat))
+    row_indices = torch.arange(batch_size, device=log_probs.device)
+    selected = log_probs.reshape(-1, log_probs.shape[-1])[row_indices, local_target]
+    nll = torch.where(target_mask, -selected, torch.zeros_like(selected))
+    sample_weights = target_mask.to(log_probs.dtype)
+    if weight is not None:
+        safe_target = torch.where(target_mask, target_flat, torch.zeros_like(target_flat))
+        sample_weights = torch.where(target_mask, weight[safe_target], torch.zeros_like(sample_weights))
+        nll = nll * sample_weights
+    total_weight = sample_weights.sum().reshape(1)
+    loss = nll.reshape(target.shape) if reduction == "none" else nll.sum().reshape(1)
 
-    total_weight = torch.zeros(1, dtype=log_probs.dtype, device=log_probs.device)
-
-    if target_mask.any():
-        local_target = target_flat[target_mask] - vocab_start
-
-        log_probs_2d = log_probs.reshape(-1, log_probs.shape[-1])
-
-        row_indices = torch.where(target_mask)[0]
-
-        selected_log_probs = log_probs_2d[row_indices, local_target]
-
-        if weight is not None:
-            global_target = target_flat[target_mask]
-            sample_weights = weight[global_target]
-            selected_log_probs = selected_log_probs * sample_weights
-            total_weight = sample_weights.sum().reshape(1)
-        else:
-            total_weight = torch.tensor(
-                target_mask.sum().item(), dtype=log_probs.dtype, device=log_probs.device
-            ).reshape(1)
-
-        nll = -selected_log_probs
-
-        if reduction == "none":
-            loss_flat = torch.zeros(batch_size, dtype=log_probs.dtype, device=log_probs.device)
-            loss_flat[target_mask] = nll
-            loss = loss_flat.reshape(target.shape)
-        elif reduction == "sum":
-            loss = nll.sum().unsqueeze(0)
-        else:
-            loss = nll.sum().unsqueeze(0)
-    else:
-        if reduction == "none":
-            loss = torch.zeros(
-                batch_size, dtype=log_probs.dtype, device=log_probs.device
-            ).reshape(target.shape)
-        total_weight = torch.zeros(1, dtype=log_probs.dtype, device=log_probs.device)
-
-    return loss, total_weight, target_mask, torch.tensor(
-        vocab_start, dtype=torch.long, device=log_probs.device
-    )
+    return loss, total_weight
 
 
 class _CrossEntropyGradients(NamedTuple):
@@ -281,8 +250,6 @@ class _CrossEntropyContext(NamedTuple):
     target: Tensor
     weight: Optional[Tensor]
     total_weight: Tensor
-    target_mask: Tensor
-    vocab_start_tensor: Tensor
     reduction: str
     ignore_index: int
     vocab_start: int
@@ -324,24 +291,14 @@ def _compute_cross_entropy_gradient(
         in_vocab_mask, target_flat - state.vocab_start, torch.zeros_like(target_flat)
     )
 
-    if in_vocab_mask.any():
-        row_indices = torch.arange(target_flat.numel(), device=state.target.device, dtype=torch.long)
-        if state.reduction == "none":
-            grad_values = -grad_scale
-        else:
-            grad_values = -grad_scale.expand_as(target_flat)
-        if sample_weights is not None:
-            grad_values = grad_values * sample_weights
-        grad_input = grad_input.contiguous()
-        grad_input[row_indices[in_vocab_mask], local_targets[in_vocab_mask]] += grad_values[in_vocab_mask]
-
-    if not ignore_mask.all():
-        if state.reduction == "none":
-            grad_input[~ignore_mask] = 0.0
-        else:
-            ignore_indices_expanded = (~ignore_mask).unsqueeze(-1).expand_as(grad_input)
-            grad_input[ignore_indices_expanded] = 0.0
-    return grad_input
+    row_indices = torch.arange(target_flat.numel(), device=state.target.device, dtype=torch.long)
+    grad_values = -grad_scale if state.reduction == "none" else -grad_scale.expand_as(target_flat)
+    if sample_weights is not None:
+        grad_values = grad_values * sample_weights
+    grad_values = torch.where(in_vocab_mask, grad_values, torch.zeros_like(grad_values))
+    grad_input = grad_input.contiguous()
+    grad_input[row_indices, local_targets] += grad_values
+    return grad_input.masked_fill_(~ignore_mask.unsqueeze(-1), 0.0)
 
 
 class DistributedCrossEntropyFunction(torch.autograd.Function):
@@ -369,7 +326,7 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
         log_probs_local = distributed_log_softmax(
             input_local, dim=-1, mesh=mesh, mesh_dim=mesh_dim
         )
-        nll_result = distributed_nll_loss_forward(
+        loss, total_weight = distributed_nll_loss_forward(
             log_probs_local,
             target,
             weight,
@@ -378,7 +335,6 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
             ctx.vocab_start,
             ctx.vocab_end,
         )
-        loss, total_weight = nll_result[:2]
         if reduction in ("mean", "sum"):
             group = mesh.get_group(mesh_dim)
             loss = _differentiable_all_reduce(loss, op="sum", group=group)
@@ -388,9 +344,7 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
                 )
         if reduction != "mean":
             total_weight = torch.zeros(1, dtype=loss.dtype, device=loss.device)
-        ctx.save_for_backward(
-            log_probs_local, target, weight, total_weight, nll_result[2], nll_result[3]
-        )
+        ctx.save_for_backward(log_probs_local, target, weight, total_weight)
         if reduction == "mean":
             if total_weight.item() == 0:
                 return torch.tensor(float('nan'), dtype=loss.dtype, device=loss.device)

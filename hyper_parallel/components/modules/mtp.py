@@ -90,6 +90,7 @@ class MultiTokenPredictionOutput:
 
     logits: tuple[torch.Tensor, ...]
     hidden_states: torch.Tensor
+    prediction_hidden_states: tuple[torch.Tensor, ...] = ()
 
 
 class MultiTokenPrediction(nn.Module):
@@ -101,7 +102,7 @@ class MultiTokenPrediction(nn.Module):
         self.layers = nn.ModuleList(layers)
 
     def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor, *,
-                embedding: nn.Module, head: nn.Module,
+                embedding: nn.Module, head: nn.Module | None,
                 decoder_kwargs: Mapping[str, Any] | None = None,
                 shift_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
                 sequence_end_mask: torch.Tensor | None = None) -> MultiTokenPredictionOutput:
@@ -111,7 +112,7 @@ class MultiTokenPrediction(nn.Module):
             hidden: Main trunk state, before its final output normalization.
             input_ids: Local or complete token IDs, shaped [batch, sequence].
             embedding: The main model's shared token embedding; not registered here.
-            head: Shared output head.
+            head: Shared output head; None returns hidden states for a chunked loss.
             decoder_kwargs: Causal attention/position arguments for every decoder.
             shift_fn: One-token left shift, including partition halos when needed.
             sequence_end_mask: Document-tail positions whose future embeddings must be zero.
@@ -129,13 +130,17 @@ class MultiTokenPrediction(nn.Module):
             raise ValueError("MTP document-tail mask must match input_ids")
         shift_fn = shift_mtp_sequence if shift_fn is None else shift_fn
         logits = []
+        prediction_hidden_states = []
         for layer in self.layers:
             input_ids = shift_fn(input_ids)
             if sequence_end_mask is not None:
                 input_ids = input_ids.masked_fill(sequence_end_mask, 0)
             hidden = layer(hidden, embedding(input_ids), **decoder_kwargs)
-            logits.append(head(hidden))
-        return MultiTokenPredictionOutput(tuple(logits), hidden)
+            if head is None:
+                prediction_hidden_states.append(hidden)
+            else:
+                logits.append(head(hidden))
+        return MultiTokenPredictionOutput(tuple(logits), hidden, tuple(prediction_hidden_states))
 
 
 class DeepseekV3MTP(MultiTokenPrediction):

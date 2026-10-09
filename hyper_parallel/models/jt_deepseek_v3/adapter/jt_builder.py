@@ -40,6 +40,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
     JTDeepseekV3MoE,
 )
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.fsdp import JTFSDP2Manager
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import configure_context_parallel
 
@@ -91,6 +92,8 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
     replica_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()
     # QK clipping must use one maximum on every rank that holds the same attention heads.
     model.qk_clip_group = replica_group
+    model.loss_sequence_parallel_size = mesh.tp_size if mesh.sequence_parallel else 1
+    model.loss_tp_mesh = mesh.device_mesh["tp"] if mesh.loss_parallel else None
     # Bias updates sum unique token counts; auxiliary gradients must also average TP replicas.
     model.expert_load_group = replica_group
     sequence_group = mesh.device_mesh["tp"].get_group() if mesh.sequence_parallel and mesh.tp_size > 1 else None
@@ -125,7 +128,9 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         distributed_setup, module_replacements=(),
         strategy_config=distributed_setup.strategy_config or FSDP2Config(),
     )
-    planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
+    planner, _ = instantiate_infrastructure(distributed_setup=framework_setup)
+    fsdp = JTFSDP2Manager(
+        framework_setup.strategy_config, mesh, fp32_main_params=framework_setup.fp32_main_params)
     with torch.device("meta"):
         model = JTDeepseekV3ForCausalLM(config)
         model, _ = _apply_module_replacement_actions(

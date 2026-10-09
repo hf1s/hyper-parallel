@@ -37,6 +37,9 @@ def jt_deepseek_v3_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mes
     del mesh, tp_mesh, cp_mesh
     if ep_mesh is None:
         raise ValueError("JT requires an EP mesh")
+    if (getattr(module.config, "moe_combine_num_partitions", 1) != 1
+            or getattr(module.config, "moe_combine_group_size", 1) != 1):
+        raise ValueError("JT reference MoE combine ordering requires EP=1")
     executor = build_ep_compute(
         module,
         ep_mesh,
