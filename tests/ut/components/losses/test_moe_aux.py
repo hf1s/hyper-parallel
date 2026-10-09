@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.components.losses.aux_loss import _replicated_group_mean, calculate_seq_aux_loss
+from hyper_parallel.components.losses.moe_aux import _replicated_group_mean, calculate_seq_aux_loss
 from tests.common.mark_utils import arg_mark
 
 

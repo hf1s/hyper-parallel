@@ -22,7 +22,7 @@ from hyper_parallel.components.losses.chunked_cross_entropy import (
 )
 from hyper_parallel.components.losses.masked_ce import MaskedCrossEntropy
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
-from hyper_parallel.components.losses.aux_loss import calculate_seq_aux_loss
+from hyper_parallel.components.losses.moe_aux import calculate_seq_aux_loss
 from hyper_parallel.components.losses.mtp import calculate_mtp_loss
 
 # FusedLinearCrossEntropy — optional, requires cut_cross_entropy
