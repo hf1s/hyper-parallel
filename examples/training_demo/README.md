@@ -113,6 +113,30 @@ validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
 
+## JT DeepSeek-V3 training demo
+
+The `jt_deepseek_v3/` directory contains the JT DeepSeek-V3 Trainer recipe
+and four 8-rank TP/EP/DP topology variants. The launcher uses the default
+recipe unless `JT_RECIPE_NAME` selects another YAML:
+
+```bash
+bash examples/training_demo/jt_deepseek_v3/run_jt_deepseek_v3.sh \
+    /path/to/jt_initial_weights \
+    /path/to/supervised_prefix
+```
+
+For example, to run the TP8/EP4/DP1 variant:
+
+```bash
+JT_RECIPE_NAME=jt_deepseek_v3.tp8_ep4_dp1.yaml \
+bash examples/training_demo/jt_deepseek_v3/run_jt_deepseek_v3.sh \
+    /path/to/jt_initial_weights \
+    /path/to/supervised_prefix
+```
+
+The launcher uses eight processes and forwards additional typed Trainer
+overrides after the two required data arguments.
+
 ## DeepSeek-V4.1 Engram and shared compressed attention
 
 `deepseek_v41/train_deepseek_v41_online.yaml` is a four-layer, randomly initialized
