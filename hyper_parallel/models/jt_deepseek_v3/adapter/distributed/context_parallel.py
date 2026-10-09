@@ -261,6 +261,8 @@ def configure_context_parallel(model: nn.Module, mesh: Any) -> None:
     """
     if mesh.cp_size <= 1:
         return
+    if getattr(model, "loss_chunk_size", 0):
+        raise ValueError("JT chunked projection loss requires cp_size=1; set loss_chunk_size=0 for CP")
     if getattr(model, "jt_cp_context", None) is not None:
         raise ValueError("JT model context parallelism is already installed")
     attentions = [module for module in model.modules() if isinstance(module, JTDeepseekV3MLAAttention)]
