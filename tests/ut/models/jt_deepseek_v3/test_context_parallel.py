@@ -25,7 +25,7 @@ from torch.nn import functional as F
 
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP
 from hyper_parallel.components.losses import calculate_mtp_loss
-from hyper_parallel.models.jt_deepseek_v3.adapter.data.dataset import JTSequenceRuntime
+from hyper_parallel.models.jt_deepseek_v3.adapter.data.runtime import JTSequenceRuntime
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
 from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
 from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLAContextParallel

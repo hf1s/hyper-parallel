@@ -16,7 +16,6 @@
 # The Transformers config signature is generated dynamically; keyword checks are false positives here.
 # pylint: disable=unexpected-keyword-arg
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -31,15 +30,14 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
 )
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from hyper_parallel.trainer.config.parser import parse_training_args
+from tests.common.jt_config import jt_test_config
 from tests.common.mark_utils import arg_mark
 
 THRESHOLD = 100.0
-RECIPE = Path(__file__).resolve().parents[4] / "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml"
 
 
 def replaced_model(dtype: torch.dtype) -> JTDeepseekV3ForCausalLM:
-    """Build a CPU-sized JT model whose attention uses the recipe's MLA replacement.
+    """Build a CPU-sized JT model whose attention uses the MLA replacement.
 
     Two heads with 4 nope, 4 rope and 4 value channels give 8 projection rows per head.
     """
@@ -56,7 +54,7 @@ def replaced_model(dtype: torch.dtype) -> JTDeepseekV3ForCausalLM:
         moe_router_enable_expert_bias=False)
     config.rope_interleave = True
     model = JTDeepseekV3ForCausalLM(config)
-    rules = entries_to_module_replacements(parse_training_args([str(RECIPE)]).plan_overrides)
+    rules = entries_to_module_replacements(jt_test_config().plan_overrides)
     apply_module_replacements(model, compile_module_replacements(model, rules), weights_mapping=[])
     return model.to(dtype)
 

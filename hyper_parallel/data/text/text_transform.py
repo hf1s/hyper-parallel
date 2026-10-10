@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Transform plaintext and conversation records into model samples."""
+"""Transform plaintext, conversations, and pre-tokenized records into model samples."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import numpy as np
 import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -138,6 +139,73 @@ class TextConversationTransform:
         messages = _get_record_value(sample, self.text_keys)
         is_valid = bool(messages)
         return is_valid
+
+
+@dataclass
+class PreTokenizedSFTTransform:
+    """Convert an already aligned SFT record into one complete model sample.
+
+    Labels must already identify the next-token target at each input position;
+    this transform never tokenizes or shifts labels. Optional cumulative document
+    boundaries include zero and the full record length. Missing boundaries mean
+    one document. Records without supervised targets are omitted. Sequence
+    splitting is a separate offline preparation step, never a training transform.
+
+    Args:
+        input_ids_key: Source field containing token IDs.
+        labels_key: Source field containing pre-shifted labels.
+        boundaries_key: Optional source field containing cumulative boundaries.
+        loss_mask_key: Optional source field containing a binary supervision mask.
+    """
+
+    input_ids_key: str = "input_ids"
+    labels_key: str = "labels"
+    boundaries_key: str = "cu_seqlens"
+    loss_mask_key: str = "loss_mask"
+
+    def _read_record(self, sample: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Validate source fields without changing their token or target semantics."""
+        try:
+            tokens = np.asarray(sample[self.input_ids_key])
+            labels = np.asarray(sample[self.labels_key])
+        except KeyError as error:
+            raise ValueError("SFT records require input IDs and pre-shifted labels") from error
+        boundaries = np.asarray(sample.get(self.boundaries_key, [0, tokens.size]))
+        if any(value.ndim != 1 or value.dtype.kind not in "iu" for value in (tokens, labels, boundaries)):
+            raise ValueError("SFT fields must be one-dimensional integer arrays")
+        if tokens.size == 0 or tokens.shape != labels.shape:
+            raise ValueError("Tokens and pre-shifted labels must have matching nonempty shapes")
+        if (np.any(tokens < 0) or np.any(tokens > np.iinfo(np.int32).max)
+                or np.any((labels < 0) & (labels != IGNORE_INDEX))
+                or np.any(labels > np.iinfo(np.int32).max)):
+            raise ValueError("Token IDs must fit int32; ignored labels must equal -100")
+        if (len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != len(tokens)
+                or np.any(boundaries[1:] <= boundaries[:-1])):
+            raise ValueError("Packed boundaries must strictly increase from zero to token count")
+        # Own labels before folding the mask so Arrow-backed source buffers stay unchanged.
+        labels = labels.astype(np.int64, copy=True)
+        if self.loss_mask_key in sample:
+            mask = np.asarray(sample[self.loss_mask_key])
+            if mask.shape != labels.shape or not np.isin(mask, (0, 1)).all():
+                raise ValueError("SFT loss_mask must be binary and match labels")
+            labels[mask == 0] = IGNORE_INDEX
+        return tokens, labels, boundaries
+
+    def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
+        """Filter wholly unsupervised records before source sampling."""
+        _, labels, _ = self._read_record(sample)
+        return bool(np.any(labels != IGNORE_INDEX))
+
+    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, torch.Tensor]]:
+        """Preserve a full record's tokens, supervision and document boundaries."""
+        tokens, labels, boundaries = self._read_record(sample)
+        if not np.any(labels != IGNORE_INDEX):
+            return []
+        return [{
+            "input_ids": torch.tensor(tokens, dtype=torch.long),
+            "labels": torch.from_numpy(labels),
+            "cu_seq_lens": torch.tensor(boundaries, dtype=torch.int32),
+        }]
 
 
 def build_text_transform(

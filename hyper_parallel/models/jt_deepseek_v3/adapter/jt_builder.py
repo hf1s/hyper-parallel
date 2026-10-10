@@ -91,6 +91,8 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
     replica_group = None if dp_cp_mesh is None or dp_cp_mesh.size() == 1 else dp_cp_mesh.get_group()
     # QK clipping must use one maximum on every rank that holds the same attention heads.
     model.qk_clip_group = replica_group
+    model.loss_sequence_parallel_size = mesh.tp_size if mesh.sequence_parallel else 1
+    model.loss_tp_mesh = mesh.device_mesh["tp"] if mesh.loss_parallel else None
     # Bias updates sum unique token counts; auxiliary gradients must also average TP replicas.
     model.expert_load_group = replica_group
     sequence_group = mesh.device_mesh["tp"].get_group() if mesh.sequence_parallel and mesh.tp_size > 1 else None

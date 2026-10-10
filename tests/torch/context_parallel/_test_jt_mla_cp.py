@@ -19,7 +19,6 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
 import os
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -44,8 +43,8 @@ from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel i
 )
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.trainer.config import Target, entries_to_module_replacements, entries_to_plan_overrides
-from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
+from tests.common.jt_config import jt_test_config
 
 
 def _optimizer(model, recipe):
@@ -69,8 +68,7 @@ def _build_pair(tp, sp, strategy):
                                  tp_size=reference_tp, ep_size=ep,
                                  sequence_parallel=sp, loss_parallel=reference_tp > 1)
     reference_mesh.build_meshs("npu", world)
-    recipe = parse_training_args([str(Path(__file__).resolve().parents[3] /
-                                     "examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.yaml")])
+    recipe = jt_test_config()
     torch.manual_seed(112)
     base = JTDeepseekV3ForCausalLM(JTDeepseekV3Config(**dict(recipe.model.config))).float()
     replacements = entries_to_module_replacements(recipe.plan_overrides)

@@ -12,4 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""JT DeepSeek-V3 runtime inputs from shared packed sequence metadata."""
+"""Launch real two-rank CPU coverage for chunked SP and vocab-parallel CE."""
+
+from pathlib import Path
+
+from tests.common.mark_utils import arg_mark
+from tests.common.distributed_launcher import torchrun_case
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_projected_cross_entropy() -> None:
+    """Two Gloo ranks must match full-vocabulary loss and hidden/head gradients."""
+    worker = str(Path(__file__).with_name("_test_projected_cross_entropy.py"))
+    torchrun_case(worker, "TestParallelCrossEntropy", num_proc=2)
