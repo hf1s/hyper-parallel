@@ -54,6 +54,12 @@ class JTDeepseekV3Config(DeepseekV32Config):
 
     model_type = "jt_deepseek_v3"
 
+    def __post_init__(self, **kwargs: Any) -> None:
+        """Describe JT's full MLA rather than inherited, unexecuted sparse indexers."""
+        super().__post_init__(**kwargs)
+        self.index_topk = 0
+        self.layer_types = ["full_attention"] * self.num_hidden_layers
+
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 
@@ -66,6 +72,7 @@ class JTDeepseekV3Output(ModelOutput):
     # mapping instead of interpreting it as a field iterator.
     logits: torch.Tensor | None = None
     loss: dict[str, torch.Tensor] | None = None
+    loss_metrics: dict[str, torch.Tensor] | None = None
 
 
 class JTDeepseekV3Experts(DeepseekV32Experts):
@@ -656,14 +663,16 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         if use_cache:
             raise ValueError("JT does not support cached decoding")
         # Same rule as the shared text batch's loss mask; JT data folds its 0/1 mask into the labels.
+        loss_metrics = {}
         losses = self.compute_jt_losses(input_ids, shift_labels, shift_labels >= 0, position_ids=position_ids,
-                                        actual_seq_len=actual_seq_len, sequence_start=sequence_start)
+                                        actual_seq_len=actual_seq_len, sequence_start=sequence_start,
+                                        loss_metrics=loss_metrics)
         # ``<token-domain>_loss[/<name>]`` keys: every JT objective is weighted by foundation tokens.
         return JTDeepseekV3Output(loss={
             "foundation_loss/lm": losses["lm_loss"],
             "foundation_loss/mtp": losses["mtp_loss"],
             "foundation_loss/aux": losses["aux_loss"],
-        })
+        }, loss_metrics=loss_metrics)
 
     def _token_loss(self, logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Mean causal-LM loss over targets with a nonzero mask; zero when there are none.
@@ -698,7 +707,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                           loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None,
-                          actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0
+                          actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0,
+                          loss_metrics: dict[str, torch.Tensor] | None = None,
                           ) -> dict[str, torch.Tensor]:
         """Compute the LM, MTP and router auxiliary losses on pre-shifted labels.
 
@@ -709,6 +719,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             position_ids: Optional sequence positions for RoPE.
             actual_seq_len: Global cumulative ends of independent documents.
             sequence_start: Global offset of the local input interval.
+            loss_metrics: Optional output mapping for detached diagnostic losses.
 
         Returns:
             ``lm_loss``, ``mtp_loss`` and ``aux_loss`` as 0-d tensors.
@@ -770,10 +781,19 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             depths = len(mtp_output.prediction_hidden_states)
             targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets,
                                                 sequence_end_mask=sequence_end_mask)
-            for prediction, future_targets in zip(mtp_output.prediction_hidden_states, targets_by_depth):
-                mtp_loss = mtp_loss + self._projection_loss(prediction, future_targets) * (cfg.mtp_loss_factor / depths)
+            for depth, (prediction, future_targets) in enumerate(
+                    zip(mtp_output.prediction_hidden_states, targets_by_depth), start=1):
+                depth_loss = self._projection_loss(prediction, future_targets)
+                mtp_loss = mtp_loss + depth_loss * (cfg.mtp_loss_factor / depths)
+                if loss_metrics is not None:
+                    loss_metrics[f"mtp_{depth}_loss"] = depth_loss.detach()
         else:
             mtp_loss = calculate_mtp_loss(mtp_output.logits, targets, self._mtp_token_loss, vocab_size=cfg.vocab_size,
                                           loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets,
-                                          sequence_end_mask=sequence_end_mask)
+                                          sequence_end_mask=sequence_end_mask, loss_metrics=loss_metrics)
+        if loss_metrics is not None:
+            loss_metrics["lm_loss"] = lm_loss.detach()
+            moe_layers = sum(hasattr(layer.mlp, "auxiliary_loss") for layer in self.model.layers) + len(self.mtp.layers)
+            if cfg.moe_aux_loss_coeff > 0 and moe_layers:
+                loss_metrics["load_balancing_loss"] = auxiliary.detach() / (cfg.moe_aux_loss_coeff * moe_layers)
         return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}

@@ -218,6 +218,14 @@ class _JTTrainingContext:
         # Trainer weights replicas by foundation counts; autograd redistributes those weights
         # before FSDP averages parameter gradients, including ranks with zero local labels.
         output.loss = dict(zip(names, losses.unbind()))
+        metrics = getattr(output, "loss_metrics", None)
+        if metrics:
+            # CE entries are local sums / global target counts; aux is divided by CP.
+            # Restore full-sequence diagnostics before the Trainer averages CP replicas.
+            names = tuple(metrics)
+            values = torch.stack([metrics[name].detach() for name in names])
+            dist.all_reduce(values, op=dist.ReduceOp.SUM, group=self.cp_group)
+            output.loss_metrics = dict(zip(names, values.unbind()))
         return output
 
     def shift_inputs(self, value: torch.Tensor, *, pad_value: int = 0) -> torch.Tensor:
