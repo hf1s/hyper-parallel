@@ -1,0 +1,766 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Public builder for sample-balanced distributed dynamic packing."""
+# This distributed-data package is intentionally PyTorch-only.
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from multiprocessing.context import BaseContext
+from typing import Any, Literal
+
+import torch  # pylint: disable=forbidden-backend-import
+
+from hyper_parallel.distributed_data.batch_sampler import (
+    BatchSamplerReader,
+    preserve_sample,
+    validate_native_sampler,
+)
+from hyper_parallel.distributed_data.data_constructor import (
+    PackingDataConstructor,
+    default_collate_fn,
+    default_pack_fn,
+)
+from hyper_parallel.distributed_data.device_prefetch import _create_device_prefetcher, _resolve_device
+from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm
+from hyper_parallel.distributed_data.cost_model import CostModel
+from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
+from hyper_parallel.distributed_data.external_step import ExternalStepSource
+from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
+from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
+from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
+from hyper_parallel.distributed_data.dataset_reader import _validate_worker_options
+from hyper_parallel.distributed_data.topology import DataTopology
+from hyper_parallel.distributed_data.transport import (
+    DataPlaneTransport,
+    ModelParallelTransport,
+    create_data_groups,
+    synchronize_build_preflight,
+)
+
+_CONFIG_DATALOADER_KWARGS = (
+    "num_workers",
+    "pin_memory",
+    "prefetch_factor",
+    "persistent_workers",
+)
+_OPTIONAL_DATALOADER_KWARGS = frozenset({
+    "in_order",
+    "multiprocessing_context",
+    "pin_memory_device",
+    "timeout",
+    "worker_init_fn",
+})
+_SUPPORTED_DATALOADER_KWARGS = frozenset(_CONFIG_DATALOADER_KWARGS) | _OPTIONAL_DATALOADER_KWARGS
+_MANAGED_DATALOADER_KWARGS = frozenset({
+    "batch_sampler",
+    "batch_size",
+    "collate_fn",
+    "dataset",
+    "drop_last",
+    "generator",
+    "sampler",
+    "shuffle",
+})
+
+
+@dataclass(frozen=True)
+class DistributedDatasetConfig:
+    """Configure sample planning, dynamic packing, and Dataset Reader workers.
+
+    ``seq_len`` and ``local_batch_size`` are the only required sizing inputs.
+    One iterator yield contains ``local_batch_size`` packed sequences on each
+    DP rank. Optimizer gradient accumulation and global batch size remain
+    Trainer concerns.
+
+    Args:
+        seq_len: Maximum token count in one non-oversized packed sequence.
+        local_batch_size: Packed sequences constructed per DP rank and yield.
+        dp_dim_names: Named mesh dimensions that define DP coordinates.
+        balance_group_size: Optional number of DP ranks in each independent
+            local-balancing group. ``None`` preserves launcher/node grouping.
+            This applies only to external-step
+            loading; native ``batch_sampler`` loading remains global.
+        dataset_reader_ranks: Optional Dataset Reader ranks. They read raw
+            samples online or metadata only in metadata mode. Defaults to the
+            Data Constructor ranks.
+        dataset_already_sharded: Legacy sharding configuration flag.
+            Native BatchSampler requires False because it owns DP slicing;
+            external sources manage their own partitioning.
+        planner_rank: Optional centralized Planner rank. Defaults to the lowest
+            Data Constructor rank.
+        oversized_policy: ``error`` by default; ``single`` explicitly permits
+            one oversized sample to occupy a bin alone.
+        drop_last: Whether to drop a tail with fewer than one sample per global
+            packing bin. Only ``True`` is supported in this first version.
+        seed: DataLoader worker seed. Sampling order is configured on the sampler
+            or external step producer.
+        num_workers: PyTorch workers per online Dataset Reader or plan-aware
+            sample loader in metadata mode.
+        pin_memory: Whether sample loader workers pin returned sample memory.
+        prefetch_factor: Samples prefetched by each worker.
+        persistent_workers: Whether workers persist for the loader lifetime.
+        min_balance_gain: Minimum relative improvement in the algorithm's
+            objective. A candidate is accepted only when its gain is strictly
+            greater; zero rejects equal or worse placements.
+        packing_budgets: Optional per-packed-sequence additive hard limits.
+            Each configured stage must
+            occur in every sample's packing_costs. These limits are independent
+            of cost-model balancing scores.
+        communication_backend: Backend for HP data-plane collectives. ``hccl``
+            is the default for NPU training and serializes control objects into
+            accelerator tensors. ``gloo`` keeps control and CPU payload
+            communication on Gloo. HCCL requires an NPU communication device.
+        metadata_mode: Whether metadata is precomputed and available by Dataset
+            index. ``False`` means the Dataset Reader loads samples and calls
+            ``metadata_fn`` during native sampler planning.
+    """
+
+    seq_len: int
+    local_batch_size: int
+    dp_dim_names: tuple[str, ...] | None = None
+    dataset_reader_ranks: tuple[int, ...] | None = None
+    dataset_already_sharded: bool = False
+    planner_rank: int | None = None
+    oversized_policy: OversizedPolicy = "error"
+    drop_last: bool = True
+    seed: int = 1234
+    num_workers: int = 0
+    pin_memory: bool = False
+    prefetch_factor: int | None = None
+    persistent_workers: bool = False
+    min_balance_gain: float = 0.0
+    packing_budgets: dict[str, float] | None = None
+    communication_backend: Literal["gloo", "hccl"] = "hccl"
+    balance_group_size: int | None = None
+    metadata_mode: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate topology-independent configuration boundaries."""
+        self._validate_integer_fields()
+        self._validate_policy_and_flags()
+        _validate_worker_options({name: getattr(self, name) for name in _CONFIG_DATALOADER_KWARGS})
+        self._validate_rank_tuple(self.dataset_reader_ranks, "dataset_reader_ranks")
+        self._validate_name_tuple(self.dp_dim_names, "dp_dim_names")
+        self._validate_planner_rank()
+        PackingConstraints(self.seq_len, self.oversized_policy, self.packing_budgets)
+
+    def _validate_integer_fields(self) -> None:
+        for name in ("seq_len", "local_batch_size"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool) or self.seed < 0:
+            raise ValueError(f"seed must be a non-negative integer, but got {self.seed!r}.")
+        if (
+            self.balance_group_size is not None
+            and (
+                not isinstance(self.balance_group_size, int)
+                or isinstance(self.balance_group_size, bool)
+                or self.balance_group_size < 1
+            )
+        ):
+            raise ValueError("balance_group_size must be a positive integer or None.")
+
+    def _validate_policy_and_flags(self) -> None:
+        if self.oversized_policy not in ("error", "single"):
+            raise ValueError("oversized_policy must be 'error' or 'single'.")
+        for name in (
+                "dataset_already_sharded",
+                "drop_last",
+                "metadata_mode",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean.")
+        if (
+            not isinstance(self.min_balance_gain, (int, float))
+            or isinstance(self.min_balance_gain, bool)
+            or not math.isfinite(self.min_balance_gain)
+            or not 0.0 <= self.min_balance_gain < 1.0
+        ):
+            raise ValueError("min_balance_gain must be in [0, 1).")
+        if self.communication_backend not in ("gloo", "hccl"):
+            raise ValueError("communication_backend must be 'gloo' or 'hccl'.")
+        if not self.drop_last:
+            raise ValueError(
+                "Dynamic distributed packing currently requires drop_last=True so every DP rank receives the "
+                "same number of non-empty packing bins."
+            )
+
+    def _validate_planner_rank(self) -> None:
+        if self.planner_rank is not None and (
+                not isinstance(self.planner_rank, int)
+                or isinstance(self.planner_rank, bool)
+                or self.planner_rank < 0
+        ):
+            raise ValueError("planner_rank must be a non-negative integer or None.")
+
+    @staticmethod
+    def _validate_rank_tuple(value: tuple[int, ...] | None, name: str) -> None:
+        if value is None:
+            return
+        if not isinstance(value, tuple) or not value:
+            raise ValueError(f"{name} must be a non-empty tuple or None.")
+        if any(not isinstance(rank, int) or isinstance(rank, bool) or rank < 0 for rank in value):
+            raise ValueError(f"{name} must contain non-negative integer ranks.")
+        if len(value) != len(set(value)):
+            raise ValueError(f"{name} must not contain duplicate ranks.")
+
+    @staticmethod
+    def _validate_name_tuple(value: tuple[str, ...] | None, name: str) -> None:
+        if value is None:
+            return
+        if not isinstance(value, tuple) or not value or any(not isinstance(item, str) or not item for item in value):
+            raise ValueError(f"{name} must be a non-empty tuple of strings or None.")
+        if len(value) != len(set(value)):
+            raise ValueError(f"{name} must not contain duplicate names.")
+
+
+def _resolve_service_ranks(
+        topology: DataTopology,
+        config: DistributedDatasetConfig,
+) -> tuple[tuple[int, ...], int]:
+    dataset_reader_ranks = config.dataset_reader_ranks or topology.constructor_ranks
+    unknown_ranks = set(dataset_reader_ranks) - set(topology.rank_list)
+    if unknown_ranks:
+        raise ValueError(f"dataset_reader_ranks are outside the root mesh: {sorted(unknown_ranks)}.")
+    planner_rank = min(topology.constructor_ranks) if config.planner_rank is None else config.planner_rank
+    data_plane_ranks = set(dataset_reader_ranks) | set(topology.constructor_ranks)
+    if planner_rank not in data_plane_ranks:
+        raise ValueError(f"planner_rank {planner_rank} must be a Dataset Reader or Data Constructor rank.")
+    return dataset_reader_ranks, planner_rank
+
+
+def _normalize_dataloader_kwargs(
+        config: DistributedDatasetConfig,
+        dataloader_kwargs: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve validated DataLoader execution options."""
+    if dataloader_kwargs is None:
+        supplied_options = {}
+    elif not isinstance(dataloader_kwargs, Mapping):
+        raise ValueError("dataloader_kwargs must be a mapping or None.")
+    else:
+        try:
+            supplied_options = dict(dataloader_kwargs)
+        except Exception as exc:
+            raise ValueError(f"dataloader_kwargs cannot be copied: {exc}") from exc
+    _validate_dataloader_option_keys(supplied_options)
+    options = {name: getattr(config, name) for name in _CONFIG_DATALOADER_KWARGS}
+    options.update(supplied_options)
+    _validate_worker_options(options)
+    _validate_dataloader_timeout(options)
+    worker_init_fn = options.get("worker_init_fn")
+    if worker_init_fn is not None and not callable(worker_init_fn):
+        raise ValueError("dataloader_kwargs worker_init_fn must be callable or None.")
+    _validate_multiprocessing_context(options)
+    pin_memory_device = options.get("pin_memory_device", "")
+    if not isinstance(pin_memory_device, str):
+        raise ValueError("dataloader_kwargs pin_memory_device must be a string.")
+    if options.get("in_order", True) is not True:
+        raise ValueError("dataloader_kwargs in_order must remain True for deterministic sample routing.")
+    return options
+
+
+def _validate_dataloader_option_keys(supplied_options: Mapping[str, Any]) -> None:
+    non_string_keys = [key for key in supplied_options if not isinstance(key, str)]
+    if non_string_keys:
+        raise ValueError(f"dataloader_kwargs keys must be strings, but got {non_string_keys!r}.")
+    managed_keys = sorted(set(supplied_options) & _MANAGED_DATALOADER_KWARGS)
+    if managed_keys:
+        raise ValueError(
+            f"dataloader_kwargs cannot override distributed sampling, batching, collation, or deterministic "
+            f"worker-seeding options "
+            f"{managed_keys}."
+        )
+    unsupported_keys = sorted(set(supplied_options) - _SUPPORTED_DATALOADER_KWARGS)
+    if unsupported_keys:
+        raise ValueError(f"dataloader_kwargs contains unsupported options {unsupported_keys}.")
+
+
+def _validate_dataloader_timeout(options: Mapping[str, Any]) -> None:
+    num_workers = options["num_workers"]
+    timeout = options.get("timeout", 0)
+    try:
+        normalized_timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        normalized_timeout = math.nan
+    if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(normalized_timeout)
+            or normalized_timeout < 0
+    ):
+        raise ValueError(f"dataloader_kwargs timeout must be finite and non-negative, but got {timeout!r}.")
+    if num_workers == 0 and timeout != 0:
+        raise ValueError("dataloader_kwargs timeout must be zero when num_workers=0.")
+
+
+def _validate_multiprocessing_context(options: Mapping[str, Any]) -> None:
+    multiprocessing_context = options.get("multiprocessing_context")
+    if multiprocessing_context is None:
+        return
+    if options["num_workers"] == 0:
+        raise ValueError("dataloader_kwargs multiprocessing_context requires num_workers > 0.")
+    if not isinstance(multiprocessing_context, (str, BaseContext)):
+        raise ValueError("dataloader_kwargs multiprocessing_context is invalid.")
+    start_method = multiprocessing_context
+    if isinstance(multiprocessing_context, BaseContext):
+        try:
+            start_method = multiprocessing_context.get_start_method()
+        except Exception as exc:
+            raise ValueError(
+                f"dataloader_kwargs multiprocessing_context cannot report its start method: {exc}"
+            ) from exc
+    if start_method not in torch.multiprocessing.get_all_start_methods():
+        raise ValueError(f"dataloader_kwargs multiprocessing_context={start_method!r} is not supported.")
+
+
+def _normalize_communication_device(communication_device: Any) -> torch.device | None:
+    """Normalize a rank-local A2A device."""
+    if communication_device is None:
+        return None
+    try:
+        return torch.device(communication_device)
+    except Exception as exc:
+        raise ValueError(f"communication_device is invalid: {communication_device!r}.") from exc
+
+
+class _BuildState:
+    """Validated rank-local components needed to assemble a distributed DataLoader."""
+
+    def __init__(
+            self,
+            dataset: Any | None,
+            mesh: Any,
+            config: DistributedDatasetConfig,
+            metadata_fn: Callable[[Any], SampleMetadata] | None,
+            metadata: Sequence[SampleMetadata] | None,
+            dataloader_kwargs: Mapping[str, Any] | None,
+            pack_fn: Callable[[Sequence[Any], int], Any] | None,
+            collate_fn: Callable[[Sequence[Any]], Any] | None,
+            communication_device: Any,
+            batch_sampler: Any = None,
+            *,
+            model_config: Any = None,
+            cost_model: CostModel | None = None,
+            balancing_algorithm: BalancingAlgorithm | None = None,
+    ) -> None:
+        """Validate inputs and construct all rank-local components.
+
+        Args:
+            dataset: Mapping Dataset on each Reader rank.
+            mesh: Named root device mesh.
+            config: Explicit loading mode, topology and packing options.
+            metadata_fn: Derives metadata from loaded samples in online mode.
+            metadata: Indexed precomputed metadata in metadata mode.
+            dataloader_kwargs: Rank-local sample loading options.
+            pack_fn: Optional packed-sequence constructor.
+            collate_fn: Optional local-batch collator.
+            communication_device: Rank-local control and payload device.
+            batch_sampler: Native sampler defining each local batch.
+            model_config: Backbone dimensions for the default cost model.
+            cost_model: Optional workload estimator.
+            balancing_algorithm: Optional assignment and objective policy.
+        """
+        if not isinstance(config, DistributedDatasetConfig):
+            raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
+        _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
+        normalized_options = _normalize_dataloader_kwargs(
+            config,
+            dataloader_kwargs,
+        )
+        loader_options = {name: normalized_options[name] for name in _CONFIG_DATALOADER_KWARGS}
+        loader_options["dataloader_kwargs"] = {
+            name: value
+            for name, value in normalized_options.items()
+            if name not in _CONFIG_DATALOADER_KWARGS
+        }
+        self.communication_device = _normalize_communication_device(communication_device)
+        effective_pack_fn, effective_collate_fn = _resolve_constructor_callbacks(
+            batch_sampler, pack_fn, collate_fn,
+        )
+        self.topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
+        self.dataset_reader_ranks, self.planner_rank = _resolve_service_ranks(self.topology, config)
+        self.dataset_reader: BatchSamplerReader | None = None
+        self.metadata_reader: BatchSamplerReader | None = None
+        self.direct_sample_loader: PlannedSampleLoader | None = None
+        self.reader_size: int | None = None
+        if batch_sampler is None:
+            if config.metadata_mode:
+                raise ValueError("Metadata mode requires batch_sampler to define step/sample boundaries.")
+            raise ValueError("Online mode requires batch_sampler or external_step_source to define complete steps.")
+        if config.metadata_mode:
+            if metadata_fn is not None:
+                raise ValueError("metadata_mode=True requires precomputed metadata, not metadata_fn.")
+            if metadata is None:
+                raise ValueError("metadata_mode=True requires metadata.")
+        elif metadata is not None:
+            raise ValueError("metadata_mode=False requires metadata_fn, not precomputed metadata.")
+        elif metadata_fn is None:
+            raise ValueError("metadata_mode=False requires metadata_fn.")
+        self._configure_batch_sampler_sources(
+            dataset, metadata_fn, metadata, config, batch_sampler, loader_options,
+        )
+        self.planner, self.constructor = self._build_components(
+            config,
+            effective_pack_fn,
+            effective_collate_fn,
+            model_config,
+            cost_model,
+            balancing_algorithm,
+        )
+
+    @property
+    def is_reader(self) -> bool:
+        """Return whether this rank owns a Dataset Reader."""
+        return self.topology.global_rank in self.dataset_reader_ranks
+
+    def _configure_batch_sampler_sources(
+            self,
+            dataset: Any,
+            metadata_fn: Callable[[Any], SampleMetadata] | None,
+            metadata: Sequence[SampleMetadata] | None,
+            config: DistributedDatasetConfig,
+            batch_sampler: Any,
+            loader_options: dict[str, Any],
+    ) -> None:
+        """Use native DP sampler owners as Readers without applying a second stride."""
+        if self.dataset_reader_ranks != self.topology.constructor_ranks:
+            raise ValueError("Native batch_sampler currently requires Dataset Readers on the Data Constructor ranks.")
+        if config.dataset_already_sharded:
+            raise ValueError(
+                "Native batch_sampler owns DP slicing; disable dataset_already_sharded."
+            )
+        validate_native_sampler(
+            batch_sampler, data_rank=self.topology.data_rank,
+            dp_size=self.topology.data_parallel_size, local_batch_size=config.local_batch_size,
+        )
+        if not self.is_reader:
+            return
+        if dataset is None:
+            raise ValueError("Native batch_sampler requires a mapping Dataset on each Data Constructor.")
+        sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
+        sample_loader.set_epoch(batch_sampler.epoch)
+        self.reader_size = len(dataset)
+        if config.metadata_mode:
+            if not callable(getattr(metadata, "__getitem__", None)) or len(metadata) != len(dataset):
+                raise ValueError("Native batch_sampler metadata must align with the mapping Dataset.")
+            self.direct_sample_loader = sample_loader
+        elif metadata_fn is None:
+            raise ValueError("Native batch_sampler online mode requires metadata_fn.")
+        reader = BatchSamplerReader(
+            batch_sampler, reader_rank=self.topology.global_rank,
+            metadata=metadata, metadata_fn=metadata_fn,
+            sample_loader=None if config.metadata_mode else sample_loader,
+        )
+        if config.metadata_mode:
+            self.metadata_reader = reader
+        else:
+            self.dataset_reader = reader
+
+    def _build_components(
+            self,
+            config: DistributedDatasetConfig,
+            effective_pack_fn: Callable[[Sequence[Any], int], Any],
+            effective_collate_fn: Callable[[Sequence[Any]], Any],
+            model_config: Any,
+            cost_model: CostModel | None,
+            balancing_algorithm: BalancingAlgorithm | None,
+    ) -> tuple[DynamicPackingPlanner, PackingDataConstructor]:
+        """Create the planner and data constructor."""
+        planner = DynamicPackingPlanner(
+            data_parallel_size=self.topology.data_parallel_size,
+            seq_len=config.seq_len,
+            local_batch_size=config.local_batch_size,
+            oversized_policy=config.oversized_policy,
+            packing_budgets=config.packing_budgets,
+            min_balance_gain=config.min_balance_gain,
+            model_config=model_config,
+            cost_model=cost_model,
+            balancing_algorithm=balancing_algorithm,
+        )
+        return planner, PackingDataConstructor(effective_pack_fn, effective_collate_fn, seq_len=config.seq_len)
+
+
+def _validate_builder_callbacks(
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        metadata: Sequence[SampleMetadata] | None,
+        pack_fn: Callable[[Sequence[Any], int], Any] | None,
+        collate_fn: Callable[[Sequence[Any]], Any] | None,
+) -> None:
+    if metadata_fn is not None and not callable(metadata_fn):
+        raise ValueError("metadata_fn must be callable or None.")
+    if metadata_fn is not None and metadata is not None:
+        raise ValueError("Provide either metadata or metadata_fn, but not both.")
+    if pack_fn is not None and not callable(pack_fn):
+        raise ValueError("pack_fn must be callable or None.")
+    if collate_fn is not None and not callable(collate_fn):
+        raise ValueError("collate_fn must be callable or None.")
+
+
+def _resolve_constructor_callbacks(
+        batch_sampler: Any,
+        pack_fn: Callable[[Sequence[Any], int], Any] | None,
+        collate_fn: Callable[[Sequence[Any]], Any] | None,
+) -> tuple[Callable[[Sequence[Any], int], Any], Callable[[Sequence[Any]], Any]]:
+    """Resolve constructor callbacks for the selected source."""
+    effective_pack_fn = default_pack_fn if pack_fn is None else pack_fn
+    if batch_sampler is not None:
+        if pack_fn is not None:
+            raise ValueError("Native batch_sampler preserves Dataset outputs; pack_fn must be omitted.")
+        effective_pack_fn = preserve_sample
+    effective_collate_fn = default_collate_fn if collate_fn is None else collate_fn
+    return effective_pack_fn, effective_collate_fn
+
+
+def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfig) -> None:
+    # Only successfully built local state enters WORLD preflight; local errors
+    # are raised directly by the caller.
+    dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
+    metadata_mode = getattr(config, "metadata_mode", False)
+    synchronize_build_preflight(
+        is_reader=state.is_reader,
+        reader_size=state.reader_size,
+        metadata_mode=metadata_mode,
+        dataset_already_sharded=dataset_already_sharded,
+        communication_backend=getattr(config, "communication_backend", "hccl"),
+        communication_device=state.communication_device,
+    )
+
+
+def build_distributed_dataloader(
+        dataset: Any | None,
+        mesh: Any,
+        config: DistributedDatasetConfig,
+        *,
+        metadata_fn: Callable[[Any], SampleMetadata] | None = None,
+        metadata: Sequence[SampleMetadata] | None = None,
+        dataloader_kwargs: Mapping[str, Any] | None = None,
+        pack_fn: Callable[[Sequence[Any], int], Any] | None = None,
+        collate_fn: Callable[[Sequence[Any]], Any] | None = None,
+        device: Any = None,
+        batch_sampler: Any = None,
+        external_step_source: ExternalStepSource | None = None,
+        model_config: Any = None,
+        cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
+        max_steps: int | None = None,
+) -> DistributedDataLoader | LocalBalancingDataLoader:
+    """Build a sample-balanced distributed DataLoader.
+
+    Online mode without ``batch_sampler`` requires ``external_step_source``.
+    The source emits one complete local step of raw-sample bins. HP derives
+    metadata, freezes the sample union,
+    balances it across Data Constructors, and routes payloads when necessary.
+    Metadata mode requires ``batch_sampler`` to define step/sample boundaries.
+    It looks up ``metadata[index]`` before any Dataset read; target constructors
+    then directly read their assigned indices from the shared Dataset and skip
+    payload A2A. Metadata-only streaming selection is not supported.
+
+    With ``batch_sampler``, native HP sampling owns step selection:
+    one sampler yield per DP Constructor fixes one forward/backward round.
+    Complete Dataset outputs are balanced without repacking their contents.
+
+    Args:
+        dataset: BatchSampler mode requires a shared mapping Dataset
+            on Data Constructor ranks. In external-step mode, the source owns data
+            loading and ``dataset`` may be ``None``. Other ranks may pass the
+            same object or ``None``.
+        mesh: Named root HyperParallel or native DeviceMesh.
+        config: Dynamic packing, service-rank, and worker configuration.
+        metadata_fn: Derives metadata from each Dataset output in
+            ``batch_sampler`` mode or each raw sample emitted by
+            ``external_step_source``.
+        metadata: Precomputed metadata for BatchSampler mode on Dataset Reader ranks
+            when ``config.metadata_mode`` is true. Pass an indexed object with
+            ``__len__`` and ``__getitem__`` explicitly. Entry
+            ``metadata[index]`` must describe the corresponding ``dataset[index]``.
+        dataloader_kwargs: Optional DataLoader execution options. These
+            override the worker options retained in ``config``. Sampling,
+            batching, shuffling, and DataLoader collation remain internally
+            managed and cannot be overridden.
+        pack_fn: Optionally construct one model-specific packed sequence. The
+            default preserves each planned bin as a raw-sample tuple.
+        collate_fn: Optionally collate ``local_batch_size`` packed sequences.
+            The default preserves the bins as a tuple.
+        device: Rank-local training device. Node-local balancing uses
+            it for final H2D and for control/payload tensors when
+            ``communication_backend="hccl"``. Gloo keeps metadata and raw
+            sample communication on the host and defaults to CPU batches;
+            pass an explicit NPU/CUDA device to enable H2D with Gloo.
+        batch_sampler: Optional native HP BatchSampler. Supply the rank-local
+            sampler on every rank; only each DP Constructor advances it. Its
+            next yield fixes local sample membership, with no second stride,
+            shuffle, or dynamic selection. Each Dataset output stays whole in
+            one bin and goes unchanged to ``collate_fn``. Readers must coincide
+            with Constructors, ``drop_last`` must be true, and ``pack_fn`` must
+            be omitted. Metadata entries must describe these Dataset indices,
+            not underlying document indices. Checkpoint through this loader,
+            not through the sampler's speculative prefetch cursor.
+        external_step_source: Source-only API for online mode. It must
+            be an iterable whose next value is one complete local step, represented
+            as ``local_batch_size`` raw-sample bins on every pure-DP rank.
+            HP supplies metadata, payload caching, packing, collation and
+            distributed placement through ``metadata_fn``, ``pack_fn`` and
+            ``collate_fn``. Optional ``set_epoch`` is forwarded to the source;
+            source recovery is managed by the caller, outside this buffered route.
+        model_config: Effective backbone dimensions required when cost_model
+            is omitted. The default cost model is constructed from these dimensions.
+        cost_model: Optional user workload callback replacing the default.
+        balancing_algorithm: Optional assignment and objective policy. Receives
+            already-scored samples; Hyper enforces capacities and the gain gate.
+        max_steps: Local-step step limit, including speculative prefetch.
+
+    Returns:
+        Collective iterator yielding constructed local batches.
+
+    Note:
+        Native sampler checkpoint replay requires a deterministic Dataset stream
+        for a given epoch; arbitrary worker-side RNG state is not captured. Metadata and
+        Dataset lengths must agree across all Data Constructor ranks. Metadata
+        entries must describe deterministic, rank-independent Dataset outputs.
+        An external_step_source uses pure DP, node-local
+        communication and buffered H2D. Every step evaluates a candidate; sample
+        exchange occurs only when its objective improves by more than
+        min_balance_gain. HCCL is the default backend; Gloo transports control
+        and CPU payloads on the host. HCCL transports control and payload
+        tensors on the rank-local NPU.
+        Checkpoint/resume remains available only on the sampler path.
+        The caller must keep topology, configuration and custom policies
+        consistent across ranks and compatible with restored checkpoints.
+    """
+    if external_step_source is not None:
+        if config.metadata_mode:
+            raise ValueError("external_step_source requires metadata_mode=False for online metadata.")
+        if batch_sampler is not None or metadata is not None:
+            raise ValueError("external_step_source cannot be combined with a sampler or metadata sequence.")
+        if dataloader_kwargs:
+            raise ValueError("Configure source worker options on external_step_source, not the balancing wrapper.")
+        return build_local_balancing_dataloader(
+            external_step_source,
+            mesh,
+            config,
+            metadata_fn=metadata_fn,
+            pack_fn=default_pack_fn if pack_fn is None else pack_fn,
+            collate_fn=default_collate_fn if collate_fn is None else collate_fn,
+            model_config=model_config,
+            cost_model=cost_model,
+            balancing_algorithm=balancing_algorithm,
+            device=device,
+            max_steps=max_steps,
+        )
+    return _build_distributed_dataloader_impl(
+        dataset,
+        mesh,
+        config,
+        metadata_fn=metadata_fn,
+        metadata=metadata,
+        dataloader_kwargs=dataloader_kwargs,
+        pack_fn=pack_fn,
+        collate_fn=collate_fn,
+        communication_device=device,
+        batch_sampler=batch_sampler,
+        model_config=model_config,
+        cost_model=cost_model,
+        balancing_algorithm=balancing_algorithm,
+    )
+
+
+def _build_distributed_dataloader_impl(
+        dataset: Any | None,
+        mesh: Any,
+        config: DistributedDatasetConfig,
+        *,
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        metadata: Sequence[SampleMetadata] | None,
+        dataloader_kwargs: Mapping[str, Any] | None,
+        pack_fn: Callable[[Sequence[Any], int], Any] | None,
+        collate_fn: Callable[[Sequence[Any]], Any] | None,
+        communication_device: Any,
+        batch_sampler: Any = None,
+        model_config: Any = None,
+        cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
+) -> DistributedDataLoader:
+    if communication_device is None:
+        communication_device = _resolve_device(communication_backend=getattr(config, "communication_backend", "hccl"))
+    if getattr(config, "balance_group_size", None) is not None:
+        raise ValueError("balance_group_size is only supported for local balancing paths.")
+    state = _BuildState(
+        dataset,
+        mesh,
+        config,
+        metadata_fn,
+        metadata,
+        dataloader_kwargs,
+        pack_fn,
+        collate_fn,
+        communication_device,
+        batch_sampler,
+        model_config=model_config,
+        cost_model=cost_model,
+        balancing_algorithm=balancing_algorithm,
+    )
+    device = _resolve_device(communication_device)
+    device_prefetch = _create_device_prefetcher(device)
+    state.communication_device = device
+
+    _synchronize_build_state(state, config)
+    groups = create_data_groups(
+        state.topology,
+        state.dataset_reader_ranks,
+        state.planner_rank,
+        cpu_backend=config.communication_backend,
+        payload_backend=config.communication_backend,
+        communication_device=(
+            state.communication_device if config.communication_backend == "hccl" else None
+        ),
+        enable_payload_exchange=not config.metadata_mode,
+        model_device=state.communication_device,
+    )
+
+    return DistributedDataLoader(
+        initial_epoch=batch_sampler.epoch,
+        topology=state.topology,
+        dataset_reader_ranks=state.dataset_reader_ranks,
+        dataset_reader=state.dataset_reader,
+        metadata_reader=state.metadata_reader,
+        direct_sample_loader=state.direct_sample_loader,
+        metadata_mode=config.metadata_mode,
+        planner=state.planner,
+        data_constructor=state.constructor,
+        data_plane=DataPlaneTransport(
+            groups,
+            state.topology.global_rank,
+            communication_device=(
+                state.communication_device if config.communication_backend == "hccl" else None
+            ),
+        ),
+        model_transport=ModelParallelTransport(
+            state.topology,
+            groups,
+            communication_device=(
+                state.communication_device if config.communication_backend == "hccl" else None
+            ),
+        ),
+        device_prefetch=device_prefetch if state.topology.is_constructor else None,
+    )
+
+
+__all__ = ["DistributedDatasetConfig", "build_distributed_dataloader"]

@@ -538,6 +538,17 @@ def _normalize_linear_args(x, weight, bias=None):
 class LinearDistributedOp(DistributedOp):
     """Distributed implementation for Linear operator."""
 
+    @staticmethod
+    def _replicated_layout(reference_layout: Layout, ndim: int) -> Layout:
+        """Build a replicated layout for a plain tensor beside a DTensor.
+
+        Pure data parallel execution feeds ordinary tensors into the model,
+        while FSDP exposes managed parameters as DTensors during an unsharded
+        forward.  Linear must model the ordinary activation as replicated so
+        that this mixed pair follows the same layout-inference path.
+        """
+        return Layout.from_device_mesh(reference_layout.mesh)(*(["None"] * ndim))
+
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
         Preprocess arguments for Linear operator.
@@ -553,15 +564,26 @@ class LinearDistributedOp(DistributedOp):
         """
         args, kwargs = _normalize_linear_args(*args, **kwargs)
         x_tensor, w_tensor, bias = args[0], args[1], args[2]
+
+        x_layout = x_tensor._layout if hasattr(x_tensor, "_layout") else None
+        w_layout = w_tensor._layout if hasattr(w_tensor, "_layout") else None
+        if x_layout is None and w_layout is None:
+            raise ValueError(
+                f"For {self.op_name}, at least one input must be a DTensor"
+            )
+        if x_layout is None:
+            x_layout = self._replicated_layout(w_layout, x_tensor.ndim)
+        if w_layout is None:
+            w_layout = self._replicated_layout(x_layout, w_tensor.ndim)
         local_args = (
-            x_tensor.to_local(),
-            w_tensor.to_local(),
+            x_tensor.to_local() if hasattr(x_tensor, "_layout") else x_tensor,
+            w_tensor.to_local() if hasattr(w_tensor, "_layout") else w_tensor,
             bias.to_local() if hasattr(bias, '_layout') else bias,
         )
         local_kwargs = {}
         cache_values = [
-            x_tensor.layout,
-            w_tensor.layout,
+            x_layout,
+            w_layout,
             bias.layout if hasattr(bias, '_layout') else None,
         ]
         return local_args, local_kwargs, cache_values

@@ -357,23 +357,38 @@ class GetItemDistributedOp(DistributedOp):
             )
 
     @staticmethod
-    def _validate_slice_action(action, alias_map, global_shape, op_name="__getitem__"):
+    def _validate_slice_action(
+        action, alias_map, global_shape, op_name="__getitem__", mesh=None
+    ):
         """Validate a slice indexing action."""
         input_dim = action[-1]
         step = action[3]
         step = step if step is not None else 1
 
+        alias = alias_map[input_dim]
+        # A one-element mesh axis is replicated in practice: every rank owns
+        # the complete dimension even though the placement retains its axis
+        # name (for example DP8 uses an ``fsdp_shard`` axis of size one).
+        # Treat it as replicated for local indexing so model-owned fused
+        # parameters can take a prefix view in pure-DP mode.
+        axis_is_replicated = alias == "None"
+        if not axis_is_replicated and mesh is not None:
+            axes = alias if isinstance(alias, tuple) else (alias,)
+            axis_is_replicated = all(
+                mesh.get_device_num_along_axis(axis) == 1
+                for axis in axes
+                if axis != "None"
+            )
         if step != 1:
             raise ValueError(
                 f"For {op_name}, slice step should be 1 or None, "
                 f"but got {step}."
             )
-
-        if not _is_full_slice_action(action, global_shape) and alias_map[input_dim] != "None":
+        if not _is_full_slice_action(action, global_shape) and not axis_is_replicated:
             raise ValueError(
                 f"For {op_name}, non-full slice on non-replicate "
                 f"dim {input_dim} is not supported, "
-                f"but got sharding {alias_map[input_dim]} on dim {input_dim}."
+                f"but got sharding {alias} on dim {input_dim}."
             )
 
     @staticmethod
@@ -434,7 +449,7 @@ class GetItemDistributedOp(DistributedOp):
                 )
             elif action_type == "slice":
                 GetItemDistributedOp._validate_slice_action(
-                    action, alias_map, global_shape, op_name
+                    action, alias_map, global_shape, op_name, self_layout.mesh
                 )
             elif action_type in ("idx_list", "idx_tensor"):
                 GetItemDistributedOp._validate_advanced_action(
