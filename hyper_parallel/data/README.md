@@ -454,3 +454,25 @@ enable_dataset_logging("debug", ranks=None)
 ```
 
 日志覆盖 source、split/blend、Dataset、Sampler、DataLoader 和 parallel batch 形状，不记录样本文本内容。
+
+## Pre-tokenized packed SFT
+
+`hyper_parallel.data.text.text_transform.PreTokenizedSFTTransform` adapts an already prepared record to the shared text
+loader. It preserves token order, pre-shifted labels and internal document
+boundaries. It does not tokenize, split windows, truncate or convert storage.
+The input can use any sequence length, including externally prepared 4K Arrow.
+
+Required columns are integer `input_ids` and aligned `labels` (`-100` means
+ignored). Optional `loss_mask` must be binary and masks labels; optional
+`cu_seqlens` contains strictly increasing boundaries from zero to record length.
+Omitting boundaries means one document. Configure `input_ids_key`, `labels_key`,
+`loss_mask_key` and `boundaries_key` to map other column names.
+
+Use `datasets.load_from_disk` on a local `datasets.save_to_disk` directory,
+`MappingTransformDataset`, this transform, and `build_online_text_collate_fn`.
+`online` is the framework's source category; local Arrow loading needs no network.
+The packing collator preserves internal boundaries before alignment padding.
+`FixedBatchDataLoader` expects each source record to produce one sample: remove
+wholly unsupervised records offline, or use the existing source-filtering path.
+Dataset creation and sequence-length changes belong to
+external offline preparation; no Arrow-to-indexed conversion is required.
