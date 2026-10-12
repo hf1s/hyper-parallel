@@ -43,6 +43,9 @@ from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,
+    collate_indexed_text_sequences,
+    pack_indexed_text_samples,
+    split_packed_text_sample,
 )
 
 logger = get_dataset_logger(__name__)
@@ -154,7 +157,8 @@ def _build_distributed_packing_config(
 
 def _native_text_metadata(sample: Mapping[str, Any]) -> SampleMetadata:
     """Describe a complete GPT output without inferring new attention boundaries."""
-    seq_len = int(sample["tokens"].shape[-1])
+    tokens = sample["tokens"] if "tokens" in sample else sample["input_ids"]
+    seq_len = int(tokens.shape[-1])
     return SampleMetadata(pack_tokens=seq_len, features={"P": seq_len, "D": 0})
 
 
@@ -166,6 +170,20 @@ def _configured_policy(dataloader_target: Any, name: str, supplied: Any, model_c
     if configured is None:
         return None
     return configured.build(model_config=model_config)
+
+
+def _native_packing_callbacks(data_config: Mapping[str, Any], collate_fn: Any) -> dict[str, Any]:
+    """Select text sequence repacking only when explicitly enabled."""
+    repack = data_config.get("repack_sequences", False)
+    if not isinstance(repack, bool):
+        raise ValueError("data_config.repack_sequences must be boolean")
+    if not repack:
+        return {"collate_fn": collate_fn}
+    return {
+        "split_fn": split_packed_text_sample,
+        "pack_fn": pack_indexed_text_samples,
+        "collate_fn": collate_indexed_text_sequences,
+    }
 
 
 def _build_native_sampler_loader(
@@ -219,7 +237,8 @@ def _build_native_sampler_loader(
     return build_distributed_dataloader(
         dataset, mesh_context.device_mesh, config,
         batch_sampler=batch_sampler, metadata_fn=effective_metadata_fn,
-        collate_fn=collate_fn, dataloader_kwargs=worker_kwargs,
+        **_native_packing_callbacks(data_config, collate_fn),
+        dataloader_kwargs=worker_kwargs,
         device=communication_device,
         model_config=model_config,
         cost_model=_configured_policy(dataloader_target, "cost_model", cost_model, model_config),

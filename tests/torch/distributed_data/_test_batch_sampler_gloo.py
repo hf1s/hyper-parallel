@@ -19,12 +19,14 @@ from contextlib import nullcontext
 from datetime import timedelta
 from unittest.mock import patch
 
+import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig, SampleMetadata, WorkloadCost, build_distributed_dataloader,
+    collate_indexed_text_sequences, pack_indexed_text_samples, split_packed_text_sample,
 )
 
 
@@ -159,6 +161,73 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
             for sampler_type, data_sharding in (("single", False), ("cyclic", False), ("cyclic", True)):
                 _run_case(mesh, metadata_mode=metadata_mode, sampler_type=sampler_type, data_sharding=data_sharding)
         _run_cost_balance(mesh)
+        _run_sequence_repacking(mesh)
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+def _check_repacked_tokens(records: list[dict], gathered: list[dict]) -> None:
+    """Check token and target conservation across the two DP representatives."""
+    expected = Counter(
+        (token, label) for record in records
+        for token, label in zip(record["input_ids"].tolist(), record["labels"].tolist())
+    )
+    actual = Counter(
+        (token, label) for rank in (0, 2)
+        for token, label in zip(gathered[rank]["input_ids"][0], gathered[rank]["labels"][0])
+        if token != 0
+    )
+    assert actual == expected, f"Repacking changed selected tokens/labels: actual={actual}, expected={expected}"
+
+
+def _run_sequence_repacking(mesh: object) -> None:
+    """Balance independent sequences with TP replication and per-rank cursor replay."""
+    records = []
+    for index in range(6):
+        lengths = [6, 6] if index % 2 == 0 else [2, 2, 2, 2]
+        ids = torch.arange(index * 20 + 1, index * 20 + sum(lengths) + 1)
+        labels = ids + 1
+        labels[::3] = -100
+        records.append({
+            "input_ids": ids, "labels": labels,
+            "cu_seq_lens": torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()]),
+        })
+
+    def build_loader() -> object:
+        """Build a fresh reader and sampler for checkpoint replay."""
+        return build_distributed_dataloader(
+            records if dist.get_rank() % 2 == 0 else None, mesh,
+            DistributedDatasetConfig(seq_len=12, local_batch_size=1, communication_backend="gloo"),
+            batch_sampler=build_dataset_batch_sampler(
+                total_samples=6, micro_batch_size=1, global_batch_size=2,
+                dp_rank=dist.get_rank() // 2, dp_world_size=2,
+            ),
+            split_fn=split_packed_text_sample, pack_fn=pack_indexed_text_samples,
+            collate_fn=collate_indexed_text_sequences,
+            metadata_fn=lambda sample: SampleMetadata(sample["input_ids"].numel()),
+            cost_model=lambda item: WorkloadCost(llm=item.pack_tokens ** 2),
+        )
+
+    delivered = []
+    with build_loader() as loader:
+        for step, batch in enumerate(loader):
+            serializable = {name: value.tolist() for name, value in batch.items()}
+            delivered.append(serializable)
+            gathered = _gather(serializable)
+            assert gathered[0] == gathered[1] and gathered[2] == gathered[3], (
+                f"TP batch mismatch after sequence repacking: batches={gathered}"
+            )
+            _check_repacked_tokens(records[step * 2:step * 2 + 2], gathered)
+            plan = _gather(loader.last_plan)[0]
+            costs = [cost.llm for cost in plan.rank_costs]
+            assert costs == [44, 44], f"Expected repacked costs [44, 44], got {costs}"
+            if step == 0:
+                saved_state = loader.state_dict()
+                if dist.get_rank() % 2 == 0:
+                    cursor = saved_state["dataset_reader"]["sampler"]["consumed_samples"]
+                    assert cursor == 2, f"Prefetched record progress was saved: cursor={cursor}"
+    with build_loader() as resumed:
+        resumed.load_state_dict(saved_state)
+        remaining = [{name: value.tolist() for name, value in batch.items()} for batch in resumed]
+    assert remaining == delivered[1:], f"Repacked checkpoint replay differs: actual={remaining}"

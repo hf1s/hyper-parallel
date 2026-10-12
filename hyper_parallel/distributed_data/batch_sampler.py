@@ -74,15 +74,19 @@ class BatchSamplerReader:
             metadata: Sequence[SampleMetadata] | None,
             metadata_fn: Callable[[Any], SampleMetadata] | None,
             sample_loader: PlannedSampleLoader | None,
+            split_fn: Callable[[Any], Sequence[Any]] | None = None,
     ) -> None:
         """Store the validated native sampler and metadata/payload sources."""
         if metadata is None and (sample_loader is None or not callable(metadata_fn)):
             raise ValueError("Online BatchSampler Reader requires payload loading and metadata_fn.")
+        if split_fn is not None and (not callable(split_fn) or metadata is not None):
+            raise ValueError("split_fn requires online metadata and must be callable.")
         self._sampler = sampler
         self._reader_rank = reader_rank
         self._metadata = metadata
         self._metadata_fn = metadata_fn
         self._sample_loader = sample_loader
+        self._split_fn = split_fn
         self._sampler.enable_source_batch_resume()
         self._committed_state = copy.deepcopy(sampler.state_dict())
         self._pending_state: dict[str, Any] | None = None
@@ -125,6 +129,8 @@ class BatchSamplerReader:
                 raise ValueError("Native BatchSampler must advance exactly one global local-batch round per yield.")
             if self._metadata is None:
                 self._payloads = self._sample_loader.fetch_keys(keys)
+                if self._split_fn is not None:
+                    keys = self._split_payloads(keys)
                 metadata = [self._metadata_fn(self._payloads[key]) for key in keys]
             else:
                 metadata = [self._metadata[key.dataset_index] for key in keys]
@@ -138,6 +144,17 @@ class BatchSamplerReader:
             # A user callback's StopIteration must not masquerade as dataset EOF.
             raise RuntimeError(f"Native BatchSampler callback raised StopIteration: {exc}") from exc
         return None
+
+    def _split_payloads(self, keys: Sequence[SampleKey]) -> tuple[SampleKey, ...]:
+        payloads = {}
+        for key in keys:
+            sequences = tuple(self._split_fn(self._payloads[key]))
+            if not sequences:
+                raise ValueError("split_fn must return at least one independent sequence per Dataset output.")
+            for index, sequence in enumerate(sequences):
+                payloads[replace(key, sequence_index=index)] = sequence
+        self._payloads = payloads
+        return tuple(payloads)
 
     def _sample_keys(self, indices: Sequence[int]) -> tuple[SampleKey, ...]:
         if len(indices) != self._sampler.micro_batch_size:

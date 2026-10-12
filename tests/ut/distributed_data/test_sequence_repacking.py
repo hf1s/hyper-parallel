@@ -1,0 +1,242 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Native packed-record decomposition, TND semantics and committed-cursor replay."""
+
+import copy
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+
+from datasets import Dataset
+import torch
+from torch.nn import functional
+
+from hyper_parallel.data.batching import TextParallelBatch
+from hyper_parallel.data.batching.build_dataloader import build_dataloader
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
+from hyper_parallel.distributed_data import (
+    DistributedDatasetConfig, SampleKey, SampleMetadata, WorkloadCost, build_distributed_dataloader,
+    collate_indexed_text_sequences, pack_indexed_text_samples, split_packed_text_sample,
+)
+from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
+from hyper_parallel.models.jt_deepseek_v3.adapter.data.dataset import JTSequenceRuntime
+from hyper_parallel.models.jt_deepseek_v3.adapter.data.packed_dataset import PackedSupervisedDataset
+from tests.common.mark_utils import arg_mark
+
+
+_MESH = SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
+
+
+def _record(lengths: list[int], offset: int = 1) -> dict:
+    count = sum(lengths)
+    labels = torch.arange(offset + 1, offset + count + 1)
+    labels[::3] = -100
+    return {
+        "input_ids": torch.arange(offset, offset + count),
+        "labels": labels,
+        "cu_seq_lens": torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()]),
+    }
+
+
+def _metadata(sample: dict) -> SampleMetadata:
+    length = sample["input_ids"].numel()
+    return SampleMetadata(length, cost=WorkloadCost(llm=length ** 2), features={"P": length, "D": 0})
+
+
+def _loader(records: list[dict], **kwargs: object) -> object:
+    return build_distributed_dataloader(
+        records, _MESH, DistributedDatasetConfig(seq_len=12, local_batch_size=1),
+        batch_sampler=build_dataset_batch_sampler(
+            total_samples=len(records), micro_batch_size=1, global_batch_size=1, dp_rank=0, dp_world_size=1,
+            index_mapping=[0] * len(records),
+        ),
+        metadata_fn=_metadata, split_fn=split_packed_text_sample, pack_fn=pack_indexed_text_samples,
+        collate_fn=collate_indexed_text_sequences, device="cpu", cost_model=lambda metadata: metadata.cost,
+        **kwargs,
+    )
+
+
+def _attention_loss(records: list[dict], weights: torch.Tensor) -> torch.Tensor:
+    losses = []
+    for record in records:
+        ids = record["input_ids"].reshape(-1)
+        labels = record["labels"].reshape(-1)
+        offsets = record["cu_seq_lens"].tolist()
+        positions = torch.arange(ids.numel())
+        documents = torch.bucketize(positions, torch.tensor(offsets[1:]), right=True)
+        allowed = (documents[:, None] == documents[None, :]) & (positions[:, None] >= positions[None, :])
+        hidden = weights[ids]
+        scores = (hidden @ hidden.T) / hidden.shape[-1] ** 0.5
+        output = scores.masked_fill(~allowed, float("-inf")).softmax(dim=-1) @ hidden
+        token_losses = functional.cross_entropy(output @ weights.T, labels, ignore_index=-100, reduction="none")
+        losses.append(token_losses[labels >= 0])
+    return torch.cat(losses).mean()
+
+
+class TestSequenceRepacking(unittest.TestCase):
+    """Exercise the real reader, planner, constructors and checkpoint entry points."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_repeated_record_indices_keep_distinct_sequence_occurrences(self) -> None:
+        """Feature: Repeated record sampling.
+        Description: Select the same packed record twice in one native round.
+        Expectation: Both occurrences retain their own sequence keys and payloads.
+        """
+        record = _record([4, 8])
+        sampler = build_dataset_batch_sampler(
+            total_samples=2, micro_batch_size=2, global_batch_size=2, dp_rank=0, dp_world_size=1,
+            index_mapping=[0, 0],
+        )
+        with build_distributed_dataloader(
+            [record], _MESH, DistributedDatasetConfig(seq_len=12, local_batch_size=2),
+            batch_sampler=sampler, metadata_fn=_metadata, split_fn=split_packed_text_sample,
+            pack_fn=pack_indexed_text_samples, collate_fn=collate_indexed_text_sequences,
+            device="cpu", cost_model=lambda item: item.cost,
+        ) as loader:
+            batch = next(loader)
+            keys = loader.last_plan.selected_keys
+            self.assertEqual({(key.dataset_index, key.global_sample_position, key.sequence_index) for key in keys},
+                             {(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1)})
+            torch.testing.assert_close(batch["labels"], record["labels"].repeat(2, 1))
+            self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 2)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_repacking_preserves_masked_attention_loss_and_gradients(self) -> None:
+        """Feature: Independent sequence repacking.
+        Description: Redistribute unequal records and compare a causal attention model's gradients.
+        Expectation: Rank costs improve while token targets, loss and gradients are conserved.
+        """
+        records = [_record([6, 6]), _record([2, 2, 2, 2], offset=13)]
+        payloads, metadata, reference = {}, [], []
+        for index, record in enumerate(records):
+            keys = []
+            for sequence_index, sample in enumerate(split_packed_text_sample(record)):
+                key = SampleKey(index, index, index, sequence_index)
+                item = _metadata(sample)
+                metadata.append(SampleMetadata(item.pack_tokens, cost=item.cost, key=key))
+                payloads[key] = sample
+                keys.append(key)
+            reference.append(keys)
+        planner = DynamicPackingPlanner(
+            data_parallel_size=2, local_batch_size=1, seq_len=12, cost_model=lambda item: item.cost,
+        )
+        plan = planner.plan(metadata, reference_bins=reference, step=0)
+        self.assertEqual([cost.llm for cost in plan.rank_costs], [44, 44])
+        repacked = [pack_indexed_text_samples([payloads[key] for key in plan.local_sample_keys(rank)], 12)
+                    for rank in range(2)]
+        torch.manual_seed(7)
+        reference_weights = torch.randn(32, 5, dtype=torch.float64, requires_grad=True)
+        balanced_weights = reference_weights.detach().clone().requires_grad_()
+        reference_loss = _attention_loss(records, reference_weights)
+        balanced_loss = _attention_loss(repacked, balanced_weights)
+        reference_loss.backward()
+        balanced_loss.backward()
+        torch.testing.assert_close(balanced_loss, reference_loss, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(balanced_weights.grad, reference_weights.grad, rtol=1e-12, atol=1e-12)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_no_gain_replays_original_grouping_and_committed_cursor(self) -> None:
+        """Feature: Native-round checkpoint replay.
+        Description: Prefetch repeated records and resume after one delivered batch.
+        Expectation: Original grouping and targets survive; saved progress excludes the next round.
+        """
+        records = [_record([4, 8])] * 3
+        with _loader(records) as loader:
+            first = next(loader)
+            loader.wait_for_prefetch()
+            state = copy.deepcopy(loader.state_dict())
+            self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 1)
+            self.assertEqual(first["cu_seq_lens"].tolist(), [0, 4, 12])
+            self.assertEqual([key.sequence_index for key in loader.last_plan.selected_keys], [0, 1])
+            torch.testing.assert_close(first["labels"][0], records[0]["labels"])
+            expected = list(loader)
+            loader.set_epoch(1)
+            self.assertEqual(next(loader)["cu_seq_lens"].tolist(), [0, 4, 12])
+        with _loader(records) as resumed:
+            resumed.load_state_dict(state)
+            actual = list(resumed)
+        self.assertEqual(len(actual), 2)
+        for left, right in zip(actual, expected):
+            for field in left:
+                torch.testing.assert_close(left[field], right[field], rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_explicit_boundaries_and_online_mode_are_required(self) -> None:
+        """Feature: Repacking input contract.
+        Description: Supply invalid boundaries and incompatible callback combinations.
+        Expectation: Invalid inputs fail directly before producing a training batch.
+        """
+        record = _record([4, 8])
+        for boundaries in ([1, 12], [0, 4, 4, 12], [0, 13], [0., 12.]):
+            with self.subTest(boundaries=boundaries), self.assertRaisesRegex(ValueError, "cu_seq_lens"):
+                split_packed_text_sample({**record, "cu_seq_lens": boundaries})
+        with self.assertRaises(KeyError):
+            split_packed_text_sample({key: value for key, value in record.items() if key != "cu_seq_lens"})
+        sampler = build_dataset_batch_sampler(
+            total_samples=1, micro_batch_size=1, global_batch_size=1, dp_rank=0, dp_world_size=1,
+        )
+        with self.assertRaisesRegex(ValueError, "online metadata"):
+            build_distributed_dataloader(
+                [record], _MESH, DistributedDatasetConfig(seq_len=12, local_batch_size=1, metadata_mode=True),
+                batch_sampler=sampler, metadata=[SampleMetadata(12)], split_fn=split_packed_text_sample,
+                pack_fn=pack_indexed_text_samples, device="cpu",
+            )
+        with self.assertRaisesRegex(ValueError, "requires pack_fn"):
+            build_distributed_dataloader(
+                [record], _MESH, DistributedDatasetConfig(seq_len=12, local_batch_size=1),
+                batch_sampler=sampler, metadata_fn=_metadata, split_fn=split_packed_text_sample, device="cpu",
+            )
+        with build_distributed_dataloader(
+            [record], _MESH, DistributedDatasetConfig(seq_len=12, local_batch_size=1),
+            batch_sampler=sampler, metadata_fn=_metadata, split_fn=lambda _: (),
+            pack_fn=pack_indexed_text_samples, device="cpu", cost_model=lambda item: item.cost,
+        ) as loader:
+            with self.assertRaisesRegex(ValueError, "at least one independent sequence"):
+                next(loader)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_saved_arrow_through_trainer_builder_preserves_jt_boundaries(self) -> None:
+        """Feature: Offline packed Arrow integration.
+        Description: Build the native loader and shared text adapter from stored packed records.
+        Expectation: JT receives exact cumulative ends, reset positions and pre-shifted labels.
+        """
+        record = _record([4, 8])
+        with TemporaryDirectory() as directory:
+            Dataset.from_dict({
+                "input_ids": [record["input_ids"].tolist()], "labels": [record["labels"].tolist()],
+                "cu_seqlens": [record["cu_seq_lens"].tolist()],
+            }).save_to_disk(directory)
+            config = {"seq_length": 12, "load_balance": "native_batch_sampler", "repack_sequences": True}
+            dataset = PackedSupervisedDataset(directory, sequence_length=12, data_config=config)
+            context = SimpleNamespace(
+                dp_rank=0, dp_size=1, tp_size=1, cp_size=1, pp_size=1, device_mesh=_MESH,
+            )
+            target = SimpleNamespace(dataloader_type="single", num_workers=0)
+            loaders, _ = build_dataloader(
+                target, datasets=(dataset, None, None), collate_fn=tuple, mesh_context=context,
+                training_config=SimpleNamespace(micro_batch_size=1, global_batch_size=1, seed=7),
+                data_config=config, cost_model=lambda metadata: WorkloadCost(llm=metadata.pack_tokens ** 2),
+            )
+            batch_context = SimpleNamespace(**{**vars(context), "device_mesh": None})
+            batch_adapter = TextParallelBatch(
+                batch_context, torch.device("cpu"), None, {"create_attention_mask_in_dataloader": True}, False,
+                source_type="indexed_source",
+                attention_mode="compressed", reset_position_ids=True, runtime_input_adapter=JTSequenceRuntime(),
+            )
+            with loaders[0] as loader:
+                model, loss = batch_adapter(loader)
+            self.assertEqual(model["actual_seq_len"], (4, 12))
+            self.assertEqual(model["position_ids"].tolist(), [[0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7]])
+            torch.testing.assert_close(loss["shift_labels"][0], record["labels"])

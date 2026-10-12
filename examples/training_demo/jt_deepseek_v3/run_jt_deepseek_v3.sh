@@ -24,7 +24,7 @@ RECIPE_BASENAME=${RECIPE_NAME##*/}
 CONFIG_FILE="${SCRIPT_DIR}/${RECIPE_NAME}"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 /path/to/jt_initial_weights /path/to/supervised_prefix [trainer overrides...]" >&2
+    echo "Usage: $0 /path/to/jt_initial_weights /path/to/dataset_prefix_or_packed_directory [trainer overrides...]" >&2
     echo "Set JT_RECIPE_NAME to select a recipe in ${SCRIPT_DIR}." >&2
     exit 1
 fi
@@ -36,14 +36,23 @@ if [[ ! -s "${REFERENCE_WEIGHTS}/model.npz" ]]; then
     echo "Converted reference weights are missing or empty: ${REFERENCE_WEIGHTS}/model.npz" >&2
     exit 1
 fi
-for STREAM in tokens labels loss_mask; do
-    for EXTENSION in bin idx; do
-        if [[ ! -s "${DATA_PATH}.${STREAM}.${EXTENSION}" ]]; then
-            echo "Indexed dataset file is missing or empty: ${DATA_PATH}.${STREAM}.${EXTENSION}" >&2
+if [[ -d "${DATA_PATH}" ]]; then
+    for METADATA_FILE in state.json dataset_info.json; do
+        if [[ ! -s "${DATA_PATH}/${METADATA_FILE}" ]]; then
+            echo "Packed Dataset metadata is missing or empty: ${DATA_PATH}/${METADATA_FILE}" >&2
             exit 1
         fi
     done
-done
+else
+    for STREAM in tokens labels loss_mask; do
+        for EXTENSION in bin idx; do
+            if [[ ! -s "${DATA_PATH}.${STREAM}.${EXTENSION}" ]]; then
+                echo "Indexed dataset file is missing or empty: ${DATA_PATH}.${STREAM}.${EXTENSION}" >&2
+                exit 1
+            fi
+        done
+    done
+fi
 if [[ ! -s "${CONFIG_FILE}" ]]; then
     echo "Recipe does not exist: ${CONFIG_FILE}" >&2
     exit 1

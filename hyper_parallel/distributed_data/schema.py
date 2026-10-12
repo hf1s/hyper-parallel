@@ -186,15 +186,18 @@ class SampleKey:
     ``global_sample_position`` identifies an occurrence in the source stream.
     Native samplers and Dataset Readers use global stream positions; local
     step sources use a rank-local position within the step.
+    ``sequence_index`` identifies an independent sequence inside a selected
+    packed record; whole-record loading leaves it at zero.
     """
 
     reader_rank: int
     dataset_index: int
     global_sample_position: int = 0
+    sequence_index: int = 0
 
     def __post_init__(self) -> None:
         """Validate non-negative routing coordinates."""
-        for name in ("reader_rank", "dataset_index", "global_sample_position"):
+        for name in ("reader_rank", "dataset_index", "global_sample_position", "sequence_index"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"SampleKey.{name} must be a non-negative integer, but got {value!r}.")

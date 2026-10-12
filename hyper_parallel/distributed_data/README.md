@@ -212,16 +212,16 @@ peers use a separate HCCL/NCCL tensor-broadcast group when needed.
 
 Current boundaries of the native-sampler path:
 
-- `dataset[index]` stays **whole**. Native GPT cross-document slicing, shifted
-  labels, loss masks, and positions are not rebuilt. Internal independent TND
-  fragments are **not yet extracted or balanced**. An offline-packed record also
-  stays whole.
+- `dataset[index]` stays **whole** by default. Online native loading can opt in
+  to independent-sequence repacking with `split_fn` and `pack_fn`. The selected
+  record set stays fixed; the original sequence grouping is the fallback when
+  a feasible, sufficiently better placement cannot be found.
 - Supply an HP-compatible native sampler on every rank. Only Constructor ranks
   need the mapping Dataset, and only those ranks advance their samplers. Readers
   must currently coincide with Constructors. The native sampler owns ordering
   and DP slicing, so `dataset_already_sharded=False` is required in
-  `DistributedDatasetConfig`. `pack_fn` must be omitted and
-  `drop_last=True` is required. Pure-DP iterable sources use
+  `DistributedDatasetConfig`, and `drop_last=True` is required. Without
+  `split_fn`, `pack_fn` must be omitted. Pure-DP iterable sources use
   `external_step_source`.
 - Supplied metadata must describe the **logical native Dataset outputs** after
   blend/shuffle/sample-index mapping, not raw document IDs. Raw `.idx` lengths
@@ -234,11 +234,54 @@ Current boundaries of the native-sampler path:
   round. Native cursor snapshots count Dataset-output occurrences, never tokens
   or fragments, and can restore at a synchronized forward/backward boundary with
   unchanged DP topology, global batch size, and sampler policy.
-- Native-round membership and pre-collation Dataset fields are preserved, not
-  bitwise training results. Worker RNG replay, batch-dependent transforms,
-  dropout, reduction order, a concrete TND runtime adapter, and full NPU training
-  parity are outside this sampler integration. The Trainer path rejects PP and
+- Whole-record loading preserves pre-collation Dataset fields. Repacking must
+  preserve each independent sequence's tokens, shifted labels, attention and
+  position semantics. Neither mode promises bitwise training results. Worker
+  RNG replay, batch-dependent transforms, dropout, reduction order and full NPU
+  training parity are outside this sampler integration. The Trainer path rejects PP and
   a second `DynamicBatchDataLoader` selection stage.
+
+### Repack offline-packed text within a native round
+
+Set `dataset.data_config.repack_sequences: true` alongside
+`packing_stage: dataset` and `load_balance: native_batch_sampler`.
+Each Dataset output must provide one-dimensional `input_ids`, pre-shifted
+`labels`, and explicit leading-zero `cu_seq_lens` covering the complete record.
+The boundaries must identify independent attention sequences. No boundary is
+inferred from supervision masks or guessed from token values.
+
+The Trainer installs `split_packed_text_sample`, `pack_indexed_text_samples`
+and `collate_indexed_text_sequences`. Metadata and workload costs are evaluated
+per independent sequence. The original records remain the sampler's unit of
+selection and checkpoint progress. A runtime `SampleKey.sequence_index`
+distinguishes sequences within each record occurrence, including repeated
+Dataset indices. All sequences in a round are delivered before its cursor is
+committed; restore rereads the original records and replans that round.
+
+Use `TextParallelBatch(source_type="indexed_source", reset_position_ids=True)`
+with `create_attention_mask_in_dataloader: true`. Compressed attention also
+requires the model's runtime adapter to pass the new boundaries to attention.
+Repacking currently requires online metadata (`metadata_mode: false`); supplying
+`split_fn` with precomputed metadata is rejected. The generic builder accepts
+custom `split_fn`/`pack_fn` callbacks; the Trainer switch selects the text callbacks.
+
+The [JT DP8 repacking recipe](../../examples/training_demo/jt_deepseek_v3/jt_deepseek_v3.tp1_ep1_dp8_repack.yaml)
+reads a Hugging Face Dataset saved with `save_to_disk`, containing `input_ids`,
+`labels` and `cu_seqlens`. It preserves all record tokens and targets, and uses
+`JTSequenceRuntime` to deliver cumulative ends as `actual_seq_len`.
+Use initial weights and model dimensions whose vocabulary matches the data.
+
+```bash
+JT_RECIPE_NAME=jt_deepseek_v3.tp1_ep1_dp8_repack.yaml \
+  bash examples/training_demo/jt_deepseek_v3/run_jt_deepseek_v3.sh \
+  /path/to/jt_initial_weights /path/to/packed_arrow_dataset
+```
+
+With DP8 and micro batch 1, each round still selects eight original records and
+produces eight packed rows. Each row is padded to `seq_len`, with ignored labels
+and a separate attention segment for padding. Fully occupied original rows can
+leave little room for a better feasible partition; the default greedy algorithm
+then retains the original grouping. Repacking does not imply a guaranteed speedup.
 
 Native-sampler regression coverage:
 
@@ -542,8 +585,8 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
 - Gloo control plane and pickle payloads; online A2A
   may use Gloo, NCCL, or HCCL.
 - `drop_last=True`; every DP rank receives the same number of non-empty bins.
-- Native sampler checkpoints are per rank and include transformed read-ahead payloads. Sample
-  keys and plans replay exactly when the Dataset stream is deterministic for a
+- Native sampler checkpoints are per rank and save the delivered record cursor,
+  excluding prefetched payloads. Sample keys and plans replay when the Dataset stream is deterministic for a
   given epoch; arbitrary Dataset/worker RNG state is not captured.
   Every training rank must save and restore its own loader state.
 - Elastic resharding and structured zero-copy tensor transport are separate

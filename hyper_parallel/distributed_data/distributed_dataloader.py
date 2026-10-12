@@ -615,14 +615,20 @@ class DistributedDataLoader(Iterator[Any]):
             return None
         if any(snapshot.exhausted for snapshot in snapshots):
             raise ValueError("Native BatchSampler ranks exhausted at different forward/backward rounds.")
-        if any(len(snapshot.metadata) != self._planner.local_batch_size for snapshot in snapshots):
+        if any(
+            len({item.key.global_sample_position for item in snapshot.metadata}) != self._planner.local_batch_size
+            for snapshot in snapshots
+        ):
             raise ValueError("Native BatchSampler ranks must each provide exactly local_batch_size samples.")
         samples = tuple(sorted(
             (item for snapshot in snapshots for item in snapshot.metadata),
-            key=lambda item: item.key.global_sample_position,
+            key=lambda item: (item.key.global_sample_position, item.key.sequence_index),
         ))
+        original_bins = {}
+        for item in samples:
+            original_bins.setdefault(item.key.global_sample_position, []).append(item.key)
         return self._planner.plan(
-            samples, reference_bins=tuple((item.key,) for item in samples), step=self._step,
+            samples, reference_bins=tuple(tuple(keys) for keys in original_bins.values()), step=self._step,
         )
 
     def _prepare_outgoing(

@@ -36,6 +36,35 @@ def _as_1d_long_tensor(value: Any, field: str) -> torch.Tensor:
     return tensor
 
 
+def split_packed_text_sample(sample: Mapping[str, Any]) -> tuple[dict[str, torch.Tensor], ...]:
+    """Split a packed record at explicit independent-attention boundaries.
+
+    Args:
+        sample: Pre-shifted ``input_ids`` and ``labels`` plus leading-zero
+            ``cu_seq_lens`` covering the complete record. Labels and token order
+            within each sequence are preserved, including ignored targets.
+
+    Returns:
+        Ordered sequence views, ready for per-sequence metadata estimation.
+    """
+    input_ids = _as_1d_long_tensor(sample["input_ids"], "input_ids")
+    labels = _as_1d_long_tensor(sample["labels"], "labels")
+    boundaries = torch.as_tensor(sample["cu_seq_lens"])
+    if input_ids.shape != labels.shape:
+        raise ValueError("Packed input_ids and labels must have identical shapes")
+    if boundaries.ndim != 1 or boundaries.dtype not in (torch.int32, torch.int64) or boundaries.numel() < 2:
+        raise ValueError("Packed cu_seq_lens must be an integer boundary vector")
+    offsets = boundaries.tolist()
+    if offsets[0] != 0 or offsets[-1] != input_ids.numel() or any(
+        start >= end for start, end in zip(offsets[:-1], offsets[1:])
+    ):
+        raise ValueError("Packed cu_seq_lens must strictly increase from zero to the record length")
+    return tuple(
+        {"input_ids": input_ids[start:end], "labels": labels[start:end]}
+        for start, end in zip(offsets[:-1], offsets[1:])
+    )
+
+
 def pack_indexed_text_samples(samples: Sequence[Any], seq_len: int) -> dict[str, torch.Tensor]:
     """Pack one planned source-sample bin into a fixed-length text row.
 
@@ -127,4 +156,4 @@ def collate_indexed_text_sequences(packed_sequences: Sequence[Any]) -> dict[str,
     }
 
 
-__all__ = ["collate_indexed_text_sequences", "pack_indexed_text_samples"]
+__all__ = ["collate_indexed_text_sequences", "pack_indexed_text_samples", "split_packed_text_sample"]

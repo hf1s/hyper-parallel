@@ -356,6 +356,7 @@ class _BuildState:
             communication_device: Any,
             batch_sampler: Any = None,
             *,
+            split_fn: Callable[[Any], Sequence[Any]] | None = None,
             model_config: Any = None,
             cost_model: CostModel | None = None,
             balancing_algorithm: BalancingAlgorithm | None = None,
@@ -373,6 +374,7 @@ class _BuildState:
             collate_fn: Optional local-batch collator.
             communication_device: Rank-local control and payload device.
             batch_sampler: Native sampler defining each local batch.
+            split_fn: Optional decomposition of each selected record into independent sequences.
             model_config: Backbone dimensions for the default cost model.
             cost_model: Optional workload estimator.
             balancing_algorithm: Optional assignment and objective policy.
@@ -380,6 +382,8 @@ class _BuildState:
         if not isinstance(config, DistributedDatasetConfig):
             raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
         _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
+        if split_fn is not None and (not callable(split_fn) or config.metadata_mode):
+            raise ValueError("split_fn requires online metadata and must be callable.")
         normalized_options = _normalize_dataloader_kwargs(
             config,
             dataloader_kwargs,
@@ -392,7 +396,7 @@ class _BuildState:
         }
         self.communication_device = _normalize_communication_device(communication_device)
         effective_pack_fn, effective_collate_fn = _resolve_constructor_callbacks(
-            batch_sampler, pack_fn, collate_fn,
+            batch_sampler, pack_fn, collate_fn, split_fn,
         )
         self.topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
         self.dataset_reader_ranks, self.planner_rank = _resolve_service_ranks(self.topology, config)
@@ -413,7 +417,7 @@ class _BuildState:
         elif metadata_fn is None:
             raise ValueError("metadata_mode=False requires metadata_fn.")
         self._configure_batch_sampler_sources(
-            dataset, metadata_fn, metadata, config, batch_sampler, loader_options,
+            dataset, metadata_fn, metadata, config, batch_sampler, loader_options, split_fn,
         )
         self.planner, self.constructor = self._build_components(
             config,
@@ -437,6 +441,7 @@ class _BuildState:
             config: DistributedDatasetConfig,
             batch_sampler: Any,
             loader_options: dict[str, Any],
+            split_fn: Callable[[Any], Sequence[Any]] | None,
     ) -> None:
         """Use native DP sampler owners as Readers without applying a second stride."""
         if self.dataset_reader_ranks != self.topology.constructor_ranks:
@@ -465,6 +470,7 @@ class _BuildState:
             batch_sampler, reader_rank=self.topology.global_rank,
             metadata=metadata, metadata_fn=metadata_fn,
             sample_loader=None if config.metadata_mode else sample_loader,
+            split_fn=split_fn,
         )
         if config.metadata_mode:
             self.metadata_reader = reader
@@ -515,13 +521,17 @@ def _resolve_constructor_callbacks(
         batch_sampler: Any,
         pack_fn: Callable[[Sequence[Any], int], Any] | None,
         collate_fn: Callable[[Sequence[Any]], Any] | None,
+        split_fn: Callable[[Any], Sequence[Any]] | None = None,
 ) -> tuple[Callable[[Sequence[Any], int], Any], Callable[[Sequence[Any]], Any]]:
     """Resolve constructor callbacks for the selected source."""
     effective_pack_fn = default_pack_fn if pack_fn is None else pack_fn
     if batch_sampler is not None:
-        if pack_fn is not None:
+        if split_fn is not None and pack_fn is None:
+            raise ValueError("Native split_fn requires pack_fn to rebuild the planned sequences.")
+        if split_fn is None and pack_fn is not None:
             raise ValueError("Native batch_sampler preserves Dataset outputs; pack_fn must be omitted.")
-        effective_pack_fn = preserve_sample
+        if split_fn is None:
+            effective_pack_fn = preserve_sample
     effective_collate_fn = default_collate_fn if collate_fn is None else collate_fn
     return effective_pack_fn, effective_collate_fn
 
@@ -535,6 +545,7 @@ def build_distributed_dataloader(
         metadata: Sequence[SampleMetadata] | None = None,
         dataloader_kwargs: Mapping[str, Any] | None = None,
         pack_fn: Callable[[Sequence[Any], int], Any] | None = None,
+        split_fn: Callable[[Any], Sequence[Any]] | None = None,
         collate_fn: Callable[[Sequence[Any]], Any] | None = None,
         device: Any = None,
         batch_sampler: Any = None,
@@ -556,7 +567,9 @@ def build_distributed_dataloader(
 
     With ``batch_sampler``, native HP sampling owns step selection:
     one sampler yield per DP Constructor fixes one forward/backward round.
-    Complete Dataset outputs are balanced without repacking their contents.
+    Dataset outputs stay whole by default. Online ``split_fn`` decomposes each
+    selected output into independent sequences; ``pack_fn`` rebuilds the planned
+    bins without changing the original sampler round's membership or cursor.
 
     Args:
         dataset: BatchSampler mode requires a shared mapping Dataset
@@ -578,6 +591,12 @@ def build_distributed_dataloader(
             managed and cannot be overridden.
         pack_fn: Optionally construct one model-specific packed sequence. The
             default preserves each planned bin as a raw-sample tuple.
+        split_fn: Online native-sampler callback returning the independent
+            sequences in one Dataset output, in original order. Requires
+            ``pack_fn``. Each original record must fit one packed bin; its
+            sequences form the fallback grouping. Metadata is computed per
+            returned sequence. The callback must preserve tokens, targets and
+            attention isolation; arbitrary contextual slices are not independent.
         collate_fn: Optionally collate ``local_batch_size`` packed sequences.
             The default preserves the bins as a tuple.
         device: Rank-local training device. Node-local balancing uses
@@ -589,9 +608,10 @@ def build_distributed_dataloader(
             sampler on every rank; only each DP Constructor advances it. Its
             next yield fixes local sample membership, with no second stride,
             shuffle, or dynamic selection. Each Dataset output stays whole in
-            one bin and goes unchanged to ``collate_fn``. Readers must coincide
-            with Constructors, ``drop_last`` must be true, and ``pack_fn`` must
-            be omitted. Metadata entries must describe these Dataset indices,
+            one bin and goes unchanged to ``collate_fn`` unless ``split_fn``
+            and ``pack_fn`` are supplied together in online mode. Readers must
+            coincide with Constructors and ``drop_last`` must be true.
+            Metadata entries must describe these Dataset indices,
             not underlying document indices. Checkpoint through this loader,
             not through the sampler's speculative prefetch cursor.
         external_step_source: Source-only API for online mode. It must
@@ -628,6 +648,8 @@ def build_distributed_dataloader(
         consistent across ranks and compatible with restored checkpoints.
     """
     if external_step_source is not None:
+        if split_fn is not None:
+            raise ValueError("split_fn is only supported with a native batch_sampler.")
         if config.metadata_mode:
             raise ValueError("external_step_source requires metadata_mode=False for online metadata.")
         if batch_sampler is not None or metadata is not None:
@@ -655,6 +677,7 @@ def build_distributed_dataloader(
         dataloader_kwargs=dataloader_kwargs,
         pack_fn=pack_fn,
         collate_fn=collate_fn,
+        split_fn=split_fn,
         communication_device=device,
         batch_sampler=batch_sampler,
         model_config=model_config,
@@ -675,6 +698,7 @@ def _build_distributed_dataloader_impl(
         collate_fn: Callable[[Sequence[Any]], Any] | None,
         communication_device: Any,
         batch_sampler: Any = None,
+        split_fn: Callable[[Any], Sequence[Any]] | None = None,
         model_config: Any = None,
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
@@ -694,6 +718,7 @@ def _build_distributed_dataloader_impl(
         collate_fn,
         communication_device,
         batch_sampler,
+        split_fn=split_fn,
         model_config=model_config,
         cost_model=cost_model,
         balancing_algorithm=balancing_algorithm,
