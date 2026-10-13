@@ -19,9 +19,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch.utils.checkpoint import DefaultDeviceType
 
 
-from hyper_parallel.core.activation_memory import CheckpointPolicy
+from hyper_parallel.core.activation_memory import CheckpointPolicy, checkpoint
 from hyper_parallel.core.activation_memory.swap import Storage
 from hyper_parallel.core.activation_memory import sac
 from hyper_parallel.core.activation_memory.sac import (
@@ -103,6 +104,52 @@ class TestSacHelpers(unittest.TestCase):
 
 class TestCreateSelectiveCheckpointContexts(unittest.TestCase):
     """Unit tests for create_selective_checkpoint_contexts()."""
+
+    def test_nested_checkpoint_owns_its_selective_cache(self):
+        """Outer SAC must neither retain nor consume an inner checkpoint's intermediates."""
+        previous_device = DefaultDeviceType.get_device_type()
+        DefaultDeviceType.set_device_type("cpu")
+        self.addCleanup(DefaultDeviceType.set_device_type, previous_device)
+        torch.manual_seed(7)
+        source = torch.randn(3, 3)
+        weight = torch.randn(3, 3)
+        reference = source.clone().requires_grad_()
+        expected = ((reference @ weight).sin() @ weight).cos() @ weight
+        expected.square().sum().backward()
+
+        for inner_selective in (False, True):
+            with self.subTest(inner_selective=inner_selective):
+                contexts = []
+
+                def policy(_context: object, op: object, *_args: object, **_kwargs: object) -> CheckpointPolicy:
+                    """Save matmuls while explicitly recomputing the other operations."""
+                    return (CheckpointPolicy.MUST_SAVE if op == torch.ops.aten.mm.default
+                            else CheckpointPolicy.MUST_RECOMPUTE)
+
+                def context_fn() -> tuple:
+                    """Retain all region-local matmuls so cache ownership is observable."""
+                    pair = create_selective_checkpoint_contexts(policy)
+                    contexts.append(pair)
+                    return pair
+
+                def inner(value: torch.Tensor) -> torch.Tensor:
+                    """One matmul belongs exclusively to the inner checkpoint."""
+                    return (value @ weight).cos()
+
+                def outer(value: torch.Tensor) -> torch.Tensor:
+                    """Two matmuls bracket the nested checkpoint."""
+                    value = (value @ weight).sin()
+                    value = checkpoint(inner, value, **({"context_fn": context_fn} if inner_selective else {}))
+                    return value @ weight
+
+                inputs = source.clone().requires_grad_()
+                actual = checkpoint(outer, inputs, context_fn=context_fn)
+                self.assertEqual(len(contexts[0][0].storage[torch.ops.aten.mm.default]), 2)
+                if inner_selective:
+                    self.assertEqual(len(contexts[1][0].storage[torch.ops.aten.mm.default]), 1)
+                actual.square().sum().backward()
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(inputs.grad, reference.grad)
 
     def test_none_policy_defaults_to_prefer_recompute(self):
         """A missing policy should default caching mode to recomputation."""

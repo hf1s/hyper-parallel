@@ -26,6 +26,7 @@ from torch._functorch._aot_autograd.functional_utils import is_fun
 from torch.utils._pytree import tree_map
 from torch.utils._python_dispatch import TorchDispatchMode
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
+from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.activation_memory.swap import (  # patch code
     SwapManager,
     SwapTensor,
@@ -158,12 +159,20 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
         # Cache context and singleton to avoid per-dispatch allocation / lookup.
         self._swap_manager = SwapManager()
         self._group_prefix = ""
+        self._checkpoint_state = None
+
+    def __enter__(self) -> "_CachingTorchDispatchMode":
+        """Bind this cache to its enclosing Hyper checkpoint execution phase."""
+        self._checkpoint_state = get_recompute_state()
+        return super().__enter__()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if func in SAC_IGNORED_OPS:
+        kwargs = {} if kwargs is None else kwargs
+        # A nested Hyper checkpoint owns its own saved activations and policy.
+        # Caching its intermediates here defeats its recomputation boundary.
+        if func in SAC_IGNORED_OPS or get_recompute_state() is not self._checkpoint_state:
             return func(*args, **kwargs)
 
-        kwargs = {} if kwargs is None else kwargs
         policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=False),
                                 func, *args, **kwargs)
         if isinstance(policy, bool):
@@ -223,12 +232,18 @@ class _CachedTorchDispatchMode(TorchDispatchMode):
         self.storage = storage
         self.allow_cache_entry_mutation = allow_cache_entry_mutation
         self._swap_cleared = False
+        self._checkpoint_state = None
+
+    def __enter__(self) -> "_CachedTorchDispatchMode":
+        """Bind replay to the same region boundary used when collecting its cache."""
+        self._checkpoint_state = get_recompute_state()
+        return super().__enter__()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if func in SAC_IGNORED_OPS:
+        kwargs = {} if kwargs is None else kwargs
+        if func in SAC_IGNORED_OPS or get_recompute_state() is not self._checkpoint_state:
             return func(*args, **kwargs)
 
-        kwargs = {} if kwargs is None else kwargs
         policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=True),
                                 func, *args, **kwargs)
         if isinstance(policy, bool):
