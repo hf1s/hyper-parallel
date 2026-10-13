@@ -61,6 +61,46 @@ class TestCompleteModel(unittest.TestCase):
     """Exercise model semantics without a builder, EP adapter or replacement pass."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_mla_token_major_inputs_preserve_output_and_gradients(self):
+        """Feature: MLA fused attention input layout.
+
+        Description: Compare the attention call boundary with the original projected tensors on CPU.
+        Expectation: Packed TND inputs are contiguous; output, input and parameter gradients are unchanged.
+        """
+        torch.manual_seed(7)
+        config = small_config()
+        module = JTDeepseekV3MLAAttention(module=JTDeepseekV3Attention(config, 0))
+        hidden = torch.randn(2, 7, config.hidden_size)
+        angles = torch.randn(2, 7, config.qk_rope_head_dim)
+        positions = (angles.cos(), angles.sin())
+
+        def attention(_module: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                      _mask: Any, **_kwargs: Any) -> tuple[torch.Tensor, None]:
+            """Assert the real kernel boundary layout and use CPU attention for numerical checks."""
+            for tensor in (query, key, value):
+                self.assertTrue(tensor.transpose(1, 2).is_contiguous())
+            output = F.scaled_dot_product_attention(query, key, value, is_causal=True, scale=module.scaling)
+            return output.transpose(1, 2), None
+
+        module.attention_interface = attention
+        captured = []
+        for optimized in (False, True):
+            module.zero_grad(set_to_none=True)
+            inputs = hidden.clone().requires_grad_()
+            if optimized:
+                output = module(inputs, positions)[0]
+            else:
+                query, key, value = module._project_attention_inputs(inputs, positions, None)
+                output = F.scaled_dot_product_attention(query, key, value, is_causal=True, scale=module.scaling)
+                output = module.o_proj(output.transpose(1, 2).reshape(2, 7, -1))
+            output.square().sum().backward()
+            captured.append({"output": output.detach().clone(), "input": inputs.grad.clone(),
+                             **{name: parameter.grad.clone() for name, parameter in module.named_parameters()}})
+        for name, expected in captured[0].items():
+            with self.subTest(tensor=name):
+                torch.testing.assert_close(captured[1][name], expected, rtol=1e-5, atol=1e-6)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_standalone_forward_backward(self):
         """Feature: Complete model.
 

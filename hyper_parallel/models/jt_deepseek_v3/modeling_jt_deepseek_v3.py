@@ -253,6 +253,10 @@ class JTDeepseekV3MLAAttention(MLAAttention):
             The attention output and ``None`` attention weights.
         """
         query, key, value = self._project_attention_inputs(hidden_states, position_embeddings, past_key_values)
+        # FA consumes packed TND. Release each old layout before copying the next tensor.
+        query = query.transpose(1, 2).contiguous().transpose(1, 2)
+        key = key.transpose(1, 2).contiguous().transpose(1, 2)
+        value = value.transpose(1, 2).contiguous().transpose(1, 2)
         output, weights = self.attention_interface(
             self, query, key, value, attention_mask,
             dropout=self.attention_dropout if self.training else 0.0, scaling=self.scaling,
