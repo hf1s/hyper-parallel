@@ -171,7 +171,7 @@ dataset:
   _target_: hyper_parallel.data.online.mapping.MappingTransformDataset
   source_dataset:
     _target_: datasets.load_from_disk
-    dataset_path: /workspace/datasets/sft_4k_ref_filtered
+    dataset_path: /workspace/datasets/sft_4k_from_256k
   model_assets:
     tokenizer: null
   data_transform:
