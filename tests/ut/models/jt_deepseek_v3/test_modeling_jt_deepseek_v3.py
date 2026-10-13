@@ -201,14 +201,16 @@ class TestCompleteModel(unittest.TestCase):
         """Feature: FSDP unit discovery.
 
         Description: Resolve FSDP units for the JT model through the framework manager.
-        Expectation: The JT adapter applies; each MTP transformer layer is one unit, not split leaves.
+        Expectation: The JT adapter applies; each MTP transformer layer is one unit, not split leaves, and every
+            router is its own FP32 unit (MF alignment experiment).
         """
         model = JTDeepseekV3ForCausalLM(small_config())
         self.assertEqual(FSDP2Manager._get_model_adapter_spec(model).model_type, "jt_deepseek_v3")
         manager = FSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
         self.assertEqual(
             sorted(unit.fqn for unit in manager._find_wrap_modules(model)),
-            ["model.layers.0", "model.layers.1", "mtp.layers.0.transformer_layer"],
+            ["model.layers.0", "model.layers.1", "model.layers.1.mlp.gate", "mtp.layers.0.transformer_layer",
+             "mtp.layers.0.transformer_layer.mlp.gate"],
         )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")

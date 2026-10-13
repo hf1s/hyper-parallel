@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -612,6 +612,13 @@ class FSDP2Manager:
                 metadata_by_parameter,
             )
             fsdp_sublayer_kwargs = dense_fsdp_kwargs
+            if wrap_module.fqn.endswith(".mlp.gate"):
+                fsdp_sublayer_kwargs = {
+                    **dense_fsdp_kwargs,
+                    "mp_policy": replace(
+                        dense_fsdp_kwargs["mp_policy"], param_dtype=torch.float32
+                    ),
+                }
             if self._uses_expert_mesh(managed_source_info):
                 if self.mesh_context.fsdp_moe_mesh is None:
                     raise ValueError("Expert TP metadata requires MeshContext.fsdp_moe_mesh")
