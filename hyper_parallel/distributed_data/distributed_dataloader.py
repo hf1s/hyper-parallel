@@ -19,7 +19,6 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
 from threading import Condition, Thread
 from typing import Any
 
@@ -41,13 +40,6 @@ from hyper_parallel.distributed_data.transport import (
     ModelParallelTransport,
     PreparedPayloadExchange,
 )
-
-
-@dataclass(frozen=True)
-class _ReaderSnapshot:
-    rank: int
-    exhausted: bool
-    metadata: tuple[SampleMetadata, ...]
 
 
 _PREFETCH_PENDING = object()
@@ -189,11 +181,15 @@ class DistributedDataLoader(Iterator[Any]):
         """Gather metadata on the caller after current-step compute submission."""
         if not self._caller_collectives or self._stopped or self._prefetch_phase != "source":
             return
-        snapshot = self._take_prefetched()
+        local_metadata = self._take_prefetched()
         with self._prefetch_stream_context():
-            snapshots = self._data_plane.gather_object_to_planner(snapshot) if self._data_plane.is_member else None
+            gathered_metadata = (
+                self._data_plane.gather_object_to_planner(local_metadata) if self._data_plane.is_member else None
+            )
         self._prefetch_phase = "plan"
-        self._start_prefetch(lambda: self._build_plan_control(snapshots) if snapshots is not None else None)
+        self._start_prefetch(
+            lambda: self._build_plan_control(gathered_metadata) if gathered_metadata is not None else None
+        )
 
     def prefetch(self) -> None:
         """Launch next-step routing on the caller, then construct and copy off-thread."""
@@ -268,7 +264,7 @@ class DistributedDataLoader(Iterator[Any]):
                 self._prefetch_thread.start()
             self._prefetch_result = _PREFETCH_PENDING
             self._prefetch_task = task or (
-                self._fill_local_reader if self._caller_collectives else self._prepare_next_batch
+                self._prepare_local_metadata if self._caller_collectives else self._prepare_next_batch
             )
             self._prefetch_error = None
             self._prefetch_requested = True
@@ -552,7 +548,7 @@ class DistributedDataLoader(Iterator[Any]):
         """Directly read constructor-assigned shared indices without payload A2A."""
         received_payloads: dict[SampleKey, Any] = {}
         if self._topology.is_constructor:
-            received_payloads = self._direct_sample_loader.fetch_keys(
+            received_payloads = self._direct_sample_loader.fetch_samples(
                 plan.local_sample_keys(self._topology.data_rank)
             )
         return self._construct_received_payloads(plan, received_payloads)
@@ -578,50 +574,45 @@ class DistributedDataLoader(Iterator[Any]):
 
     def _next_plan_control(self) -> DistributedPackingPlan | None:
         """Plan exactly one source-selected step, or return None at end of stream."""
-        local_snapshot = self._fill_local_reader()
-        snapshots = self._data_plane.gather_object_to_planner(local_snapshot)
+        local_metadata = self._prepare_local_metadata()
+        gathered_metadata = self._data_plane.gather_object_to_planner(local_metadata)
         plan = None
         if self._topology.global_rank == self._data_plane.planner_rank:
-            plan = self._build_plan_control(snapshots)
+            plan = self._build_plan_control(gathered_metadata)
         return self._data_plane.broadcast_from_planner(plan)
 
-    def _fill_local_reader(self) -> _ReaderSnapshot:
-        is_reader = self._topology.global_rank in self._dataset_reader_ranks
-        if not is_reader:
-            return _ReaderSnapshot(
-                rank=self._topology.global_rank,
-                exhausted=True,
-                metadata=(),
-            )
+    def _prepare_local_metadata(self) -> tuple[SampleMetadata, ...]:
+        """Prepare one local sampler batch and return its planning metadata."""
+        if self._topology.global_rank not in self._dataset_reader_ranks:
+            return ()
         planning_reader = self._planning_reader()
         planning_reader.prepare_next_step()
-        return _ReaderSnapshot(
-            rank=self._topology.global_rank,
-            exhausted=planning_reader.exhausted,
-            metadata=planning_reader.metadata(),
-        )
+        return planning_reader.metadata()
 
-    def _build_plan_control(self, snapshots: tuple[_ReaderSnapshot, ...]) -> DistributedPackingPlan | None:
+    def _build_plan_control(
+            self, gathered_metadata: tuple[tuple[SampleMetadata, ...], ...],
+    ) -> DistributedPackingPlan | None:
         """Return the current step's plan; None means end of stream."""
-        # Fixed-group gather already supplies one snapshot per rank in rank order.
-        reader_snapshots = [
-            snapshot for snapshot in snapshots if snapshot.rank in self._dataset_reader_ranks
+        # Collective order identifies the source rank even when its metadata is empty.
+        reader_metadata = [
+            metadata for rank, metadata in zip(self._data_plane.ranks, gathered_metadata)
+            if rank in self._dataset_reader_ranks
         ]
-        return self._plan_native_batch(reader_snapshots)
+        return self._plan_native_batch(reader_metadata)
 
-    def _plan_native_batch(self, snapshots: list[_ReaderSnapshot]) -> DistributedPackingPlan | None:
+    def _plan_native_batch(self, reader_metadata: list[tuple[SampleMetadata, ...]]) -> DistributedPackingPlan | None:
         """Plan this forward/backward round exactly as native DP samplers selected it."""
-        if all(snapshot.exhausted for snapshot in snapshots):
+        if all(not metadata for metadata in reader_metadata):
             return None
-        if any(snapshot.exhausted for snapshot in snapshots):
+        if any(not metadata for metadata in reader_metadata):
             raise ValueError("Native BatchSampler ranks exhausted at different forward/backward rounds.")
         if any(
-            len({item.key.global_sample_position for item in snapshot.metadata}) != self._planner.local_batch_size
-            for snapshot in snapshots
+            len({item.key.global_sample_position for item in metadata}) != self._planner.local_batch_size
+            for metadata in reader_metadata
         ):
             raise ValueError("Native BatchSampler ranks must each provide exactly local_batch_size samples.")
         samples = tuple(sorted(
-            (item for snapshot in snapshots for item in snapshot.metadata),
+            (item for metadata in reader_metadata for item in metadata),
             key=lambda item: (item.key.global_sample_position, item.key.sequence_index),
         ))
         original_bins = {}

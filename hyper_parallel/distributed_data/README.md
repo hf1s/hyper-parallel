@@ -486,8 +486,7 @@ when resuming; Dataset outputs must remain deterministic. Global rank ownership
 is still checked, readers validate their saved state, and the native sampler
 validates its restored cursor and batch sizes. Legacy loader fingerprint and
 plan-ID fields are ignored; component checkpoint formats must still be
-compatible. Standalone `DatasetReader` snapshots with the previous buffer
-layout must be recreated. Plans expose their step, sample assignments and costs
+compatible. Plans expose their step, sample assignments and costs
 directly; no plan digest or `last_plan_id` is generated.
 
 Dataset and distributed batching semantics remain internal. Do not pass

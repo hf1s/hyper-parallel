@@ -26,7 +26,6 @@ import torch
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
-from hyper_parallel.distributed_data.distributed_dataloader import _ReaderSnapshot
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import DistributedPackingPlan, SampleKey
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
@@ -89,7 +88,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
 
                 with patch.object(DataPlaneTransport, "communication_backend", new_callable=PropertyMock,
                                   return_value="hccl"), patch.object(
-                        loader, "_fill_local_reader", side_effect=record("read", loader._fill_local_reader),
+                        loader, "_prepare_local_metadata", side_effect=record("read", loader._prepare_local_metadata),
                 ), patch.object(
                         loader, "_build_plan_control", side_effect=record("plan", loader._build_plan_control),
                 ), patch.object(
@@ -171,26 +170,23 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_plan_uses_native_positions_and_filters_non_readers(self) -> None:
         """Feature: Native sampler planning.
-        Description: Non-reader ranks are filtered without changing selected indices.
+        Description: Non-reader ranks in a non-contiguous group are filtered without changing selected indices.
         Expectation: The planner receives one singleton bin per selected Dataset output.
         """
         loader = _native_loader()
-        first = SampleMetadata(4, key=SampleKey(0, 8, 7))
-        second = SampleMetadata(6, key=SampleKey(2, 3, 42))
-        snapshots = (
-            _ReaderSnapshot(0, False, (first,)),
-            _ReaderSnapshot(1, True, ()),
-            _ReaderSnapshot(2, False, (second,)),
-        )
+        first = SampleMetadata(4, key=SampleKey(2, 8, 7))
+        second = SampleMetadata(6, key=SampleKey(6, 3, 42))
+        gathered_metadata = ((first,), (), (second,))
         planner = DynamicPackingPlanner(
             data_parallel_size=2, seq_len=10, local_batch_size=1, cost_model=lambda metadata: metadata.cost,
         )
         with (
-                patch.object(loader, "_dataset_reader_ranks", frozenset((0, 2))),
+                patch.object(loader, "_dataset_reader_ranks", frozenset((2, 6))),
+                patch.object(loader._data_plane, "_ranks", (2, 4, 6)),
                 patch.object(loader, "_planner", planner),
                 patch.object(planner, "plan", wraps=planner.plan) as plan_step,
         ):
-            plan = loader._build_plan_control(snapshots)
+            plan = loader._build_plan_control(gathered_metadata)
 
         samples = plan_step.call_args.args[0]
         self.assertEqual(tuple(item.key for item in samples), (first.key, second.key))
@@ -206,9 +202,12 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         """
         loader = _native_loader()
         sample = SampleMetadata(1, key=SampleKey(0, 0))
-        partial = (_ReaderSnapshot(0, False, (sample,)), _ReaderSnapshot(1, True, ()))
-        exhausted = (_ReaderSnapshot(0, True, ()), _ReaderSnapshot(1, True, ()))
-        with patch.object(loader, "_dataset_reader_ranks", frozenset((0, 1))):
+        partial = ((sample,), ())
+        exhausted = ((), ())
+        with (
+                patch.object(loader, "_dataset_reader_ranks", frozenset((0, 1))),
+                patch.object(loader._data_plane, "_ranks", (0, 1)),
+        ):
             with self.assertRaisesRegex(ValueError, "exhausted at different"):
                 loader._build_plan_control(partial)
             self.assertIsNone(loader._build_plan_control(exhausted))

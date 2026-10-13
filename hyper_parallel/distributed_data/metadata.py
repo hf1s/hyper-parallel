@@ -80,8 +80,8 @@ class PlannedSampleLoader:
             **worker_options,
         )
 
-    def fetch_keys(self, sample_keys: Sequence[SampleKey]) -> dict[SampleKey, Any]:
-        """Fetch an ordered sequence of sample keys from this loader's Dataset.
+    def fetch_samples(self, sample_keys: Sequence[SampleKey]) -> dict[SampleKey, Any]:
+        """Fetch Dataset samples for the requested keys, preserving their order.
 
         Args:
             sample_keys: Keys whose local ``dataset_index`` values belong to

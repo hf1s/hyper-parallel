@@ -51,7 +51,15 @@ def validate_native_sampler(sampler: Any, *, data_rank: int, dp_size: int, local
 
 
 def preserve_sample(samples: Sequence[Any], seq_len: int) -> Any:
-    """Pass one native Dataset output unchanged to the original collator."""
+    """Pass one native Dataset output unchanged to the original collator.
+
+    Args:
+        samples: Source samples for one native sequence bin.
+        seq_len: Sequence capacity, unused when preserving a Dataset output.
+
+    Returns:
+        The sole source sample, unchanged.
+    """
     del seq_len
     if len(samples) != 1:
         raise ValueError("Native BatchSampler mode must keep one Dataset output per sequence bin.")
@@ -128,7 +136,7 @@ class BatchSamplerReader:
             if self._pending_state["consumed_samples"] != expected_position:
                 raise ValueError("Native BatchSampler must advance exactly one global local-batch round per yield.")
             if self._metadata is None:
-                self._payloads = self._sample_loader.fetch_keys(keys)
+                self._payloads = self._sample_loader.fetch_samples(keys)
                 if self._split_fn is not None:
                     keys = self._split_payloads(keys)
                 metadata = [self._metadata_fn(self._payloads[key]) for key in keys]
@@ -174,11 +182,22 @@ class BatchSamplerReader:
         return self._buffer
 
     def selected_payloads(self, selected_keys: set[SampleKey]) -> tuple[tuple[SampleKey, Any], ...]:
-        """Return already-read payloads without rereading their Dataset indices."""
+        """Return already-read payloads without rereading their Dataset indices.
+
+        Args:
+            selected_keys: Sample occurrences selected from this Reader's buffer.
+
+        Returns:
+            Selected key-payload pairs in buffered sample order.
+        """
         return tuple((item.key, self._payloads[item.key]) for item in self._buffer if item.key in selected_keys)
 
     def commit(self, selected_keys: set[SampleKey]) -> None:
-        """Advance saved progress only after this entire round is delivered."""
+        """Advance saved progress only after this entire round is delivered.
+
+        Args:
+            selected_keys: Every sample occurrence in the delivered local round.
+        """
         if selected_keys != {item.key for item in self._buffer} or self._pending_state is None:
             raise ValueError("Native BatchSampler commit must consume the complete pending local batch.")
         self._committed_state = self._pending_state
@@ -215,7 +234,11 @@ class BatchSamplerReader:
         self._reset_pending()
 
     def set_epoch(self, epoch: int) -> None:
-        """Delegate epoch changes to the native sampler without changing its policy."""
+        """Delegate epoch changes to the native sampler without changing its policy.
+
+        Args:
+            epoch: Epoch to apply to the sampler and sample loader.
+        """
         self._sampler.load_state_dict(self._committed_state)
         self._sampler.set_epoch(epoch)
         if self._sample_loader is not None:

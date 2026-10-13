@@ -29,7 +29,6 @@ from hyper_parallel.distributed_data import (
     build_distributed_dataloader,
 )
 from hyper_parallel.distributed_data.api import _normalize_dataloader_kwargs
-from hyper_parallel.distributed_data.dataset_reader import DatasetReader
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from tests.common.mark_utils import arg_mark
 
@@ -78,8 +77,12 @@ class TestDataLoaderKwargs(unittest.TestCase):
             "in_order": True,
         }
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_public_builder_exposes_keyword_only_dataloader_kwargs(self) -> None:
-        """The public API should accept optional DataLoader kwargs by keyword."""
+        """Feature: DataLoader execution options API.
+        Description: Inspect the public builder's dataloader_kwargs parameter.
+        Expectation: The parameter is optional and keyword-only.
+        """
         parameter = inspect.signature(build_distributed_dataloader).parameters["dataloader_kwargs"]
 
         self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
@@ -110,8 +113,12 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertEqual(config.prefetch_factor, 2)
         self.assertFalse(config.persistent_workers)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_online_source_forwards_execution_options_to_native_dataloader(self) -> None:
-        """Online Dataset Readers should pass normalized options to PyTorch."""
+        """Feature: Online sample loading options.
+        Description: Build an online loader with custom worker execution options.
+        Expectation: Normalized options reach PyTorch without changing sample routing.
+        """
         supplied = self._execution_options()
         with patch("hyper_parallel.distributed_data.metadata.DataLoader") as dataloader_type:
             build_distributed_dataloader(
@@ -134,8 +141,12 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertIn("collate_fn", forwarded)
         self.assertIn("generator", forwarded)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_metadata_reader_forwards_execution_options_to_native_dataloader(self) -> None:
-        """Plan-aware metadata reads should use the same PyTorch worker options."""
+        """Feature: Metadata-mode sample loading options.
+        Description: Build a metadata-mode loader with custom worker execution options.
+        Expectation: Plan-aware sample reads receive the supplied PyTorch options.
+        """
         samples = self._samples()
         metadata = [_metadata_fn(sample) for sample in samples]
         supplied = self._execution_options()
@@ -160,8 +171,12 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertIn("collate_fn", forwarded)
         self.assertIn("generator", forwarded)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_rejects_framework_managed_and_unknown_options(self) -> None:
-        """Users must not replace sample routing internals or arbitrary options."""
+        """Feature: DataLoader option ownership.
+        Description: Supply framework-managed or unsupported DataLoader options.
+        Expectation: Normalization rejects options that could replace sample routing.
+        """
         cases = (
             ({"batch_size": 2}, "cannot override distributed sampling"),
             ({"sampler": object()}, "cannot override distributed sampling"),
@@ -174,8 +189,12 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected_error):
                     _normalize_dataloader_kwargs(self._config(), supplied)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_rejects_invalid_worker_option_combinations(self) -> None:
-        """Invalid combinations should fail before native DataLoader iteration."""
+        """Feature: DataLoader worker option validation.
+        Description: Supply incompatible worker settings or invalid callback types.
+        Expectation: Invalid options fail before native DataLoader iteration.
+        """
         cases = (
             ({"num_workers": 0, "prefetch_factor": 2}, "prefetch_factor requires num_workers"),
             ({"num_workers": 0, "persistent_workers": True}, "persistent_workers=True requires"),
@@ -190,8 +209,12 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected_error):
                     _normalize_dataloader_kwargs(self._config(), supplied)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_worker_validation_is_shared_by_config_overrides_and_direct_readers(self) -> None:
-        """Every entry point rejects the same invalid worker settings before creating workers."""
+        """Feature: Shared worker validation.
+        Description: Supply invalid settings through config, overrides and planned reads.
+        Expectation: Every entry point rejects invalid settings before creating workers.
+        """
         cases = (
             {"num_workers": True}, {"num_workers": -1}, {"pin_memory": 1}, {"persistent_workers": 1},
             {"prefetch_factor": True}, {"prefetch_factor": 0}, {"prefetch_factor": 2},
@@ -207,11 +230,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 options.update(invalid)
                 with self.assertRaises(ValueError):
                     PlannedSampleLoader(self._samples(), seed=17, **options)
-                with self.assertRaises(ValueError):
-                    DatasetReader(
-                        self._samples(), _metadata_fn, reader_rank=0, reader_idx=0, reader_count=1,
-                        seq_len=8, shuffle=False, seed=17, **options,
-                    )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_accepts_string_and_object_multiprocessing_contexts(self) -> None:
@@ -243,7 +261,7 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 )
                 for step, indices in enumerate(((1, 0, 1), (), (0,), (1, 0))):
                     keys = [SampleKey(0, index, step * 3 + offset) for offset, index in enumerate(indices)]
-                    payloads = loader.fetch_keys(keys)
+                    payloads = loader.fetch_samples(keys)
                     self.assertEqual(list(payloads), keys, "Each sample occurrence must keep its requested order.")
                     self.assertEqual(
                         [sample["id"] for sample in payloads.values()], list(indices),
