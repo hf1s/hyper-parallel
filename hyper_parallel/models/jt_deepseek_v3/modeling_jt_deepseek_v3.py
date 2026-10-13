@@ -35,6 +35,18 @@ from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32MoE, DeepseekV32Model, DeepseekV32PreTrainedModel, DeepseekV32RMSNorm,
     DeepseekV32RotaryEmbedding, DeepseekV32TopkRouter,
 )
+class MFParityRMSNorm(DeepseekV32RMSNorm):
+    """Temporary MF-compatible RMSNorm: FP32 norm and weight, one final output cast."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        normalized = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight.float() * normalized).to(input_dtype)
+
+
+DeepseekV32RMSNorm = MFParityRMSNorm
 
 from hyper_parallel.components.losses import calculate_mtp_loss, calculate_seq_aux_loss
 from hyper_parallel.components.losses.mtp import iter_mtp_targets
