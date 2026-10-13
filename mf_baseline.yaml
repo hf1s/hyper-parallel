@@ -1,0 +1,327 @@
+seed: 42
+output_dir: '/jt_lmc/taoyuyang/training_outputs/236B_256k_test_0618_32nodes'
+
+# checkpoints setting
+# pretrained_model_dir: '/root/work/filestorage/taoyuyang/Qwen3-235B-A22B'
+#load_checkpoint: null
+load_checkpoint: '/jt_lmc/taoyuyang/236B_256k_base_1330_10596_ema_alpha0.2_ms'
+# load_checkpoint: '/root/work/filestorage/taoyuyang/finetune_mf_r180/training_outputs/236B_sft_0618_256k/checkpoint'
+load_ckpt_format: 'safetensors'
+auto_trans_ckpt: True  # If true, auto transform load_checkpoint to load in distributed model
+only_save_strategy: False
+resume_training: False
+
+run_mode: 'train'
+use_parallel: True
+use_legacy: False
+print_separate_loss: True
+train_precision_sync: False
+
+# trainer config
+trainer:
+  type: CausalLanguageModelingTrainer
+  model_name: 'deepseekv3'
+
+# runner config
+runner_config:
+  epochs: 5
+  batch_size: 1
+  sink_mode: True
+  sink_size: 1
+  gradient_accumulation_steps: 1
+
+# optimizer
+optimizer:
+  type: Muon
+  adamw_betas: [0.9, 0.95]
+  adamw_eps: 1.e-8
+  weight_decay: 0.1
+  matched_adamw_rms: 0.2
+  qk_clip_threshold: 100
+
+# lr schedule
+lr_schedule:
+  type: CosineWithWarmUpLR
+  learning_rate: 2.4e-5
+  lr_end: 2.4e-6
+  # warmup_ratio: 0.03
+  warmup_steps: 50
+  total_steps: -1 # -1 means it will load the total steps of the dataset
+
+# dataset
+train_dataset: &train_dataset
+
+  data_loader:
+    type: HFDataLoader
+
+    # offline
+    load_func: 'load_from_disk'
+    dataset_path: /jt_lmc/taoyuyang/lcdiv2_2026061823.distill_35b_wod_newbench_packed_shuffle_mode_0_256k_seed_42_bs_128
+
+    # MindFormers dataset arguments
+    create_attention_mask: True # packing需开启，数据集返回mask
+    create_compressed_eod_mask: True # 数据集返回actual_seq_len，等价于cu_seq_len
+    compressed_eod_mask_length: 129 # packing后每条数据包含的最大子样本数，按需修改即可
+    use_broadcast_data: True # False # 数据通信域去冗余功能，开启后可降低Host内存以及IO负载
+    shuffle: True # False # True
+
+    balance_config:
+      data_parallel: 1 #4
+      model_parallel: 16 #8
+      micro_batch_num: 48 #8
+      global_batch_size: 48 #32
+
+    handler:
+      - type: rename_column
+        original_column_name: 'cu_seqlens'
+        new_column_name: 'actual_seq_len'
+      - type: remove_columns
+        column_names: ['cu_seqlens_padded', 'real_len']
+        #- type: DoubleConcatHandler
+        #max_pairs: 200
+        #target_length: 262144
+
+  input_columns: ["input_ids", "labels", "loss_mask", "position_ids", "actual_seq_len"]
+  construct_args_key:  ["input_ids", "labels", "loss_mask", "position_ids", "actual_seq_len"] # actual_seq_len
+
+  num_parallel_workers: 4 #8
+  python_multiprocessing: True # False #True
+  drop_remainder: True
+  numa_enable: False
+  prefetch_size: 1
+train_dataset_task:
+  type: CausalLanguageModelDataset
+  dataset_config: *train_dataset
+
+# mindspore context init config
+context:
+  mode: 0 # 0--Graph Mode; 1--Pynative Mode
+  device_target: "Ascend"
+  max_call_depth: 10000
+  max_device_memory: "52GB"
+  save_graphs: False
+  save_graphs_path: "./graph"
+  device_id: 0
+  memory_optimize_level: "O0"
+  jit_config:
+    jit_level: "O1"
+  ascend_config:
+    # precision_mode: "must_keep_origin_dtype"
+    parallel_speed_up_json_path: "/jt_lmc/taoyuyang/parallel_speed_up.json"
+
+parallel_config:
+  data_parallel: &dp 1 # 2 # 4 # 8
+  model_parallel: 16 # 8
+  pipeline_stage: 4 #6 # 9 # 10 # 12 # 6
+  context_parallel: 8
+  context_parallel_algo: 'ulysses_cp'
+  ulysses_degree_in_cp: 8
+  expert_parallel: 32 #16 # 16
+  micro_batch_num: 48 # 16 # 12 # 8 # 12 # 12 # 6
+  use_seq_parallel: True
+  gradient_aggregation_group: 4
+# when model parallel is greater than 1, we can set micro_batch_interleave_num=2, that may accelerate the train process.
+micro_batch_interleave_num: 1
+
+# parallel context config
+parallel:
+  parallel_mode: 1 # 0-data parallel, 1-semi-auto parallel, 2-auto parallel, 3-hybrid parallel
+  gradients_mean: False
+  enable_alltoall: True
+  full_batch: False
+  dataset_strategy: [[*dp, 1], [*dp, 1], [*dp, 1], [*dp, 1], [*dp, 1]] # add, =dp
+  search_mode: "sharding_propagation"
+  enable_parallel_optimizer: True # False # True
+  strategy_ckpt_config:
+    save_file: "./ckpt_strategy.ckpt"
+    only_trainable_params: False
+  parallel_optimizer_config:
+    gradient_accumulation_shard: False
+    parallel_optimizer_threshold: 64
+    optimizer_weight_shard_size: 4 # 1 # 2 # 8 # num_experts % (ep * op) == 0
+  pipeline_config:
+    pipeline_interleave: False # True
+    pipeline_scheduler: '1f1b' #'seqpipe' #'seqsmartvpp' # 'seqpipe' '1f1b'
+
+# recompute config
+# recompute_config:
+#   recompute: True # False 
+#   select_recompute: False
+#   parallel_optimizer_comm_recompute: False
+#   mp_comm_recompute: False
+#   recompute_slice_activation: False
+
+recompute_config:
+  recompute: true
+  select_recompute: false
+  parallel_optimizer_comm_recompute: false
+  mp_comm_recompute: false
+  recompute_slice_activation: false
+  select_recompute_exclude:
+    self_attention\.core_attention\.flash_attention: true
+    transformer_layer\.self_attention\.core_attention\.flash_attention: true
+
+# model config
+model:
+  model_config:
+    model_type: "deepseek_v3"
+    architectures: ["DeepseekV3ForCausalLM"]
+    batch_size: 1
+    # offset: [
+    #   [0, 0, 0, 0, 0, 0, 0, 0, 0, -1],
+    #   [0, 0, 0, 0, 0, 0, 1, 1, 1, -2]
+    # ] # sum=16, last stage 3 layers
+
+    # 60 % 18 = 6
+    # offset: [
+    #   [0, 1, 0, 1, 1, 1, 0, 1, -1],
+    #   [0, 0, 1, 0, 1, 1, 1, 0, -2]
+    # ]
+
+    # 39 // 12 = 3
+    # sum = 12
+    # offset: [
+    #   [0, 1, 2, 1, 2, 1, 1, -1],
+    #   [0, 1, 1, 2, 1, 1, 1, -2]
+    # ]
+
+    # p0 6, p-1 3
+    # 39 // 12
+
+    #offset: [
+            #[0, 1, 0, 1, 0, -2],
+       #[1, 0, 1, 0, 1, -3]
+       #]
+       # offset: [1, 1, 1, 1, 1, -5]
+    offset: [1, 1, 1, -3]
+    pp_interleave_num: 1 #2
+
+    # model args
+    vocab_size: 152064
+    seq_length: 262144 # 266240 # 262400 # 131072 # 128000 # 32768
+    hidden_size: 5120
+    intermediate_size: 12288
+    num_hidden_layers: 60
+    max_position_embeddings: 262400
+    hidden_act: 'silu' # 'swiglu'
+    num_attention_heads: 128
+    rms_norm_eps: 1.e-6
+    add_bias_linear: False
+    use_flash_attention: True
+    # use_attn_mask_compression: True
+
+    # MLA args
+    multi_latent_attention: True
+    mla_qkv_concat: False
+    kv_lora_rank: 512
+    q_lora_rank: 1536
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    qk_nope_head_dim: 128
+    qk_layernorm: True
+
+    # rope args
+    position_embedding_type: "rope"
+    rope_theta: 5000000 # 1000000 # from xuanchang
+    rotary_scaling_factor: 1
+    beta_fast: 32
+    beta_slow: 1
+    mscale: 1
+    mscale_all_dim: 1
+
+    # position_embedding_type: "yarn"
+    # scaling_factor: 40
+    # beta_fast: 32
+    # beta_slow: 1
+    # mscale: 1
+    # mscale_all_dim: 1
+    # rope_theta: 10000
+
+    # dropout args
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+
+    params_dtype: "float32"
+    compute_dtype: "bfloat16"
+    layernorm_compute_dtype: "float32"
+    softmax_compute_dtype: "float32"
+    rotary_dtype: "float32"
+    initializer_range: 0.02
+
+    num_nextn_predict_layers: 1
+    mtp_loss_factor: 0.3
+    # num_nextn_predict_layers: 0
+    # mtp_loss_factor: 0.0
+
+    # moe config
+    router_dense_type: "float32"
+    gated_linear_unit: True
+    moe_grouped_gemm: True
+    use_fused_ops_topkrouter: True
+    first_k_dense_replace: 1
+    moe_intermediate_size: 1536
+    n_shared_experts: 2
+    # moe_shared_expert_intermediate_size: 1536
+    routed_scaling_factor: 2.827
+    n_routed_experts: 160
+    num_experts_per_tok: 6
+    scoring_func: 'sigmoid'
+    norm_topk_prob: True
+    topk_group: 1
+    n_group: 1
+    use_pad_tokens: True # False
+    # moe_token_dispatcher_type: "alltoall_deredundency"
+    moe_token_dispatcher_type: "alltoall"
+    #moe_token_dispatcher_type: "alltoall_deredundency"
+    npu_nums_per_device: 16 # 8
+
+    moe_router_load_balancing_type: 'seq_aux_loss'
+    moe_aux_loss_coeff: 0.0001
+
+    moe_token_drop_policy: False
+    moe_router_enable_expert_bias: True
+    moe_router_bias_update_rate: 0.001
+
+# callbacks
+callbacks:
+  - type: MFLossMonitor
+  - type: TopkBiasBalanceCallback
+  # - type: CheckpointMonitor
+  #   prefix: "236B_sft"
+  #   save_checkpoint_steps: 218 # 0.125 epoch
+  #   keep_checkpoint_max: 60
+  #   save_network_params: False
+  #   integrated_save: False
+  #   async_save: False
+  #   checkpoint_format: safetensors
+  #   remove_redundancy: True
+  - type: TrainCallBack
+    stop_step: 100 #7 #800 # 4
+
+# wrapper cell config
+runner_wrapper:
+  type: MFTrainOneStepCell
+  scale_sense: 1.0
+  use_clip_grad: True
+
+# tensorboard:
+#   tensorboard_dir: /root/work/filestorage/taoyuyang/finetune_mf_r180/training_outputs/236B_sft_0618_256k_continue/tensorboard_log
+
+  #profile: False
+#profile_start_step: 10
+#profile_stop_step: 11
+#init_start_profile: True
+#profile_communication: False
+#profile_memory: False
+
+profile: False #True
+profile_start_step: 5
+profile_stop_step: 6
+init_start_profile: True
+profile_communication: False
+profile_memory: False # True  # NPU Tensor/算子显存
+profile_pipeline: True # 每个 PP stage 取一个代表 rank
+with_stack: False # 不采 Python stack
+profiler_level: 0
+data_simplification: True
+mstx: True
