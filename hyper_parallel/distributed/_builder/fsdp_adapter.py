@@ -612,7 +612,7 @@ class FSDP2Manager:
                 metadata_by_parameter,
             )
             fsdp_sublayer_kwargs = dense_fsdp_kwargs
-            if wrap_module.fqn.endswith(".mlp.gate"):
+            if wrap_module.fqn.endswith(".mlp.gate") or wrap_module.fqn.endswith("norm"):
                 fsdp_sublayer_kwargs = {
                     **dense_fsdp_kwargs,
                     "mp_policy": replace(

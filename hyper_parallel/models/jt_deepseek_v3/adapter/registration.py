@@ -45,6 +45,7 @@ JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     fsdp_wrap_modules=lambda model: (
         tuple(f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers)))
         + tuple(name for name, _ in model.named_modules() if name.endswith(".mlp.gate"))
+        + tuple(name for name, _ in model.named_modules() if name.endswith("norm"))
     ),
 )
 register_model_adapter(JT_DEEPSEEK_V3_ADAPTER_SPEC)

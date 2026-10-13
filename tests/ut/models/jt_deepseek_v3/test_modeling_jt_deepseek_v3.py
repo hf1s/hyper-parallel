@@ -202,15 +202,23 @@ class TestCompleteModel(unittest.TestCase):
 
         Description: Resolve FSDP units for the JT model through the framework manager.
         Expectation: The JT adapter applies; each MTP transformer layer is one unit, not split leaves, and every
-            router is its own FP32 unit (MF alignment experiment).
+            router and RMSNorm is its own FP32 unit (MF alignment experiment).
         """
         model = JTDeepseekV3ForCausalLM(small_config())
         self.assertEqual(FSDP2Manager._get_model_adapter_spec(model).model_type, "jt_deepseek_v3")
         manager = FSDP2Manager(FSDP2Config(), SimpleNamespace(fsdp_moe_mesh=None))
         self.assertEqual(
             sorted(unit.fqn for unit in manager._find_wrap_modules(model)),
-            ["model.layers.0", "model.layers.1", "model.layers.1.mlp.gate", "mtp.layers.0.transformer_layer",
-             "mtp.layers.0.transformer_layer.mlp.gate"],
+            ["model.layers.0", "model.layers.0.input_layernorm", "model.layers.0.post_attention_layernorm",
+             "model.layers.0.self_attn.kv_a_layernorm", "model.layers.0.self_attn.q_a_layernorm",
+             "model.layers.1", "model.layers.1.input_layernorm", "model.layers.1.mlp.gate",
+             "model.layers.1.post_attention_layernorm", "model.layers.1.self_attn.kv_a_layernorm",
+             "model.layers.1.self_attn.q_a_layernorm", "model.norm", "mtp.layers.0.enorm",
+             "mtp.layers.0.final_layernorm", "mtp.layers.0.hnorm", "mtp.layers.0.transformer_layer",
+             "mtp.layers.0.transformer_layer.input_layernorm", "mtp.layers.0.transformer_layer.mlp.gate",
+             "mtp.layers.0.transformer_layer.post_attention_layernorm",
+             "mtp.layers.0.transformer_layer.self_attn.kv_a_layernorm",
+             "mtp.layers.0.transformer_layer.self_attn.q_a_layernorm"],
         )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
