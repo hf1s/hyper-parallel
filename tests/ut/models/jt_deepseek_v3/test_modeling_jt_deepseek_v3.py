@@ -18,6 +18,7 @@
 from types import SimpleNamespace
 from typing import Any
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
@@ -28,6 +29,10 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3Gate, JTDeepseekV3MoE,
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention, JTDeepseekV3RotaryEmbedding,
 )
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import (
+    _latent_inputs, _head_projection_request,
+)
+from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
 from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
 from hyper_parallel.data.batching import TextParallelBatch
@@ -59,6 +64,65 @@ def small_config() -> JTDeepseekV3Config:
 
 class TestCompleteModel(unittest.TestCase):
     """Exercise model semantics without a builder, EP adapter or replacement pass."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_mla_releases_query_views_before_kv_expansion(self):
+        """Feature: MLA query lifetime, including latent CP projections.
+
+        Description: Observe Q storage through a weak reference at the KV projection boundary.
+        Expectation: The obsolete unrotated query is released in checkpoint-style no-grad execution.
+        """
+        config = small_config()
+        for latent_cp in (False, True):
+            with self.subTest(latent_cp=latent_cp):
+                module = JTDeepseekV3MLAAttention(module=JTDeepseekV3Attention(config, 0))
+                query_references = []
+                module.q_b_proj.register_forward_hook(
+                    lambda _module, _args, output: query_references.append(weakref.ref(output)))
+
+                def check_lifetime(_module: Any, _args: Any) -> None:
+                    """Avoid retaining the projection while testing whether its storage is still owned."""
+                    self.assertIsNone(query_references[-1]())
+
+                module.kv_b_proj.register_forward_pre_hook(check_lifetime)
+                hidden = torch.randn(1, 7, config.hidden_size)
+                angles = torch.randn(1, 7, config.qk_rope_head_dim)
+                positions = (angles.cos(), angles.sin())
+                with torch.no_grad():
+                    if latent_cp:
+                        _commit_forward_rewrite(_head_projection_request(
+                            module.kv_b_proj, module.qk_nope_head_dim + module.v_head_dim))
+                        runtime = SimpleNamespace(degree=1, compute_heads=module.num_heads,
+                                                  head_range=(0, module.num_heads), latent=lambda *values: values)
+                        _latent_inputs(module, runtime, hidden, positions)
+                    else:
+                        module._project_attention_inputs(hidden, positions, None)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_mla_rotary_lifetime_preserves_fp32_formula(self):
+        """Feature: Explicit FP32 RoPE temporary lifetime.
+
+        Description: Compare the rotation and all input gradients against the original expression.
+        Expectation: Interleaving, FP32 arithmetic and gradients remain exactly equal.
+        """
+        torch.manual_seed(19)
+        rotary = JTDeepseekV3RotaryEmbedding()
+        values = torch.randn(2, 3, 7, 4)
+        positions = [torch.randn(2, 7, 4) for _ in range(2)]
+        captures = []
+        for optimized in (False, True):
+            inputs, cosine, sine = [value.clone().requires_grad_() for value in (values, *positions)]
+            if optimized:
+                output = rotary(inputs, cosine, sine)
+            else:
+                ordered = torch.cat((inputs[..., ::2], inputs[..., 1::2]), -1).float()
+                first, second = ordered.chunk(2, -1)
+                rotated = torch.cat((-second, first), -1)
+                output = ordered * cosine.unsqueeze(1).float() + rotated * sine.unsqueeze(1).float()
+            output.square().sum().backward()
+            captures.append((output.detach(), inputs.grad, cosine.grad, sine.grad))
+        for expected, actual in zip(*captures, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_standalone_forward_backward(self):

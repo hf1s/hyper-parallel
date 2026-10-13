@@ -67,6 +67,8 @@ def _latent_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel
     cos, sin = positions
     query = torch.cat((query_pass.transpose(1, 2),
                        module.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
+    # The split views retain the old Q projection across KV exchange and expansion.
+    del query_pass, query_rope
     key_rope = module.explicit_rotary(key_rope.unsqueeze(1), cos, sin).squeeze(1)
     query, kv_latent, key_rope = runtime.latent(query, kv_latent, key_rope)
     kv_states = module.kv_b_proj(kv_latent.unsqueeze(1), mla_head_range=runtime.head_range)

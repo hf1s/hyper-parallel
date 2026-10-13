@@ -107,7 +107,11 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1).float()
         first, second = ordered.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-        output = ordered * cos.unsqueeze(1).float() + rotated * sin.unsqueeze(1).float()
+        cosine_term = ordered * cos.unsqueeze(1).float()
+        # Drop the input and its views before allocating the remaining FP32 terms.
+        del ordered, first, second
+        rotated = rotated * sin.unsqueeze(1).float()
+        output = cosine_term + rotated
         return output.to(values.dtype)
 
 
@@ -225,13 +229,16 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         batch, sequence = query_latent.shape[:2]
         query = self.q_b_proj(query_latent).reshape(batch, sequence, self.num_heads, self.qk_head_dim)
         query_pass, query_rope = query.split((self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
+        cos, sin = position_embeddings
+        query = torch.cat((query_pass.transpose(1, 2),
+                           self.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
+        # These views otherwise retain the unrotated query while the key is materialized.
+        del query_pass, query_rope
+        # Keep expanded KV out of the FP32 query rotation's working set.
         kv_latent = kv_latent.reshape(batch, 1, sequence, self.kv_lora_rank)
         kv_states = self.kv_b_proj(kv_latent).view(
             batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
         key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
-        cos, sin = position_embeddings
-        query = torch.cat((query_pass.transpose(1, 2),
-                           self.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
         key_rope = self.explicit_rotary(key_rope.unsqueeze(1), cos, sin)
         key = torch.cat((key_pass, key_rope.expand(-1, self.num_heads, -1, -1)), dim=-1)
         return query, key, value
