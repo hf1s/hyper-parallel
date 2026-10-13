@@ -17,6 +17,8 @@
 __all__ = ["CheckpointerCallback"]
 
 import os
+import json
+import numpy as np
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -317,6 +319,103 @@ class CheckpointerCallback(Callback):
             raise FileNotFoundError(f"Checkpoint directory not found: {restore_path}")
         return restore_path
 
+    def _load_offline_state(self, restore_path: str) -> None:
+        """Restore the MF-converted offline state artifact.
+
+        The artifact contains model.npz (already consumed by jt_builder),
+        optimizer.npz, and state.json.  This path intentionally bypasses DCP:
+        the source state is MF safetensors, not an HP-native checkpoint.
+        """
+        if not self._restore_train_state:
+            raise ValueError("MF offline state requires restore_train_state=True")
+
+        state_path = os.path.join(restore_path, "state.json")
+        optimizer_path = os.path.join(restore_path, "optimizer.npz")
+        if not os.path.isfile(state_path) or not os.path.isfile(optimizer_path):
+            raise FileNotFoundError(
+                "Offline state requires state.json and optimizer.npz: "
+                f"{restore_path}"
+            )
+
+        with open(state_path, encoding="utf-8") as stream:
+            state = json.load(stream)
+        global_step = int(state["global_step"])
+        consumed_samples = int(state["consumed_samples"])
+
+        optimizers = _as_list(self.trainer.optimizer) if self._restore_optimizer else []
+        if optimizers:
+            for optimizer in optimizers:
+                if not initialize_optimizer_state(optimizer):
+                    raise RuntimeError("Could not materialize HP optimizer state for MF restore")
+
+            optimizer_state = _unwrap_single(
+                [optimizer.state_dict() for optimizer in optimizers]
+            )
+            with np.load(optimizer_path, allow_pickle=False) as archive:
+                for name, fields in optimizer_state.items():
+                    if not isinstance(fields, dict):
+                        continue
+                    for field, source_prefix in (
+                        ("exp_avg", "adam_m"),
+                        ("exp_avg_sq", "adam_v"),
+                        ("momentum_buffer", "muon_m"),
+                    ):
+                        source_name = f"{source_prefix}.{name}"
+                        if source_name not in archive.files or field not in fields:
+                            continue
+                        current = fields[field]
+                        value = torch.from_numpy(np.asarray(archive[source_name]))
+                        if torch.is_tensor(current):
+                            value = value.to(device=current.device, dtype=current.dtype)
+                        fields[field] = value
+                    if "step" in fields:
+                        current = fields["step"]
+                        value = torch.tensor(global_step)
+                        if torch.is_tensor(current):
+                            value = value.to(device=current.device, dtype=current.dtype)
+                        fields["step"] = value
+
+            for optimizer in optimizers:
+                optimizer.load_state_dict(optimizer_state)
+                for param_group in getattr(optimizer, "param_groups", []):
+                    if "step" in param_group:
+                        param_group["step"] = global_step
+
+        self.trainer.state.global_step = global_step
+        self.trainer.state.epoch = int(state.get("epoch_num", 0))
+        self._set_start_position_from_state()
+
+        dataloader = self.trainer.train_dataloader
+        if not hasattr(dataloader, "state_dict") or not hasattr(dataloader, "load_state_dict"):
+            raise TypeError("MF offline state requires a stateful HP train dataloader")
+        dataloader_state = dataloader.state_dict()
+
+        def set_cursor(value: Any) -> bool:
+            changed = False
+            if isinstance(value, dict):
+                if "consumed_samples" in value:
+                    value["consumed_samples"] = consumed_samples
+                    value["global_batch_size"] = int(state["global_batch_size"])
+                    value["epoch"] = 0
+                    changed = True
+                for child in value.values():
+                    changed = set_cursor(child) or changed
+            elif isinstance(value, list):
+                for child in value:
+                    changed = set_cursor(child) or changed
+            return changed
+
+        if not set_cursor(dataloader_state):
+            raise ValueError("Could not locate consumed_samples in HP dataloader state")
+        dataloader.load_state_dict(dataloader_state)
+        self._last_saved_step = global_step
+        logger.info(
+            "Loaded MF offline state: global_step=%s, consumed_samples=%s, path=%s",
+            global_step,
+            consumed_samples,
+            restore_path,
+        )
+
     def _load_checkpoint(self) -> None:
         """Restore a checkpoint into the trainer's live objects."""
         restore_path = self._resolve_restore_path()
@@ -324,6 +423,9 @@ class CheckpointerCallback(Callback):
             return
 
         logger.info("Loading checkpoint from %s", restore_path)
+        if os.path.isfile(os.path.join(restore_path, "CONVERSION.json")):
+            self._load_offline_state(restore_path)
+            return
 
         optimizers = _as_list(self.trainer.optimizer) if self._restore_optimizer else []
         for optimizer in optimizers:
