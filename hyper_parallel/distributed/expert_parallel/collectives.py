@@ -24,7 +24,10 @@ computation).
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
-from typing import Any
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -85,15 +88,20 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
     """
 
     @staticmethod
-    def _pad_and_exchange(x, counts, pad_to, group):
-        """Pad each chunk to pad_to, run equal-length a2a_single, return [ep*pad_to, ...]."""
+    def _pad(x, counts, pad_to):
+        """Pad destination chunks to a globally consistent row count."""
         chunks = []
         for chunk, n in zip(x.split(counts), counts):
             if n < pad_to:
                 pad = x.new_zeros((pad_to - n,) + tuple(x.shape[1:]))
                 chunk = torch.cat([chunk, pad])
             chunks.append(chunk)
-        send = torch.cat(chunks).contiguous()
+        return torch.cat(chunks).contiguous()
+
+    @staticmethod
+    def _pad_and_exchange(x, counts, pad_to, group):
+        """Pad each chunk to pad_to, run equal-length a2a_single, return [ep*pad_to, ...]."""
+        send = _EPAllToAllPadded._pad(x, counts, pad_to)
         recv = torch.empty_like(send)
         dist.all_to_all_single(recv, send, group=group)
         return recv
@@ -106,7 +114,7 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
             if n > 0:
                 pieces.append(recv[i * pad_to: i * pad_to + n])
         if not pieces:
-            return recv.new_zeros((0,) + tuple(recv.shape[1:]))
+            return recv[:0]
         return torch.cat(pieces)
 
     @staticmethod
@@ -141,17 +149,108 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         return grad, None, None, None
 
 
+@dataclass
+class _PendingEPExchange:
+    """Retain send storage only until the outstanding exchange is waited."""
+
+    work: Any
+    send_buffer: torch.Tensor | None
+    pad_to: int = 0
+
+    def wait(self) -> None:
+        """Join communication and release the temporary send buffer."""
+        self.work.wait()
+        self.send_buffer = None
+
+
+class _EPAllToAllAsync(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Launch token exchange; the caller waits before consuming or unpadding it."""
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, send_counts: list[int], recv_counts: list[int],
+                group: Any) -> tuple:  # pylint: disable=arguments-differ
+        """Return the pending output and its storage-owning work handle.
+
+        Args:
+            ctx: Autograd context for reverse exchange metadata.
+            x: Contiguous expert-major rows.
+            send_counts: Rows sent to each rank.
+            recv_counts: Rows received from each rank.
+            group: Expert process group.
+
+        Returns:
+            Output storage and a pending exchange that must be waited.
+        """
+        ctx.send_counts, ctx.recv_counts, ctx.group = send_counts, recv_counts, group
+        ctx.pad_to = 0
+        if _backend_supports_uneven_a2a(group):
+            out = x.new_empty((sum(recv_counts),) + tuple(x.shape[1:]))
+            work = dist.all_to_all(list(out.split(recv_counts)), list(x.split(send_counts)),
+                                   group=group, async_op=True)
+            return out, _PendingEPExchange(work, x)
+        pad_size = x.new_tensor([max([*send_counts, *recv_counts, 1])], dtype=torch.int64)
+        dist.all_reduce(pad_size, op=dist.ReduceOp.MAX, group=group)
+        pad_to = int(pad_size.item())
+        send = _EPAllToAllPadded._pad(x, send_counts, pad_to)
+        ctx.pad_to = pad_to
+        out = torch.empty_like(send)
+        work = dist.all_to_all_single(out, send, group=group, async_op=True)
+        return out, _PendingEPExchange(work, send, pad_to)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor,
+                 _grad_pending: Any) -> tuple:  # pylint: disable=arguments-differ
+        """Reverse the exchange, excluding filler rows from the padded path.
+
+        Args:
+            ctx: Saved split counts and process group.
+            grad_output: Gradient of the completed exchange.
+            _grad_pending: No gradient for the Python work handle.
+
+        Returns:
+            Input gradient and placeholders for non-tensor inputs.
+        """
+        if ctx.pad_to:
+            grad_output = _EPAllToAllPadded._unpad(grad_output, ctx.recv_counts, ctx.pad_to)
+        grad = ep_all_to_all(grad_output.contiguous(), ctx.recv_counts, ctx.send_counts, ctx.group)
+        return grad, None, None, None
+
+
 def ep_all_to_all(
     x: torch.Tensor,
     send_counts: list[int],
     recv_counts: list[int],
     group: Any,
+    *,
+    overlap_fn: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     """Unified entry for EP token exchange (autograd-differentiable).
 
-    send_counts/recv_counts: list[int], length ep_size, row counts per dest/src rank.
     NCCL/HCCL -> ragged a2a (zero-padding); other backends (gloo test path) -> pad-to-max.
+
+    When supplied, ``overlap_fn`` runs with the caller's autograd mode while
+    the exchange is pending. The work is waited even if independent compute
+    raises; no pending output is exposed to the callback or the caller.
+
+    Args:
+        x: Contiguous rows to exchange.
+        send_counts: Row counts per destination rank.
+        recv_counts: Row counts per source rank.
+        group: Expert process group.
+        overlap_fn: Optional independent compute executed before the combine wait.
+
+    Returns:
+        Completed exchanged rows with differentiable reverse communication.
     """
+    if overlap_fn is not None:
+        output, pending = _EPAllToAllAsync.apply(x, send_counts, recv_counts, group)
+        try:
+            overlap_fn()
+        finally:
+            pending.wait()
+        if pending.pad_to:
+            return _EPAllToAllPadded._unpad(output, recv_counts, pending.pad_to)
+        return output
     if _backend_supports_uneven_a2a(group):
         return _EPAllToAllUneven.apply(x, send_counts, recv_counts, group)
     return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)

@@ -21,7 +21,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -53,6 +53,13 @@ class JTDeepseekV3Config(DeepseekV32Config):
     """DeepSeek-V3.2 configuration registered as the ``jt_deepseek_v3`` model type."""
 
     model_type = "jt_deepseek_v3"
+
+    def __init__(self, *, shared_expert_overlap: bool = False, **kwargs: Any) -> None:
+        """Configure optional EP combine overlap with the shared expert MLP."""
+        if not isinstance(shared_expert_overlap, bool):
+            raise ValueError("shared_expert_overlap must be a boolean")
+        super().__init__(**kwargs)
+        self.shared_expert_overlap = shared_expert_overlap
 
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
@@ -455,7 +462,8 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.gate.e_score_correction_bias.add_((counts.mean() - counts).sign(), alpha=lr)
         self.tokens_per_expert = None
 
-    def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def local_routed_forward(self, hidden: torch.Tensor, *,
+                             combine_overlap: Callable[[], None] | None = None) -> torch.Tensor:
         """Run the routed experts on this rank without expert parallelism.
 
         Routing weights are cast to the activation dtype, as in the EP combine.
@@ -476,7 +484,10 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             values = F.silu(gate) * up
             values = F.linear(values, self.experts.down_proj[expert])
             outputs = outputs.index_put((tokens, slots), values)
-        return (outputs * probabilities.to(outputs.dtype).unsqueeze(-1)).sum(1).reshape(hidden.shape)
+        routed = (outputs * probabilities.to(outputs.dtype).unsqueeze(-1)).sum(1).reshape(hidden.shape)
+        if combine_overlap is not None:
+            combine_overlap()
+        return routed
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
@@ -505,8 +516,19 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         hidden = hidden_states
         if self.padding:
             hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
-        routed = self.ep_compute(hidden)
-        return routed[:, self.padding:] + self.shared_experts(hidden_states)
+        if self.config.shared_expert_overlap:
+            shared = None
+
+            def compute_shared() -> None:
+                """Keep shared output local to this forward, including checkpoint recomputation."""
+                nonlocal shared
+                shared = self.shared_experts(hidden_states)
+
+            routed = self.ep_compute(hidden, combine_overlap=compute_shared)
+        else:
+            routed = self.ep_compute(hidden)
+            shared = self.shared_experts(hidden_states)
+        return routed[:, self.padding:] + shared
 
 
 class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):

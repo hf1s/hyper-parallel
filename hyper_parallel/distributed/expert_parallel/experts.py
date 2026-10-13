@@ -32,6 +32,8 @@ Nothing in this module probes model structure with getattr fallback chains.
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -279,6 +281,7 @@ def _run_ep_local_experts(
     receive_counts: list[int],
     ep_group: Any,
     expert_offset: int,
+    combine_overlap: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     """Dispatch tokens, run local experts, and return combined expert outputs."""
     received_states = ep_all_to_all(dispatched_states, send_counts, receive_counts, ep_group)
@@ -286,6 +289,9 @@ def _run_ep_local_experts(
         dispatched_indices, send_counts, receive_counts, ep_group
     ).squeeze(-1)
     local_outputs = module.experts(received_states, received_indices - expert_offset)
+    if combine_overlap is not None:
+        return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group,
+                             overlap_fn=combine_overlap)
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
 
 
@@ -314,6 +320,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    combine_overlap: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -348,6 +355,8 @@ def ep_routed_forward(
 
     ``router_fn`` is supplied BY THE CALLER (explicit choice, e.g. an entry
     of MOE_ROUTER_ADAPTERS picked by name in the factory code).
+    ``combine_overlap`` optionally schedules independent model-owned compute
+    during the final all-to-all, before routed output aggregation.
 
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
@@ -355,6 +364,16 @@ def ep_routed_forward(
     homogeneous across TP). Expert weights are only Shard(0) along the
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
+
+    Args:
+        module: Model-owned MoE module with bound local expert execution.
+        hidden_states: Local token states, ``[batch, sequence, hidden]``.
+        router_fn: Model-owned expert selection and weighting.
+        ep_group: Extended expert process group.
+        combine_overlap: Independent compute to schedule before waiting for combine.
+
+    Returns:
+        Weighted routed output in the input's local sequence layout.
     """
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
@@ -381,6 +400,7 @@ def ep_routed_forward(
         dispatch.receive_counts,
         ep_group,
         expert_offset,
+        combine_overlap,
     )
     return _aggregate_ep_outputs(
         combined_expert_outputs,

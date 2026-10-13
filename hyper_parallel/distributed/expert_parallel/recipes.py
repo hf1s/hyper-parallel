@@ -86,7 +86,9 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable
+from __future__ import annotations
+
+from typing import Any, Callable, Sequence
 
 import torch
 
@@ -140,7 +142,7 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
 ) -> Callable:
@@ -156,6 +158,18 @@ def build_ep_compute(
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
+
+    Args:
+        module: MoE module to validate and bind.
+        ep_mesh: Expert mesh holding the extended EP group.
+        router_fn: Model-owned expert selection and weighting.
+        archetype_key: Diagnostic identity of the explicit recipe.
+        expected_attrs: Required MoE attributes.
+        combine: Model-owned output composition function.
+        use_grouped_gemm: Whether to bind the grouped expert kernel.
+
+    Returns:
+        Executor accepting optional independent compute during combine.
     """
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
@@ -170,10 +184,23 @@ def build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
-    def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run the routed branch and compose the MoE block output."""
-        routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+    def compute_fn(module: Any, hidden_states: torch.Tensor, *,
+                   combine_overlap: Callable[[], None] | None = None) -> torch.Tensor:
+        """Run the routed branch and compose the MoE block output.
+
+        Args:
+            module: Model-owned MoE module.
+            hidden_states: Local token states.
+            combine_overlap: Independent compute to schedule before the combine wait.
+
+        Returns:
+            Composed output of the explicit MoE recipe.
+        """
+        if combine_overlap is None:
+            routed = ep_routed_forward(module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+        else:
+            routed = ep_routed_forward(module, hidden_states, router_fn=router_fn, ep_group=ep_group,
+                                       combine_overlap=combine_overlap)
         return combine(module, hidden_states, routed)
 
     return compute_fn
