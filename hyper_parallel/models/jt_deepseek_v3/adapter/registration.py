@@ -42,8 +42,9 @@ JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     sharding_rules=build_parameter_sharding_rules,
     expert_parallel=_load_expert_parallel,
     context_parallel=_load_context_parallel,
-    fsdp_wrap_modules=lambda model: tuple(
-        f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers))
+    fsdp_wrap_modules=lambda model: (
+        tuple(f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers)))
+        + tuple(name for name, _ in model.named_modules() if name.endswith(".mlp.gate"))
     ),
 )
 register_model_adapter(JT_DEEPSEEK_V3_ADAPTER_SPEC)

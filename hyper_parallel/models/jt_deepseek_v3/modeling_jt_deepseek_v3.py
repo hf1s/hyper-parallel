@@ -356,7 +356,7 @@ class JTDeepseekV3Gate(DeepseekV32TopkRouter):
         Args:
             hidden_states: Router inputs, ``[..., hidden]``.
         """
-        self.router_logits = F.linear(hidden_states.reshape(-1, self.hidden_dim), self.weight)
+        self.router_logits = F.linear(hidden_states.reshape(-1, self.hidden_dim).float(), self.weight.float())
         return self.router_logits
 
     def pop_router_logits(self) -> torch.Tensor:
