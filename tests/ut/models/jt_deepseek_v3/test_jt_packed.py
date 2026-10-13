@@ -36,8 +36,8 @@ class TestJTPacked(unittest.TestCase):
         DefaultDeviceType.set_device_type("cpu")
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_packed_lm_mtp_equal_independent_documents(self) -> None:
-        """Packed losses and gradients equal token-weighted independent document runs."""
+    def test_packed_lm_equals_independent_documents_and_mtp_shifts_whole_row(self) -> None:
+        """Packed LM equals independent documents; MTP inputs shift across documents as in MindFormers."""
         torch.manual_seed(8)
         config = small_config()
         config.moe_aux_loss_coeff = 0.0
@@ -46,18 +46,26 @@ class TestJTPacked(unittest.TestCase):
         separate = copy.deepcopy(packed)
         tokens = torch.arange(1, 9).unsqueeze(0)
         labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, -100]])
-        output = packed(tokens, labels, actual_seq_len=(4, 8)).loss
+        embedded = []
+        handle = packed.model.embed_tokens.register_forward_hook(
+            lambda _module, inputs, _output: embedded.append(inputs[0].tolist()))
+        try:
+            output = packed(tokens, labels, actual_seq_len=(4, 8)).loss
+        finally:
+            handle.remove()
+        # Trunk, then MTP depths 1 and 2: the first document's tail sees the second document's tokens.
+        self.assertEqual(embedded, [[[1, 2, 3, 4, 5, 6, 7, 8]], [[2, 3, 4, 5, 6, 7, 8, 0]], [[3, 4, 5, 6, 7, 8, 0, 0]]])
         left = separate(tokens[:, :4], labels[:, :4]).loss
         right = separate(tokens[:, 4:], labels[:, 4:]).loss
-        keys = ("foundation_loss/lm", "foundation_loss/mtp")
-        expected = {key: (left[key] + right[key]) / 2 for key in keys}
-        for key in keys:
-            torch.testing.assert_close(output[key], expected[key], rtol=2e-5, atol=2e-6)
-        sum(output[key] for key in keys).backward()
-        sum(expected.values()).backward()
+        key = "foundation_loss/lm"
+        expected = (left[key] + right[key]) / 2
+        torch.testing.assert_close(output[key], expected, rtol=2e-5, atol=2e-6)
+        output[key].backward()
+        expected.backward()
         torch.testing.assert_close(
-            {name: parameter.grad for name, parameter in packed.named_parameters()},
-            {name: parameter.grad for name, parameter in separate.named_parameters()}, rtol=3e-4, atol=2e-6)
+            {name: parameter.grad for name, parameter in packed.named_parameters() if parameter.grad is not None},
+            {name: parameter.grad for name, parameter in separate.named_parameters() if parameter.grad is not None},
+            rtol=3e-4, atol=2e-6)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_chunked_lm_mtp_preserves_packed_losses_and_gradients(self) -> None:
