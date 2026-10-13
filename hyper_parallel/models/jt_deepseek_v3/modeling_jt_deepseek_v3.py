@@ -48,6 +48,8 @@ from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
+from hyper_parallel.core.activation_memory import is_recomputing
+
 
 class JTDeepseekV3Config(DeepseekV32Config):
     """DeepSeek-V3.2 configuration registered as the ``jt_deepseek_v3`` model type."""
@@ -420,7 +422,10 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
         scores = self.gate.pop_router_logits().sigmoid()
-        self.auxiliary_loss = self.routing_statistics(indices, scores)
+        auxiliary_loss = self.routing_statistics(indices, scores)
+        # The loss owns the original forward graph; caching its replay retains old layer activations.
+        if not is_recomputing():
+            self.auxiliary_loss = auxiliary_loss
         flat_indices = indices.reshape(-1)
         # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
         counts = flat_indices.new_zeros(config.n_routed_experts, dtype=torch.float32).scatter_add_(

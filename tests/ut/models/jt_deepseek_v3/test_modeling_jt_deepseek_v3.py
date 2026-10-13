@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
@@ -29,6 +30,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention, JTDeepseekV3RotaryEmbedding,
 )
 from hyper_parallel.components.losses import calculate_seq_aux_loss
+from hyper_parallel.core.activation_memory import checkpoint as activation_checkpoint
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
@@ -59,6 +61,48 @@ def small_config() -> JTDeepseekV3Config:
 
 class TestCompleteModel(unittest.TestCase):
     """Exercise model semantics without a builder, EP adapter or replacement pass."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_moe_recomputation_retains_forward_auxiliary_graph(self):
+        """Feature: MoE auxiliary-loss cache lifetime.
+
+        Description: Compare eager and checkpointed top-2 routing using an auxiliary-only objective.
+        Expectation: Replay preserves the forward cache, loss and nonzero input/router gradients exactly.
+        """
+        config = small_config()
+        config.moe_aux_loss_coeff = 0.3
+        torch.manual_seed(97)
+        reference = JTDeepseekV3MoE(config)
+        with torch.no_grad():
+            for parameter in reference.parameters():
+                parameter.normal_(0.0, 0.1)
+            reference.gate.e_score_correction_bias.zero_()
+        hidden = torch.randn(1, 31 + reference.padding, config.hidden_size)
+        captures = []
+        previous_device = DefaultDeviceType.get_device_type()
+        DefaultDeviceType.set_device_type("cpu")
+        try:
+            for recompute in (False, True):
+                module = JTDeepseekV3MoE(config)
+                module.load_state_dict(reference.state_dict())
+                inputs = hidden.clone().requires_grad_()
+
+                def operation(value: torch.Tensor) -> torch.Tensor:
+                    """Keep routing in the checkpoint while isolating the auxiliary gradient below."""
+                    _, selected = module.route(value)
+                    return selected.square().mean()
+
+                output = activation_checkpoint(operation, inputs) if recompute else operation(inputs)
+                forward_aux = module.auxiliary_loss
+                (output * 0 + forward_aux).backward()
+                self.assertIs(module.auxiliary_loss, forward_aux)
+                captures.append((forward_aux.detach(), inputs.grad, module.gate.weight.grad))
+        finally:
+            DefaultDeviceType.set_device_type(previous_device)
+        for expected, actual in zip(*captures, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for gradient in captures[0][1:]:
+            self.assertGreater(gradient.norm().item(), 1e-8)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_standalone_forward_backward(self):
