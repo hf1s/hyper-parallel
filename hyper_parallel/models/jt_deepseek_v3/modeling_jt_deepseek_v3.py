@@ -761,7 +761,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens,
                               head=None if self.loss_chunk_size else self.lm_head,
                               decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs,
-                              sequence_end_mask=sequence_end_mask)
+                              sequence_end_mask=None)
         for layer in self.mtp.layers:
             auxiliary = auxiliary + layer.transformer_layer.mlp.auxiliary_loss
         shift_targets = partial(self.shift_mtp_inputs, pad_value=-100)
@@ -769,11 +769,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             mtp_loss = torch.zeros_like(lm_loss)
             depths = len(mtp_output.prediction_hidden_states)
             targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets,
-                                                sequence_end_mask=sequence_end_mask)
+                                                sequence_end_mask=None)
             for prediction, future_targets in zip(mtp_output.prediction_hidden_states, targets_by_depth):
                 mtp_loss = mtp_loss + self._projection_loss(prediction, future_targets) * (cfg.mtp_loss_factor / depths)
         else:
             mtp_loss = calculate_mtp_loss(mtp_output.logits, targets, self._mtp_token_loss, vocab_size=cfg.vocab_size,
                                           loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets,
-                                          sequence_end_mask=sequence_end_mask)
+                                          sequence_end_mask=None)
         return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}
