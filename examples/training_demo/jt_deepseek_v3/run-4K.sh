@@ -42,14 +42,4 @@ printf '%q ' "${command[@]}" > "$RUN_DIR/command.sh"
 printf '\n' >> "$RUN_DIR/command.sh"
 "${command[@]}"
 printf '{"canonical_entry":true,"worktree":"%s","steps":%s}\n' "$WORKTREE_ROOT" "$STEPS" > "$RUN_DIR/SUCCESS.json"
-MF_REFERENCE="${MF_REFERENCE:-/workspace/reference/mf-4k-from-256k/info.log}"
-if [ -f "$MF_REFERENCE" ]; then
-  /workspace/venv/bin/python "$SCRIPT_DIR/compare_hp_mf.py" \
-    --mf "$MF_REFERENCE" \
-    --run "current=$RUN_DIR" \
-    --steps "301-$STEPS" \
-    --out "$RUN_DIR/plots"
-else
-  printf 'MF reference not found; skipped plotting: %s\n' "$MF_REFERENCE" >&2
-fi
 printf 'Training complete: %s\n' "$RUN_DIR"
