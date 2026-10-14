@@ -52,6 +52,16 @@ from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTE
 class JTDeepseekV3Config(DeepseekV32Config):
     """DeepSeek-V3.2 configuration registered as the ``jt_deepseek_v3`` model type."""
 
+    def __post_init__(self, **kwargs: Any) -> None:
+        """Validate fixed routing, an opt-in deterministic performance-tuning mode."""
+        fix_router = kwargs.pop("fix_router", False)
+        if not isinstance(fix_router, bool):
+            raise ValueError("fix_router must be a boolean")
+        super().__post_init__(**kwargs)
+        self.fix_router = fix_router
+        if fix_router and not 1 <= self.num_experts_per_tok <= self.n_routed_experts:
+            raise ValueError("fix_router requires 1 <= num_experts_per_tok <= n_routed_experts")
+
     model_type = "jt_deepseek_v3"
 
 
@@ -418,8 +428,13 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """
         padding, config = self.padding, self.config
         hidden = hidden[:, padding:]
-        indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
-        scores = self.gate.pop_router_logits().sigmoid()
+        if config.fix_router:
+            self.gate(hidden)
+            scores = self.gate.pop_router_logits().sigmoid()
+            indices, selected = self.fixed_routing(scores)
+        else:
+            indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
+            scores = self.gate.pop_router_logits().sigmoid()
         self.auxiliary_loss = self.routing_statistics(indices, scores)
         flat_indices = indices.reshape(-1)
         # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
@@ -432,6 +447,27 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             indices = torch.cat((pad_ids, indices))
             selected = torch.cat((selected.new_zeros(padding, selected.shape[-1]), selected))
         return indices, selected
+
+    def fixed_routing(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Assign consecutive token slots cyclically while retaining learned weights.
+
+        This performance-tuning mode changes model semantics. Each token receives
+        distinct experts, and real-token counts per expert differ by at most one.
+        The assignment is independent of input, correction bias and RNG state.
+
+        Args:
+            scores: FP32 sigmoid router affinities, ``[real_tokens, num_experts]``.
+
+        Returns:
+            Deterministic expert indices and differentiable routing weights.
+        """
+        config = self.config
+        slots = torch.arange(scores.shape[0] * config.num_experts_per_tok, device=scores.device)
+        indices = slots.reshape(-1, config.num_experts_per_tok) % config.n_routed_experts
+        selected = scores.gather(1, indices)
+        if config.norm_topk_prob:
+            selected = selected / (selected.sum(dim=-1, keepdim=True) + 1e-20)
+        return indices, selected * config.routed_scaling_factor
 
     def routing_statistics(self, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         """Compute the sequence objective separately from step-level router counts.
