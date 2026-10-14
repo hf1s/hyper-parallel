@@ -44,10 +44,17 @@ def enable_high_precision_for_bf16() -> None:
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
 
-def enable_full_determinism(seed: int) -> None:
+def enable_full_determinism(seed: int, *, close_matmul_k_shift: bool | None = None) -> None:
     """
     Helper function for reproducibility in distributed training.
     See https://pytorch.org/docs/stable/notes/randomness.html for details.
+
+    Args:
+        seed: Seed applied to Python, NumPy, and framework generators.
+        close_matmul_k_shift: NPU matmul tiling policy. ``None`` (default) leaves
+            ``CLOSE_MATMUL_K_SHIFT`` untouched; ``True``/``False`` force it to ``1``/``0``
+            for cross-framework bitwise parity. Select it before the first matmul in a
+            fresh process.
     """
 
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -57,12 +64,15 @@ def enable_full_determinism(seed: int) -> None:
     if IS_NPU_AVAILABLE:
         # The environment variable required for deterministic collective communication on Ascend NPUs.
         os.environ["NCCL_DETERMINISTIC"] = "true"
-        # Deliberately not touching CLOSE_MATMUL_K_SHIFT here: CANN's K-shift and non-K-shift matmul
-        # tilings are each independently run-to-run reproducible on their own (confirmed on real
-        # hardware), so neither is required for *this* function's determinism guarantee. Forcing it
-        # off only matters for bitwise comparison against a reference implementation that happens to
-        # use CANN's default (non-K-shift) tiling, which is a cross-framework parity concern, not a
-        # determinism one, and doesn't belong in this function.
+        # K-shift is deliberately not part of this function's determinism guarantee: CANN's K-shift
+        # and non-K-shift matmul tilings are each independently run-to-run reproducible on their own
+        # (confirmed on real hardware), so neither is required for determinism. The matmul tiling only
+        # matters for bitwise comparison against a reference implementation that uses CANN's default
+        # (non-K-shift) tiling, which is a cross-framework parity concern. Therefore the environment is
+        # left untouched unless the caller explicitly selects a policy (``None`` keeps the process
+        # value; ``True``/``False`` force ``CLOSE_MATMUL_K_SHIFT`` to ``1``/``0``).
+        if close_matmul_k_shift is not None:
+            os.environ["CLOSE_MATMUL_K_SHIFT"] = "1" if close_matmul_k_shift else "0"
 
     random.seed(seed)
     np.random.seed(seed)
@@ -80,14 +90,19 @@ def enable_full_determinism(seed: int) -> None:
         torch.npu.manual_seed_all(seed)
 
 
-def set_seed(seed: int | None, full_determinism: bool = False) -> None:
+def set_seed(seed: int | None, full_determinism: bool = False, *, close_matmul_k_shift: bool | None = None) -> None:
     """
     Sets a manual seed on all devices.
+
+    Args:
+        seed: Seed to apply, or ``None`` to leave the process unchanged.
+        full_determinism: Whether to configure deterministic algorithms as well as RNGs.
+        close_matmul_k_shift: NPU matmul policy used only with full determinism.
     """
     if seed is None:
         return
     if full_determinism:
-        enable_full_determinism(seed)
+        enable_full_determinism(seed, close_matmul_k_shift=close_matmul_k_shift)
     else:
         set_seed_func(seed)
 

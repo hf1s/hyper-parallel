@@ -45,6 +45,25 @@ accelerator:
 
 外层字段的类型注解确定嵌套 mapping 对应的 dataclass。因此根 YAML 只接受 `TrainerConfig` 声明的字段，嵌套配置也只接受对应 dataclass 声明的字段。
 
+### NPU 矩阵乘法的确定性配置
+
+`training.enable_full_determinism: true` 开启确定性算法及相关后端设置。
+其中 `training.close_matmul_k_shift` 默认是 `true`，保持原有 NPU 行为：
+初始化时设置 `CLOSE_MATMUL_K_SHIFT=1`，关闭 CANN matmul 的 K-shift。
+与其他框架对照时，可以显式允许 K-shift：
+
+```yaml
+training:
+  seed: 42
+  enable_full_determinism: true
+  close_matmul_k_shift: false
+```
+
+`false` 会将该环境变量设为 `0`，包括覆盖进程继承的值；其他随机种子和确定性算法设置仍然生效。
+此字段仅在 NPU 且开启 `enable_full_determinism` 时生效，CPU、CUDA 和普通种子初始化不使用它。
+修改后应启动新进程，在首次矩阵乘法前完成初始化。不同 CANN 版本、形状和执行拓扑可能选择不同累加顺序，
+允许 K-shift 不承诺所有场景逐位复现，也不承诺与其他框架完全一致，应在目标配置上验证。
+
 ## 2. Target 节点
 
 [`Target`](../../../hyper_parallel/trainer/config/target.py#L54) 是一个延迟调用 Python 类或函数的配置对象。它保存导入后的目标对象、原始导入路径和 YAML 参数；调用 `build()` 时，再合并 Trainer 提供的运行时参数并创建组件。
