@@ -65,6 +65,7 @@ def calculate_mtp_loss(
     ignore_index: int = IGNORE_INDEX,
     shift_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     sequence_end_mask: torch.Tensor | None = None,
+    loss_metrics: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """DeepSeek-V3 Multi-Token-Prediction loss ``loss_factor / D * sum_k L_k``.
 
@@ -87,6 +88,8 @@ def calculate_mtp_loss(
         ignore_index: Target value excluded from every depth.
         shift_fn: One-token left shift, padding with ignore_index; may supply partition halos.
         sequence_end_mask: Document tails where future targets must be ignored.
+        loss_metrics: Optional output mapping receiving detached, unweighted
+            ``mtp_1_loss`` etc. Scalars are for logging, not extra objectives.
 
     Returns:
         The weighted 0-d MTP loss; zero when no depth is given. A depth whose
@@ -99,7 +102,7 @@ def calculate_mtp_loss(
     depths = len(mtp_per_depth_logits)
     targets_by_depth = iter_mtp_targets(shift_labels, depths, ignore_index=ignore_index,
                                         shift_fn=shift_fn, sequence_end_mask=sequence_end_mask)
-    for logits, targets in zip(mtp_per_depth_logits, targets_by_depth):
+    for depth, (logits, targets) in enumerate(zip(mtp_per_depth_logits, targets_by_depth), start=1):
         if logits.shape[:-1] != shift_labels.shape:
             raise ValueError("MTP logits must align with shift_labels position by position")
         # Each depth averages over its own valid targets; one without any adds zero instead of 0/0.
@@ -107,6 +110,8 @@ def calculate_mtp_loss(
                              num_items_in_batch=(targets != ignore_index).sum().clamp_min(1),
                              ignore_index=ignore_index)
         total = total + depth_loss.reshape(()) * (loss_factor / depths)
+        if loss_metrics is not None:
+            loss_metrics[f"mtp_{depth}_loss"] = depth_loss.detach().reshape(())
     return total
 
 
