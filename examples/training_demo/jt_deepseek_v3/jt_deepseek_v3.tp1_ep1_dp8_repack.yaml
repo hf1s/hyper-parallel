@@ -144,7 +144,7 @@ dataset:
   sequence_length: 262144
   data_config:
     packing_stage: dataset
-    load_balance: native_batch_sampler
+    load_balance: true
     repack_sequences: true
     create_attention_mask_in_dataloader: true
     seq_length: 262144

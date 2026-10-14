@@ -80,20 +80,22 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_failed_copy_drains_only_copy_stream(self) -> None:
         """Feature: Failed H2D staging lifecycle.
-        Description: Fail a mapping after launching the first copy.
+        Description: Fail a batch item after launching the first copy.
         Expectation: Drain only the copy stream before releasing staging storage.
         """
         accelerator = Mock()
         accelerator.stream.side_effect = lambda _stream: nullcontext()
-        move = Mock(side_effect=[object(), RuntimeError("copy failed")])
+        first, second = Mock(), Mock()
+        first.to.return_value = object()
+        second.to.side_effect = RuntimeError("copy failed")
         with patch.object(torch, "cuda", accelerator), patch(
                 "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
-        ), patch(
-                "hyper_parallel.distributed_data.device_prefetch._move_to_device", move,
         ):
             prefetcher = DeviceStepPrefetcher("cuda:0")
             with self.assertRaisesRegex(RuntimeError, "copy failed"):
-                prefetcher([{"host": 1}, {"host": 2}])
+                prefetcher([first, second])
+            first.to.assert_called_once_with(torch.device("cuda:0"), non_blocking=True)
+            second.to.assert_called_once_with(torch.device("cuda:0"), non_blocking=True)
             accelerator.Stream.return_value.synchronize.assert_called_once()
             accelerator.synchronize.assert_not_called()
             self.assertEqual(prefetcher._pending_staging, [])
@@ -112,8 +114,8 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
                 "hyper_parallel.distributed_data.device_prefetch._pin_memory", return_value=pinned,
         ):
             prefetcher = DeviceStepPrefetcher("cuda:0")
-            prefetcher([{"host": 1}])
-            self.assertIs(prefetcher._pending_staging[0][1][0], pinned)
+            prefetcher({"host": 1})
+            self.assertIs(prefetcher._pending_staging[0][1], pinned)
             accelerator.Event.return_value.synchronize.assert_not_called()
             prefetcher.close()
             accelerator.Event.return_value.synchronize.assert_called_once()
@@ -135,15 +137,44 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
                 "hyper_parallel.distributed_data.device_prefetch._move_to_device", return_value=device_batch,
         ):
             prefetcher = DeviceStepPrefetcher("cuda:0")
-            first = prefetcher([{"host": 1}])
-            prefetcher([{"host": 2}])
+            first = prefetcher({"host": 1})
+            prefetcher({"host": 2})
             self.assertEqual(accelerator.set_device.call_count, 2)
             accelerator.Stream.assert_called_once_with(device=torch.device("cuda:0"))
             # H2D is intentionally not host-synchronized here.  The consumer
-            # stream waits on each step's ready event in ``take_microbatch``.
+            # stream waits on each step's ready event in ``take_batch``.
             self.assertEqual(accelerator.Event.return_value.synchronize.call_count, 0)
-            self.assertIs(first.take_microbatch(0), device_batch)
+            self.assertIs(first.take_batch(), device_batch)
             accelerator.current_stream.return_value.wait_event.assert_called_once_with(first.ready_event)
             self.assertEqual(events, [("record_stream", accelerator.current_stream.return_value)])
-            self.assertEqual(first.device_micro_batches, [None])
-            self.assertEqual(first.cpu_micro_batches, [{"host": 1}])
+            self.assertIsNone(first.device_batch)
+            self.assertEqual(first.cpu_batch, {"host": 1})
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_complete_batch_preserves_containers_and_records_all_storage(self) -> None:
+        """Feature: Complete-batch device handoff.
+        Description: Prefetch multiple nested items in list, tuple and mapping batches.
+        Expectation: One take preserves the batch structure and registers every device item after one event wait.
+        """
+        for container in (list, tuple, lambda items: {"items": items, "name": "batch"}):
+            with self.subTest(container=container):
+                events = []
+                accelerator = Mock()
+                accelerator.stream.side_effect = lambda _stream: nullcontext()
+                device_items = [_DeviceBatch(events), _DeviceBatch(events)]
+                host_items = [Mock(), Mock()]
+                for host, device in zip(host_items, device_items):
+                    host.to.return_value = device
+                host_batch = container([{"data": item} for item in host_items])
+                expected = container([{"data": item} for item in device_items])
+                with patch.object(torch, "cuda", accelerator), patch(
+                        "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                ):
+                    prefetcher = DeviceStepPrefetcher("cuda:0")
+                    staged = prefetcher(host_batch)
+                    self.assertEqual(staged.take_batch(), expected)
+                    self.assertIs(staged.cpu_batch, host_batch)
+                    self.assertIsNone(staged.device_batch)
+                    accelerator.current_stream.return_value.wait_event.assert_called_once_with(staged.ready_event)
+                    self.assertEqual(events, [("record_stream", accelerator.current_stream.return_value)] * 2)
+                    prefetcher.close()

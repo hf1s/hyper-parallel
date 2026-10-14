@@ -103,39 +103,36 @@ def _pin_memory(value: Any) -> Any:
 
 
 class DevicePrefetchedStep:
-    """Retain Host statistics inputs while handing ready device microbatches to training."""
+    """Retain Host statistics inputs while handing the complete device batch to training."""
 
     def __init__(
             self,
-            cpu_micro_batches: list[Any],
-            device_micro_batches: list[Any],
+            cpu_batch: Any,
+            device_batch: Any,
             ready_event: Any,
             device: torch.device,
-            staging_micro_batches: list[Any] | None = None,
+            staging_batch: Any = None,
     ) -> None:
         """Retain batch views and pinned sources while device copies are pending."""
-        self.cpu_micro_batches = cpu_micro_batches
-        self.device_micro_batches = device_micro_batches
+        self.cpu_batch = cpu_batch
+        self.device_batch = device_batch
         self.ready_event = ready_event
         self.device = device
-        self._staging_micro_batches = staging_micro_batches
+        self._staging_batch = staging_batch
 
-    def take_microbatch(self, index: int) -> Any:
-        """Transfer one microbatch's lifetime to the current consumer stream.
-
-        Args:
-            index: Position of an unconsumed microbatch in this step.
+    def take_batch(self) -> Any:
+        """Transfer the complete batch's lifetime to the current consumer stream.
 
         Returns:
-            Device microbatch, with non-tensor metadata left untouched.
+            Device batch, with non-tensor metadata left untouched.
         """
         accelerator = getattr(torch, self.device.type)
         stream = accelerator.current_stream(self.device)
         stream.wait_event(self.ready_event)
-        micro_batch = self.device_micro_batches[index]
-        _record_stream(micro_batch, stream)
-        self.device_micro_batches[index] = None
-        return micro_batch
+        batch = self.device_batch
+        _record_stream(batch, stream)
+        self.device_batch = None
+        return batch
 
 
 class DeviceStepPrefetcher:
@@ -144,7 +141,7 @@ class DeviceStepPrefetcher:
     This is not an additional iterator, queue, or thread. Packing and payload
     exchange finish before this stage runs. The consumer stream waits for the
     H2D event before using inputs, while training uses the original
-    Host view for metrics and takes device microbatches immediately before use.
+    Host view for metrics and takes the complete device batch before use.
     """
 
     def __init__(self, device: Any) -> None:
@@ -158,7 +155,7 @@ class DeviceStepPrefetcher:
             raise ValueError("DeviceStepPrefetcher requires a CUDA or NPU device.")
         self._accelerator = _accelerator_module(self.device)
         self._copy_stream = None
-        self._pending_staging: list[tuple[Any, list[Any]]] = []
+        self._pending_staging: list[tuple[Any, Any]] = []
 
     def close(self) -> None:
         """Drain pending copies before dropping their pinned source storage."""
@@ -166,16 +163,16 @@ class DeviceStepPrefetcher:
             event.synchronize()
         self._pending_staging.clear()
 
-    def __call__(self, cpu_micro_batches: list[Any]) -> DevicePrefetchedStep:
-        """Enqueue final microbatches and publish their copy-completion event.
+    def __call__(self, cpu_batch: Any) -> DevicePrefetchedStep:
+        """Enqueue the final batch and publish its copy-completion event.
 
         Args:
-            cpu_micro_batches: Final collated step, retained for Host metering.
+            cpu_batch: Final collated batch, retained for Host metering.
 
         Returns:
             Host/device views of the step with a copy-completion event.  The
             producer thread does not wait for that event; the consumer stream
-            orders itself with ``wait_event`` in ``take_microbatch``.
+            orders itself with ``wait_event`` in ``take_batch``.
         """
         accelerator = self._accelerator
         # The local loader may create a fresh producer thread each step; device
@@ -184,12 +181,10 @@ class DeviceStepPrefetcher:
         if self._copy_stream is None:
             self._copy_stream = accelerator.Stream(device=self.device)
         self._pending_staging = [(event, batch) for event, batch in self._pending_staging if not event.query()]
-        staging = [_pin_memory(micro_batch) for micro_batch in cpu_micro_batches]
-        device_micro_batches = []
+        staging = _pin_memory(cpu_batch)
         try:
             with accelerator.stream(self._copy_stream):
-                for micro_batch in staging:
-                    device_micro_batches.append(_move_to_device(micro_batch, self.device))
+                device_batch = _move_to_device(staging, self.device)
                 ready_event = accelerator.Event()
                 ready_event.record(self._copy_stream)
         except BaseException:
@@ -199,11 +194,11 @@ class DeviceStepPrefetcher:
             raise
         self._pending_staging.append((ready_event, staging))
         return DevicePrefetchedStep(
-            cpu_micro_batches,
-            device_micro_batches,
+            cpu_batch,
+            device_batch,
             ready_event,
             self.device,
-            staging_micro_batches=staging,
+            staging_batch=staging,
         )
 
 

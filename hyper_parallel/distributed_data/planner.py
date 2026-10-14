@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from copy import copy
+from itertools import chain
 from typing import Any
 
 from hyper_parallel.distributed_data.balancing_algorithm import (
@@ -137,7 +138,7 @@ class DynamicPackingPlanner:
         for item in samples:
             self._constraints.validate_sample(item)
         samples_by_key = {item.key: item for item in samples}
-        original, reference_costs = self._materialize(reference_bins, samples_by_key, audit=self._validate)
+        original, reference_costs = self._build_rank_packing_plans(reference_bins, samples_by_key, audit=self._validate)
         candidate_keys = self.balancing_algorithm.assign(
             samples,
             reference_bins=reference_bins,
@@ -150,7 +151,9 @@ class DynamicPackingPlanner:
             and type(self.balancing_algorithm).assign is LPTBalancingAlgorithm.assign
         )
         audit_candidate = self._validate or not trusted_assignment
-        candidate, candidate_costs = self._materialize(candidate_keys, samples_by_key, audit=audit_candidate)
+        candidate, candidate_costs = self._build_rank_packing_plans(
+            candidate_keys, samples_by_key, audit=audit_candidate,
+        )
         accepted = self._accept_candidate(reference_costs, candidate_costs)
         local_batches, rank_costs = (candidate, candidate_costs) if accepted else (original, reference_costs)
         return DistributedPackingPlan(
@@ -179,7 +182,7 @@ class DynamicPackingPlanner:
             self.last_sample_costs[item.key] = cost
         return tuple(estimated_samples)
 
-    def _materialize(
+    def _build_rank_packing_plans(
             self,
             key_bins: Sequence[Sequence[SampleKey]],
             samples_by_key: Mapping[SampleKey, SampleMetadata],
@@ -190,7 +193,7 @@ class DynamicPackingPlanner:
         if len(key_bins) != self.distributed_bin_count or any(not keys for keys in key_bins):
             raise ValueError("Assignments must contain data_parallel_size * local_batch_size non-empty bins.")
         if audit:
-            planned_keys = [key for keys in key_bins for key in keys]
+            planned_keys = list(chain.from_iterable(key_bins))
             if len(planned_keys) != len(samples_by_key) or set(planned_keys) != set(samples_by_key):
                 raise ValueError("Assignments must conserve every selected sample key exactly once.")
         local_batches = [[] for _ in range(self.data_parallel_size)]

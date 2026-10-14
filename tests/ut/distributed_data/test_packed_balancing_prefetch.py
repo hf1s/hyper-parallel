@@ -17,9 +17,11 @@
 import threading
 import unittest
 from contextlib import nullcontext
+from itertools import product
 from typing import Any
 from unittest.mock import Mock, patch
 
+from hyper_parallel.distributed_data import DistributedDatasetConfig
 from hyper_parallel.distributed_data.packed_balancing import _LocalBalancingIterator, _LocalBatch
 from tests.common.mark_utils import arg_mark
 
@@ -30,9 +32,10 @@ class _SynchronousCollectiveLoader:
     local_dataloader = (("step-0",), ("step-1",))
     _uses_synchronous_collectives = True
 
-    def __init__(self) -> None:
+    def __init__(self, broadcast_plan: bool = True) -> None:
         """Initialize fake transport state and the source event log."""
         self.last_balance_stats = None
+        self.config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, broadcast_plan=broadcast_plan)
         self.events = []
         self._transport = Mock()
         self._transport.all_gather_object.side_effect = self._gather
@@ -82,9 +85,9 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
         Description: Consume steps with and without explicit prefetch hooks.
         Expectation: Both paths preserve order and collective thread ownership.
         """
-        for explicit in (False, True):
-            with self.subTest(explicit=explicit):
-                loader = _SynchronousCollectiveLoader()
+        for explicit, broadcast_plan in product((False, True), repeat=2):
+            with self.subTest(explicit=explicit, broadcast_plan=broadcast_plan):
+                loader = _SynchronousCollectiveLoader(broadcast_plan=broadcast_plan)
                 iterator = _LocalBalancingIterator(loader)
                 try:
                     self.assertEqual(next(iterator), [0])
@@ -104,8 +107,11 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
                     iterator.close()
                 for step in (0, 1):
                     events = [event for event in loader.events if event[1] == step]
-                    self.assertEqual([event[0] for event in events],
-                                     ["source", "gather", "plan", "broadcast", "exchange", "collate"])
+                    expected_events = ["source", "gather", "plan"]
+                    if broadcast_plan:
+                        expected_events.append("broadcast")
+                    expected_events.extend(("exchange", "collate"))
+                    self.assertEqual([event[0] for event in events], expected_events)
                     for name, _, thread in events:
                         expected = "MainThread" if name in ("gather", "broadcast", "exchange") else \
                             "hp-local-balance-prefetch"

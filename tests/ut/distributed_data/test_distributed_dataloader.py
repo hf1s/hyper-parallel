@@ -18,6 +18,7 @@ import copy
 import unittest
 from contextlib import nullcontext
 from collections.abc import Callable
+from itertools import product
 from threading import current_thread
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
@@ -73,9 +74,10 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         Description: Consume steps with implicit or repeated explicit prefetch hooks.
         Expectation: Collectives stay on the caller; CPU work reuses one background thread.
         """
-        for explicit in (False, True):
-            with self.subTest(explicit=explicit):
-                loader = _native_loader()
+        for explicit, broadcast_plan in product((False, True), repeat=2):
+            with self.subTest(explicit=explicit, broadcast_plan=broadcast_plan):
+                loader = _native_loader(broadcast_plan=broadcast_plan)
+                gather_method = "gather_object_to_planner" if broadcast_plan else "all_gather_object"
                 events = []
 
                 def record(name: str, callback: Callable[..., Any]) -> Callable[..., Any]:
@@ -92,12 +94,12 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 ), patch.object(
                         loader, "_build_plan_control", side_effect=record("plan", loader._build_plan_control),
                 ), patch.object(
-                        loader._data_plane, "gather_object_to_planner",
-                        side_effect=record("gather", loader._data_plane.gather_object_to_planner),
+                        loader._data_plane, gather_method,
+                        side_effect=record("gather", getattr(loader._data_plane, gather_method)),
                 ), patch.object(
                         loader._data_plane, "broadcast_from_planner",
                         side_effect=record("broadcast", loader._data_plane.broadcast_from_planner),
-                ), patch.object(
+                ) as broadcast, patch.object(
                         loader._data_plane, "begin_exchange_prepared",
                         side_effect=record("exchange", loader._data_plane.begin_exchange_prepared),
                 ):
@@ -113,9 +115,41 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     self.assertEqual(next(loader)[0][0]["id"], 2)
                     self.assertIs(worker, loader._prefetch_thread)
                     self.assertEqual(len(list(loader)), 1)
+                    self.assertEqual(broadcast.called, broadcast_plan)
                 for name, thread in events:
                     expected = "MainThread" if name in ("gather", "broadcast", "exchange") else worker.name
                     self.assertEqual(thread, expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_non_planner_rank_builds_batches_without_plan_broadcast(self) -> None:
+        """Feature: Independent planning on every data-plane rank.
+        Description: Run online and metadata loading through both prefetch paths on a non-Planner rank.
+        Expectation: All batches and EOF are produced without centralized gather or plan broadcast.
+        """
+        for backend, metadata_mode in product(("gloo", "hccl"), (False, True)):
+            with self.subTest(backend=backend, metadata_mode=metadata_mode):
+                options = {"metadata": [SampleMetadata(1)] * 6} if metadata_mode else {
+                    "metadata_fn": lambda _: SampleMetadata(1),
+                }
+                with build_distributed_dataloader(
+                        list(range(6)), _StandaloneMesh(),
+                        DistributedDatasetConfig(
+                            seq_len=10, local_batch_size=2, communication_backend="gloo",
+                            metadata_mode=metadata_mode, broadcast_plan=False,
+                        ),
+                        batch_sampler=_sampler(), device="cpu", cost_model=lambda metadata: metadata.cost, **options,
+                ) as loader, patch.object(
+                        DataPlaneTransport, "communication_backend", new_callable=PropertyMock, return_value=backend,
+                ), patch.object(
+                        DataPlaneTransport, "planner_rank", new_callable=PropertyMock, return_value=1,
+                ), patch.object(
+                        loader._data_plane, "broadcast_from_planner", side_effect=AssertionError("plan broadcast used"),
+                ), patch.object(
+                        loader._data_plane, "gather_object_to_planner",
+                        side_effect=AssertionError("central gather used"),
+                ), patch.object(loader._planner, "plan", wraps=loader._planner.plan) as plan:
+                    self.assertEqual(list(loader), [(0, 1), (2, 3), (4, 5)])
+                    self.assertEqual(plan.call_count, 3)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_sampler_paths_stage_h2d_before_model_broadcast(self) -> None:

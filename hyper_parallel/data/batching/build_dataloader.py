@@ -279,7 +279,7 @@ def build_dataloader(
         max_seq_len: Maximum sample length used to derive dynamic token budget.
         default_seed: Seed used when no training seed is configured.
         metadata_fn: Native physical sample metadata for online
-            ``load_balance=native_batch_sampler``. Defaults to complete GPT output
+            ``load_balance=True``. Defaults to complete GPT output
             lengths; VLMTrainer supplies image metadata. Offline mode uses the
             indexed metadata configured on the Dataset instead.
         model_config: Effective model dimensions for the default workload estimator.
@@ -312,14 +312,13 @@ def build_dataloader(
     drop_last = getattr(dataloader_target, "drop_last", True)
     rearrangement_map = getattr(dataloader_target, "data_rearrange_map", None)
     data_sharding = getattr(dataloader_target, "data_sharding", False)
-    load_balance = (data_config or {}).get("load_balance")
-    if load_balance not in (None, "native_batch_sampler"):
-        raise ValueError("data_config.load_balance must be 'native_batch_sampler' or omitted")
-    native_balance = load_balance == "native_batch_sampler"
+    load_balance = (data_config or {}).get("load_balance", False)
+    if not isinstance(load_balance, bool):
+        raise ValueError("data_config.load_balance must be boolean")
     if _uses_distributed_packing(data_config):
         raise ValueError(
             "packing_stage='distributed_dataloader' streaming selection has been removed. "
-            "Use packing_stage='dataset' with load_balance='native_batch_sampler', "
+            "Use packing_stage='dataset' with load_balance=True, "
             "or supply an external_step_source to the distributed data API."
         )
 
@@ -347,7 +346,7 @@ def build_dataloader(
                 seed=seed,
             )
 
-        if native_balance:
+        if load_balance:
             dataloader = _build_native_sampler_loader(
                 dataset, batch_sampler, collate_fn, dataloader_target, mesh_context, data_config, seed,
                 metadata_fn=metadata_fn, max_seq_len=max_seq_len,
@@ -373,7 +372,7 @@ def build_dataloader(
         dataloaders[split_index] = dataloader
         # The collective loader owns sampler checkpoint/epoch state; exposing
         # its speculative cursor to the Trainer would skip prefetched batches.
-        batch_samplers[split_index] = None if native_balance else batch_sampler
+        batch_samplers[split_index] = None if load_balance else batch_sampler
 
     dataloader_splits = tuple(dataloaders)
     batch_sampler_splits = tuple(batch_samplers)
@@ -430,7 +429,11 @@ class FixedBatchDataLoader(StatefulDataLoader):
             )
 
     def set_epoch(self, epoch: int) -> None:
-        """Forward epoch state to the Dataset and configured batch sampler."""
+        """Forward epoch state to the Dataset and configured batch sampler.
+
+        Args:
+            epoch: Epoch index used by the sampler and Dataset.
+        """
         if self.batch_sampler is not None and hasattr(self.batch_sampler, "set_epoch"):
             self.batch_sampler.set_epoch(epoch)
 
@@ -630,7 +633,11 @@ class _DynamicBatchLoader(ABC):
         return checkpoint_state
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore the future source cursor and unconsumed dynamic buffer."""
+        """Restore the future source cursor and unconsumed dynamic buffer.
+
+        Args:
+            state_dict: Saved source progress and unconsumed candidate buffer.
+        """
         checkpoint_state = copy.deepcopy(dict(state_dict))
         saved_dp_world_size = checkpoint_state.get("dp_world_size", self.dp_world_size)
         if saved_dp_world_size != self.dp_world_size:
@@ -658,7 +665,11 @@ class _DynamicBatchLoader(ABC):
         self.resume_pending = True
 
     def set_epoch(self, epoch: int) -> None:
-        """Forward epoch state to the stateful source DataLoader."""
+        """Forward epoch state to the stateful source DataLoader.
+
+        Args:
+            epoch: Epoch index forwarded to the source DataLoader.
+        """
         self.source_dataloader.set_epoch(epoch)
 
 

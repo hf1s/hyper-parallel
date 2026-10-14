@@ -125,6 +125,18 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             DistributedDatasetConfig(seq_len=32, local_batch_size=1, metadata_mode=1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_plan_broadcast_defaults_on_and_requires_boolean(self) -> None:
+        """Feature: Configurable plan broadcast.
+        Description: Use the default, disable broadcast, and supply invalid flag values.
+        Expectation: Central planning remains the default and only boolean values are accepted.
+        """
+        self.assertTrue(DistributedDatasetConfig(seq_len=32, local_batch_size=1).broadcast_plan)
+        self.assertFalse(DistributedDatasetConfig(seq_len=32, local_batch_size=1, broadcast_plan=False).broadcast_plan)
+        for value in (0, 1, "false", None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "broadcast_plan must be boolean"):
+                DistributedDatasetConfig(seq_len=32, local_batch_size=1, broadcast_plan=value)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_balance_group_size_is_positive_and_topology_divisible(self) -> None:
         """Feature: Local balancing groups.
         Description: Configure fixed-size groups over the root mesh rank order.

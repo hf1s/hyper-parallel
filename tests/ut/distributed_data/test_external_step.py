@@ -16,9 +16,10 @@
 
 import unittest
 from collections.abc import Iterator
-from contextlib import closing
+from contextlib import closing, nullcontext
 from itertools import islice
-from unittest.mock import Mock
+from typing import Any
+from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
@@ -28,6 +29,7 @@ from hyper_parallel.distributed_data import (
     WorkloadCost,
     build_distributed_dataloader,
 )
+from hyper_parallel.distributed_data.transport import DataPlaneTransport
 from tests.common.mark_utils import arg_mark
 
 
@@ -62,11 +64,11 @@ class _Source:
         self.position = 0
 
 
-def _build(source):
+def _build(source, **options):
     return build_distributed_dataloader(
         None,
         _Mesh(),
-        DistributedDatasetConfig(seq_len=16, local_batch_size=1),
+        DistributedDatasetConfig(seq_len=16, local_batch_size=1, **options),
         metadata_fn=lambda sample: SampleMetadata(sample["tokens"], sample_id=sample["id"]),
         pack_fn=lambda samples, seq_len: tuple(samples) if sum(item["tokens"] for item in samples) <= seq_len else None,
         collate_fn=list,
@@ -90,6 +92,25 @@ def _pack(samples: list[dict], seq_len: int) -> dict:
 
 class TestExternalStepSource(unittest.TestCase):
     """Verify source iteration, metadata, and externally owned recovery."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_non_planner_rank_consumes_source_without_plan_broadcast(self) -> None:
+        """Feature: Independent planning for external steps.
+        Description: Disable plan broadcast on a non-Planner rank with either collective schedule.
+        Expectation: The rank plans both source steps locally and returns all samples.
+        """
+        for backend in ("gloo", "hccl"):
+            with self.subTest(backend=backend), closing(
+                    _build(_Source(), broadcast_plan=False),
+            ) as loader, patch.object(
+                    DataPlaneTransport, "communication_backend", new_callable=PropertyMock, return_value=backend,
+            ), patch.object(
+                    DataPlaneTransport, "planner_rank", new_callable=PropertyMock, return_value=1,
+            ), patch.object(
+                    loader._transport, "broadcast_from_planner", side_effect=AssertionError("plan broadcast used"),
+            ), patch.object(loader._planner, "plan", wraps=loader._planner.plan) as plan:
+                self.assertEqual(list(loader), [[({"id": 0, "tokens": 4},)], [({"id": 1, "tokens": 5},)]])
+                self.assertEqual(plan.call_count, 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_source_steps_and_optional_epoch_hook(self) -> None:
@@ -129,6 +150,48 @@ class TestExternalStepSource(unittest.TestCase):
 
 class TestExternalStepCallbacks(unittest.TestCase):
     """Verify raw-step callbacks, buffering and source lifecycle without process groups."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_device_handoff_preserves_complete_batch_and_host_view(self) -> None:
+        """Feature: Complete external-step device handoff.
+        Description: Collate two packed bins as a list or tuple and stage the complete batch.
+        Expectation: Delivery preserves both bins, container type and the original Host batch for statistics.
+        """
+        for container in (list, tuple):
+            with self.subTest(container=container):
+                samples = _samples()
+                accelerator = Mock()
+                accelerator.stream.side_effect = lambda _stream: nullcontext()
+                accelerator.Event.return_value.query.return_value = False
+
+                def move(batch: Any, device: torch.device) -> Any:
+                    """Model a device batch while retaining its container structure."""
+                    self.assertEqual(device, torch.device("cuda:0"))
+                    return type(batch)(
+                        {"input_ids": item["input_ids"].tolist(), "storage": Mock()} for item in batch
+                    )
+
+                with patch.object(torch, "cuda", accelerator), patch(
+                        "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                ), patch(
+                        "hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=move,
+                ), closing(build_distributed_dataloader(
+                        None, _Mesh(), DistributedDatasetConfig(
+                            seq_len=8, local_batch_size=2, communication_backend="gloo",
+                        ),
+                        external_step_source=[[samples[:2], samples[2:]]],
+                        metadata_fn=lambda sample: sample["metadata"], pack_fn=_pack, collate_fn=container,
+                        device="cuda:0", cost_model=lambda metadata: metadata.cost,
+                )) as loader:
+                    batch = next(loader)
+                    self.assertIsInstance(batch, container)
+                    self.assertIsInstance(loader.last_host_batch, container)
+                    expected = [[0, 1, 1, 2], [2, 3, 3, 4]]
+                    self.assertEqual([item["input_ids"] for item in batch], expected)
+                    self.assertEqual([item["input_ids"].tolist() for item in loader.last_host_batch], expected)
+                    accelerator.current_stream.return_value.wait_event.assert_called_once()
+                    for item in batch:
+                        item["storage"].record_stream.assert_called_once_with(accelerator.current_stream.return_value)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_shared_metadata_keeps_independent_occurrences(self) -> None:

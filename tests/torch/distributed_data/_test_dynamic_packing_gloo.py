@@ -31,7 +31,7 @@ def _gather(value):
     return gathered
 
 
-def _run_local_steps(source_api: str) -> None:
+def _run_local_steps(source_api: str, broadcast_plan: bool) -> list:
     """Exercise the shared codec through locality-scoped moved and retained steps."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -43,6 +43,7 @@ def _run_local_steps(source_api: str) -> None:
     ]
     config = DistributedDatasetConfig(
         seq_len=10, local_batch_size=1, communication_backend="gloo", balance_group_size=2,
+        broadcast_plan=broadcast_plan,
     )
 
     def metadata_fn(sample: dict) -> SampleMetadata:
@@ -67,7 +68,7 @@ def _run_local_steps(source_api: str) -> None:
     try:
         expected_group = (0, 1) if rank < 2 else (2, 3)
         assert loader.group_ranks == expected_group, (rank, loader.group_ranks)
-        delivered_steps = 0
+        delivered = []
         for step, batch in enumerate(loader):
             outputs = _gather(batch)
             actual = sorted(sample["id"] for output in outputs for packing_bin in output for sample in packing_bin)
@@ -75,12 +76,17 @@ def _run_local_steps(source_api: str) -> None:
             assert actual == expected, f"Local balancing changed membership: {actual} != {expected}"
             assert all(len(output) == 1 and len(output[0]) == 2 for output in outputs), outputs
             stats = dict(loader.last_balance_stats)
+            all_stats = _gather(stats)
+            assert all_stats[0] == all_stats[1] and all_stats[2] == all_stats[3], (
+                f"Group statistics differ: stats={all_stats}"
+            )
             moved = stats["moved_samples"]
             assert (moved > 0) == (step == 0), f"Unexpected movement at step {step}: {moved}"
-            delivered_steps += 1
-        assert delivered_steps == 2, f"Expected both source steps before exhaustion, got {delivered_steps}"
+            delivered.append((batch, stats))
+        assert len(delivered) == 2, f"Expected both source steps before exhaustion, got {len(delivered)}"
     finally:
         loader.close()
+    return delivered
 
 
 def test_dynamic_packing_dp4_gloo() -> None:
@@ -88,6 +94,10 @@ def test_dynamic_packing_dp4_gloo() -> None:
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
         for source_api in ("source", "local"):
-            _run_local_steps(source_api)
+            baseline = _run_local_steps(source_api, broadcast_plan=True)
+            independent = _run_local_steps(source_api, broadcast_plan=False)
+            assert independent == baseline, (
+                f"Broadcast mode changed batches/stats: actual={independent}, expected={baseline}"
+            )
     finally:
         dist.destroy_process_group()

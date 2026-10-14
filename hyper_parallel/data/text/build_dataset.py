@@ -43,6 +43,9 @@ def _build_dataloader_context(
         data_config: Mapping[str, Any],
 ) -> DataLoaderParallelContext | None:
     """Build DataLoader ownership from the runtime mesh when available."""
+    load_balance = data_config.get("load_balance", False)
+    if not isinstance(load_balance, bool):
+        raise ValueError("data_config.load_balance must be boolean")
     if mesh_context is None:
         return None
 
@@ -51,7 +54,7 @@ def _build_dataloader_context(
         data_index_cache=bool(data_config.get("data_index_cache", False)),
         collective_source=(
             data_config.get("packing_stage") == "distributed_dataloader"
-            or data_config.get("load_balance") == "native_batch_sampler"
+            or load_balance
         ),
         shared_storage=not bool(data_config.get("no_shared_storage", False)),
     )

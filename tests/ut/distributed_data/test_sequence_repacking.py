@@ -218,7 +218,7 @@ class TestSequenceRepacking(unittest.TestCase):
                 "input_ids": [record["input_ids"].tolist()], "labels": [record["labels"].tolist()],
                 "cu_seqlens": [record["cu_seq_lens"].tolist()],
             }).save_to_disk(directory)
-            config = {"seq_length": 12, "load_balance": "native_batch_sampler", "repack_sequences": True}
+            config = {"seq_length": 12, "load_balance": True, "repack_sequences": True}
             dataset = PackedSupervisedDataset(directory, sequence_length=12, data_config=config)
             context = SimpleNamespace(
                 dp_rank=0, dp_size=1, tp_size=1, cp_size=1, pp_size=1, device_mesh=_MESH,

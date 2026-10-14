@@ -116,6 +116,7 @@ class DistributedDataLoader(Iterator[Any]):
             model_transport: ModelParallelTransport,
             device_prefetch: DeviceStepPrefetcher | None = None,
             initial_epoch: int = 0,
+            broadcast_plan: bool = True,
     ) -> None:
         """Store the fully validated runtime components."""
         _validate_loader_components(
@@ -132,6 +133,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._metadata_reader = metadata_reader
         self._direct_sample_loader = direct_sample_loader
         self._metadata_mode = metadata_mode
+        self._broadcast_plan = broadcast_plan
         self._planner = planner
         self._data_constructor = data_constructor
         self._data_plane = data_plane
@@ -153,7 +155,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._prefetch_in_flight = False
         self._prefetch_stream: Any = None
         self._prefetch_task: Callable[[], Any] | None = self._prepare_next_batch
-        self._prefetch_phase = "source"
+        self._prefetch_phase = "metadata"
 
     def __iter__(self) -> "DistributedDataLoader":
         """Return this stateful distributed iterator."""
@@ -166,10 +168,10 @@ class DistributedDataLoader(Iterator[Any]):
         self.prefetch()
         batch = self._take_prefetched()
         if isinstance(batch, DevicePrefetchedStep):
-            batch = batch.take_microbatch(0)
+            batch = batch.take_batch()
         received = self._broadcast_batch(batch)
         data = self._consume_batch(received)
-        self._prefetch_phase = "source"
+        self._prefetch_phase = "metadata"
         self._start_prefetch()
         return data
 
@@ -179,13 +181,16 @@ class DistributedDataLoader(Iterator[Any]):
 
     def prefetch_plan(self) -> None:
         """Gather metadata on the caller after current-step compute submission."""
-        if not self._caller_collectives or self._stopped or self._prefetch_phase != "source":
+        if not self._caller_collectives or self._stopped or self._prefetch_phase != "metadata":
             return
         local_metadata = self._take_prefetched()
+        gathered_metadata = None
         with self._prefetch_stream_context():
-            gathered_metadata = (
-                self._data_plane.gather_object_to_planner(local_metadata) if self._data_plane.is_member else None
-            )
+            if self._data_plane.is_member:
+                if self._broadcast_plan:
+                    gathered_metadata = self._data_plane.gather_object_to_planner(local_metadata)
+                else:
+                    gathered_metadata = self._data_plane.all_gather_object(local_metadata)
         self._prefetch_phase = "plan"
         self._start_prefetch(
             lambda: self._build_plan_control(gathered_metadata) if gathered_metadata is not None else None
@@ -198,7 +203,7 @@ class DistributedDataLoader(Iterator[Any]):
             return
         plan = self._take_prefetched()
         with self._prefetch_stream_context():
-            if self._data_plane.is_member:
+            if self._data_plane.is_member and self._broadcast_plan:
                 plan = self._data_plane.broadcast_from_planner(plan)
             self._set_pending_plan(plan)
             work = None
@@ -217,7 +222,7 @@ class DistributedDataLoader(Iterator[Any]):
         return self._stage_batch(batch)
 
     def _stage_batch(self, batch: Any) -> Any:
-        return self._device_prefetch([batch]) if batch is not None and self._device_prefetch is not None else batch
+        return self._device_prefetch(batch) if batch is not None and self._device_prefetch is not None else batch
 
     def _prepare_next_batch(self) -> Any:
         """Select, balance, route, and construct samples without model-group broadcast."""
@@ -331,7 +336,6 @@ class DistributedDataLoader(Iterator[Any]):
             self._prefetch_result = _PREFETCH_PENDING
             self._prefetch_error = None
             self._prefetch_in_flight = False
-            self._prefetch_condition.notify_all()
         if error is not None:
             raise error
         if result is _PREFETCH_PENDING:
@@ -522,7 +526,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._stopped = False
         self._last_plan = None
         self._pending_plan = None
-        self._prefetch_phase = "source"
+        self._prefetch_phase = "metadata"
 
     def _produce_on_data_plane(self) -> Any:
         plan = self._next_plan_control()
@@ -575,6 +579,8 @@ class DistributedDataLoader(Iterator[Any]):
     def _next_plan_control(self) -> DistributedPackingPlan | None:
         """Plan exactly one source-selected step, or return None at end of stream."""
         local_metadata = self._prepare_local_metadata()
+        if not self._broadcast_plan:
+            return self._build_plan_control(self._data_plane.all_gather_object(local_metadata))
         gathered_metadata = self._data_plane.gather_object_to_planner(local_metadata)
         plan = None
         if self._topology.global_rank == self._data_plane.planner_rank:

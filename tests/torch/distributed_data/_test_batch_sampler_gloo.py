@@ -66,15 +66,42 @@ def _gather(value: object) -> list:
     return gathered
 
 
+def _check_round_payloads(batch: tuple[dict, ...], expected_local_indices: list[int]) -> None:
+    """Check selected occurrences and whole-sample fields across DP and TP peers."""
+    all_batches = _gather(batch)
+    expected_indices = _gather(expected_local_indices)
+    expected = Counter(expected_indices[0] + expected_indices[2])
+    actual = Counter(sample["id"] for target in (0, 2) for sample in all_batches[target])
+    assert actual == expected, f"Native round membership changed: actual={actual}, expected={expected}"
+    assert all_batches[0] == all_batches[1] and all_batches[2] == all_batches[3], (
+        f"TP peers received different batches: batches={all_batches}"
+    )
+    for sample in batch:
+        assert sample["labels"] == [sample["id"] + 1] and sample["position_ids"] == [7], (
+            f"Original native fields changed: sample={sample}"
+        )
+
+
+def _check_dataset_reads(dataset: _Dataset, reference: list[list[int]]) -> None:
+    """Compare physical reads across ranks with all selected native occurrences."""
+    all_reads = _gather(dataset.reads)
+    actual_reads = Counter(index for rank_reads in all_reads for index in rank_reads)
+    expected_reads = Counter(index for refs in _gather(reference)[::2] for row in refs for index in row)
+    assert actual_reads == expected_reads, (
+        f"Read coverage differs: actual={actual_reads}, expected={expected_reads}"
+    )
+
+
 def _run_case(
-        mesh: object, *, metadata_mode: bool, sampler_type: str, data_sharding: bool,
-) -> None:
+        mesh: object, *, metadata_mode: bool, sampler_type: str, data_sharding: bool, broadcast_plan: bool,
+) -> list:
     rank = dist.get_rank()
     dataset = _Dataset()
     reference = list(_sampler(sampler_type, data_sharding))
     source_sampler = _sampler(sampler_type, data_sharding)
     config = DistributedDatasetConfig(
         seq_len=8, local_batch_size=2, communication_backend="gloo", metadata_mode=metadata_mode,
+        broadcast_plan=broadcast_plan,
     )
     metadata_options = (
         {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
@@ -91,18 +118,9 @@ def _run_case(
         for round_idx, expected_local_indices in enumerate(reference):
             batch = next(loader)
             delivered.append(batch)
-            all_batches = _gather(batch)
-            expected_indices = _gather(expected_local_indices)
-            expected = Counter(expected_indices[0] + expected_indices[2])
-            actual = Counter(sample["id"] for target in (0, 2) for sample in all_batches[target])
-            assert actual == expected, f"Native round membership changed: actual={actual}, expected={expected}"
-            assert all_batches[0] == all_batches[1] and all_batches[2] == all_batches[3], (
-                f"TP peers received different batches: batches={all_batches}"
-            )
-            for sample in batch:
-                assert sample["labels"] == [sample["id"] + 1] and sample["position_ids"] == [7], (
-                    f"Original native fields changed: sample={sample}"
-                )
+            _check_round_payloads(batch, expected_local_indices)
+            plans = _gather(loader.last_plan)
+            assert plans[0] == plans[2], f"Data-plane plans differ: plans={plans}"
             if rank % 2:
                 assert source_sampler.consumed_samples == 0 and not dataset.reads, (
                     f"TP peer advanced sampler or read payloads: cursor={source_sampler.consumed_samples}, "
@@ -116,12 +134,7 @@ def _run_case(
                     assert saved_cursor == 4, f"Saved speculative sampler cursor: actual={saved_cursor}, expected=4"
 
         assert not list(loader), f"Native sampler should exhaust after {len(reference)} rounds"
-        all_reads = _gather(dataset.reads)
-        actual_reads = Counter(index for rank_reads in all_reads for index in rank_reads)
-        expected_reads = Counter(index for refs in _gather(reference)[::2] for row in refs for index in row)
-        assert actual_reads == expected_reads, (
-            f"Read coverage differs: actual={actual_reads}, expected={expected_reads}"
-        )
+        _check_dataset_reads(dataset, reference)
         resumed = build_distributed_dataloader(
             dataset if rank % 2 == 0 else None, mesh, config,
             batch_sampler=_sampler(sampler_type, data_sharding), **metadata_options,
@@ -130,16 +143,19 @@ def _run_case(
         resumed.load_state_dict(saved_state)
         remaining = list(resumed)
         assert remaining == delivered[1:], f"Native replay differs: actual={remaining}, expected={delivered[1:]}"
+    return delivered
 
 
-def _run_cost_balance(mesh: object) -> None:
+def _run_cost_balance(mesh: object, broadcast_plan: bool) -> None:
     """Redistribute unequal native samples while keeping the selected four outputs."""
     sampler = build_dataset_batch_sampler(
         total_samples=18, micro_batch_size=2, global_batch_size=8,
         dp_rank=dist.get_rank() // 2, dp_world_size=2,
     )
     loader = build_distributed_dataloader(
-        _Dataset(), mesh, DistributedDatasetConfig(seq_len=8, local_batch_size=2, communication_backend="gloo"),
+        _Dataset(), mesh, DistributedDatasetConfig(
+            seq_len=8, local_batch_size=2, communication_backend="gloo", broadcast_plan=broadcast_plan,
+        ),
         batch_sampler=sampler, metadata_fn=_metadata,
         cost_model=lambda metadata: metadata.cost,
     )
@@ -159,9 +175,17 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
         for metadata_mode in (False, True):
             for sampler_type, data_sharding in (("single", False), ("cyclic", False), ("cyclic", True)):
-                _run_case(mesh, metadata_mode=metadata_mode, sampler_type=sampler_type, data_sharding=data_sharding)
-        _run_cost_balance(mesh)
-        _run_sequence_repacking(mesh)
+                options = {
+                    "metadata_mode": metadata_mode, "sampler_type": sampler_type, "data_sharding": data_sharding,
+                }
+                baseline = _run_case(mesh, **options, broadcast_plan=True)
+                independent = _run_case(mesh, **options, broadcast_plan=False)
+                assert independent == baseline, (
+                    f"Broadcast mode changed batches: actual={independent}, expected={baseline}"
+                )
+        for broadcast_plan in (True, False):
+            _run_cost_balance(mesh, broadcast_plan)
+            _run_sequence_repacking(mesh, broadcast_plan)
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -181,7 +205,7 @@ def _check_repacked_tokens(records: list[dict], gathered: list[dict]) -> None:
     assert actual == expected, f"Repacking changed selected tokens/labels: actual={actual}, expected={expected}"
 
 
-def _run_sequence_repacking(mesh: object) -> None:
+def _run_sequence_repacking(mesh: object, broadcast_plan: bool) -> None:
     """Balance independent sequences with TP replication and per-rank cursor replay."""
     records = []
     for index in range(6):
@@ -198,7 +222,9 @@ def _run_sequence_repacking(mesh: object) -> None:
         """Build a fresh reader and sampler for checkpoint replay."""
         return build_distributed_dataloader(
             records if dist.get_rank() % 2 == 0 else None, mesh,
-            DistributedDatasetConfig(seq_len=12, local_batch_size=1, communication_backend="gloo"),
+            DistributedDatasetConfig(
+                seq_len=12, local_batch_size=1, communication_backend="gloo", broadcast_plan=broadcast_plan,
+            ),
             batch_sampler=build_dataset_batch_sampler(
                 total_samples=6, micro_batch_size=1, global_batch_size=2,
                 dp_rank=dist.get_rank() // 2, dp_world_size=2,
@@ -219,7 +245,9 @@ def _run_sequence_repacking(mesh: object) -> None:
                 f"TP batch mismatch after sequence repacking: batches={gathered}"
             )
             _check_repacked_tokens(records[step * 2:step * 2 + 2], gathered)
-            plan = _gather(loader.last_plan)[0]
+            plans = _gather(loader.last_plan)
+            assert plans[0] == plans[2], f"Repacked data-plane plans differ: plans={plans}"
+            plan = plans[0]
             costs = [cost.llm for cost in plan.rank_costs]
             assert costs == [44, 44], f"Expected repacked costs [44, 44], got {costs}"
             if step == 0:

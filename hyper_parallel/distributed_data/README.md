@@ -54,6 +54,14 @@ build time. There is no metadata-only streaming mode.
 The loader never expands a candidate window to infer how many samples a step
 should contain; there is no refill/`attempt` loop.
 
+`DistributedDatasetConfig.broadcast_plan` defaults to `True`: one Planner
+computes the plan and broadcasts it to the data-plane ranks. Set it to `False`
+to let every data-plane rank compute the complete plan from the same gathered
+metadata, skipping the plan broadcast. This applies to native sampler and
+external-step loading. Keep configuration, cost models, and assignment policies
+identical and deterministic across ranks. Metadata gathering, payload exchange,
+and model-parallel batch broadcast still follow the normal loading path.
+
 ## Batch semantics
 
 - `seq_len` is the hard token capacity of one normal sequence bin.
@@ -175,9 +183,13 @@ enable this path with:
 dataset:
   data_config:
     packing_stage: dataset
-    load_balance: native_batch_sampler
+    load_balance: true
     seq_length: 32768
 ```
+
+`load_balance` is a boolean switch and defaults to `false`. Set it to `true`
+to enable balancing; other types, including the former `native_batch_sampler`
+string, are rejected.
 
 The Trainer builds its normal `build_dataset_batch_sampler` first, including
 `single`/`cyclic`, `data_sharding`, and the supported index rearrangement map.
@@ -201,7 +213,7 @@ dataloader:
     objective: makespan
 ```
 
-These factories are constructed only for `load_balance: native_batch_sampler`;
+These factories are constructed only for `load_balance: true`;
 they may accept the runtime `model_config`. Explicit Python policy arguments
 take precedence over configured factories. Omitting both selects default costs
 and LPT, not a separate disabled planner.
@@ -244,7 +256,7 @@ Current boundaries of the native-sampler path:
 ### Repack offline-packed text within a native round
 
 Set `dataset.data_config.repack_sequences: true` alongside
-`packing_stage: dataset` and `load_balance: native_batch_sampler`.
+`packing_stage: dataset` and `load_balance: true`.
 Each Dataset output must provide one-dimensional `input_ids`, pre-shifted
 `labels`, and explicit leading-zero `cu_seq_lens` covering the complete record.
 The boundaries must identify independent attention sequences. No boundary is
@@ -304,7 +316,7 @@ dataset:
   data_path: /data/conversations.json
   data_config:
     source_type: online
-    load_balance: native_batch_sampler
+    load_balance: true
   data_transform:
     _target_: hyper_parallel.data.omni.omni_transform.AutoProcessorTransform
     max_seq_len: 32768
@@ -359,7 +371,7 @@ native HP BatchSampler selects each round's Dataset-index occurrences
 - The HP VLM runtime currently requires **TP=CP=PP=1**; this integration keeps
   that boundary and supports DP. It does not add VLM packing, video/audio
   adapters, or a new model-parallel batch-broadcast implementation.
-- Omit `load_balance` to retain the native DataLoader. Enabled loaders own
+- Set `load_balance: false` or omit it to retain the native DataLoader. Enabled loaders own
   checkpoint cursors and epochs; VLMTrainer preserves a restored first-epoch
   cursor and waits for outstanding prefetch before distributed teardown.
   CUDA/NPU payload communication uses the existing device transport; the
@@ -383,7 +395,7 @@ python -m pytest -q \
 The Trainer shortcut `packing_stage: distributed_dataloader` depended on
 streaming metadata selection and now raises a migration error. For native HP
 training, retain `packing_stage: dataset` and set
-`load_balance: native_batch_sampler`. This preserves whole GPT Dataset outputs;
+`load_balance: true`. This preserves whole GPT Dataset outputs;
 it does **not** rebalance document fragments inside a packed GPT sequence.
 
 The lower-level Indexed source Dataset and text packing helpers remain available

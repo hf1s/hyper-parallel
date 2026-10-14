@@ -145,7 +145,10 @@ class _LocalBalancingIterator(Iterator[Any]):
             return
         self._join_worker()
         with self._loader._data_stream_context():
-            plan, stats = self._loader._transport.broadcast_from_planner(self._planned)
+            planned = self._planned
+            if self._loader.config.broadcast_plan:
+                planned = self._loader._transport.broadcast_from_planner(planned)
+            plan, stats = planned
             pending = self._loader._begin_batch(self._prepared_source_step.local_payloads, plan, stats)
         self._prepared_source_step = None
         self._planned = None
@@ -363,9 +366,8 @@ class LocalBalancingDataLoader:
     def _deliver_batch(self, result: _LocalBatch, step: int) -> Any:
         batch = result.data
         if self.prefetches_to_device:
-            self.last_host_batch = batch.cpu_micro_batches
-            ready = [batch.take_microbatch(index) for index in range(len(batch.cpu_micro_batches))]
-            batch = tuple(ready) if isinstance(batch.cpu_micro_batches, tuple) else ready
+            self.last_host_batch = batch.cpu_batch
+            batch = batch.take_batch()
         else:
             self.last_host_batch = batch
         if result.stats is not None and self._balance_stats_callback is not None and self._global_rank == 0:
@@ -448,11 +450,12 @@ class LocalBalancingDataLoader:
         return (tuple(key_bins), tuple(entries)), payloads
 
     def _plan_step(self, gathered: Sequence[Any], step: int) -> tuple[DistributedPackingPlan, dict[str, Any]]:
-        return self._transport.broadcast_from_planner(self._make_plan(gathered, step))
+        planned = self._make_plan(gathered, step)
+        return self._transport.broadcast_from_planner(planned) if self.config.broadcast_plan else planned
 
     def _make_plan(self, gathered: Sequence[Any], step: int) -> Any:
         result = None
-        if self._global_rank == self._transport.planner_rank:
+        if not self.config.broadcast_plan or self._global_rank == self._transport.planner_rank:
             samples = []
             reference_bins = []
             for bins, entries in gathered:
@@ -460,13 +463,13 @@ class LocalBalancingDataLoader:
                 samples.extend(entries)
             plan = self._planner.plan(samples, reference_bins=reference_bins, step=step)
             stats = self._statistics(plan, step)
-            if self._global_rank == 0:
+            if self._transport.planner_rank == 0:
                 stats.update(self._bin_statistics(gathered, plan))
             result = (plan, stats)
         return result
 
     def _bin_statistics(self, gathered: Sequence[Any], plan: DistributedPackingPlan) -> dict[str, Any]:
-        """Summarize original and accepted bins on the planner, reusing gathered metadata."""
+        """Summarize original and accepted bins using gathered metadata."""
         # Gathered metadata predates cost-model evaluation. Reuse the accepted
         # plan's estimates for both layouts so before/after have the same units.
         metadata_by_key = {

@@ -23,12 +23,15 @@ import torch
 
 from hyper_parallel.data.batching.build_dataloader import (
     DynamicBatchDataLoader,
+    FixedBatchDataLoader,
     build_dataloader,
 )
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
+from hyper_parallel.data.text.build_dataset import _build_dataloader_context
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
 from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
 from hyper_parallel.distributed_data.schema import SampleKey
+from hyper_parallel.trainer.config.target import Target
 from tests.common.mark_utils import arg_mark
 
 
@@ -89,8 +92,12 @@ def _batch_ids(batch: tuple) -> list[int]:
 class TestNativeBatchSampler(unittest.TestCase):
     """Test without process groups or accelerator hardware."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_fixed_membership_without_dynamic_selection(self) -> None:
-        """Short samples still occupy native batches instead of filling token budgets."""
+        """Feature: Fixed native round membership.
+        Description: Read short samples with online and offline metadata.
+        Expectation: Each batch retains the native indices and prefetch reads only the next round.
+        """
         for metadata_mode in (False, True):
             with self.subTest(metadata_mode=metadata_mode):
                 dataset = _TrackedDataset()
@@ -102,16 +109,24 @@ class TestNativeBatchSampler(unittest.TestCase):
                 loader.wait_for_prefetch()
                 self.assertEqual(sorted(dataset.reads), [0, 1, 2, 3, 4, 5])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_native_mode_does_not_construct_dynamic_selector(self) -> None:
-        """Native sampling should not allocate an unused stream selector."""
+        """Feature: Native sampler ownership.
+        Description: Build online and offline native loaders and consume a batch.
+        Expectation: Both paths preserve selected indices without constructing a streaming selector.
+        """
         for metadata_mode in (False, True):
             with self.subTest(metadata_mode=metadata_mode):
                 loader = _loader(_TrackedDataset(), metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
                 self.assertFalse(hasattr(loader, "_step_sample_selector"))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_cyclic_order_and_epoch_remain_native(self) -> None:
-        """Both cyclic sharding policies retain the original round membership."""
+        """Feature: Cyclic sampler epoch behavior.
+        Description: Compare loader output with both native cyclic sharding policies across epochs.
+        Expectation: Every round contains the same occurrences as the reference sampler.
+        """
         for data_sharding in (False, True):
             with self.subTest(data_sharding=data_sharding):
                 options = {"sampler_type": "cyclic", "data_sharding": data_sharding, "seed": 13}
@@ -242,16 +257,24 @@ class TestNativeBatchSampler(unittest.TestCase):
                     resumed.load_state_dict(state)
                     self.assertEqual([_batch_ids(batch) for batch in resumed], [[4, 4]] * 4)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_existing_native_cursor_is_respected(self) -> None:
-        """An already-restored sampler determines the first distributed read."""
+        """Feature: Restored native sampler progress.
+        Description: Build the loader with a sampler that already has a cursor and epoch.
+        Expectation: Reading begins at the restored cursor and preserves the epoch.
+        """
         sampler = _sampler(consumed_samples=4)
         sampler.epoch = 2
         loader = _loader(_TrackedDataset(), sampler=sampler)
         self.assertEqual(_batch_ids(next(loader)), [4, 5])
         self.assertEqual(loader.state_dict()["epoch"], 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_metadata_failure_does_not_look_like_exhaustion(self) -> None:
-        """StopIteration from a metadata callback is a reader error, not EOF."""
+        """Feature: Metadata callback error reporting.
+        Description: Raise StopIteration while extracting sample metadata.
+        Expectation: The loader reports a RuntimeError instead of treating the failure as EOF.
+        """
         def broken_metadata(sample: object) -> SampleMetadata:
             """Raise an accidental StopIteration outside sampler advancement."""
             del sample
@@ -265,8 +288,12 @@ class TestNativeBatchSampler(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid metadata callback"):
             next(loader)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_callback_errors_propagate_without_wrapping(self) -> None:
-        """Only StopIteration needs translation; normal callback errors retain identity."""
+        """Feature: Direct callback error propagation.
+        Description: Fail sample metadata extraction with a ValueError.
+        Expectation: The original exception is raised without advancing committed sampler progress.
+        """
         failure = ValueError("metadata unavailable")
         loader = build_distributed_dataloader(
             _TrackedDataset(), _StandaloneMesh(),
@@ -327,8 +354,12 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertIsNone(reader.prepare_next_step())
         self.assertEqual([item.key.dataset_index for item in reader.metadata()], [0, 1])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_trainer_builder_reuses_sampler_and_collator(self) -> None:
-        """Opt-in uses the native sampler and delegates progress to the collective loader."""
+        """Feature: Trainer balancing enablement.
+        Description: Enable balancing with a configured collator and repeated index mapping.
+        Expectation: The collective loader retains both and owns sampler checkpoint progress.
+        """
         context = SimpleNamespace(dp_rank=0, dp_size=1, device_mesh=_StandaloneMesh(), pp_size=1)
         target = SimpleNamespace(dataloader_type="single", data_rearrange_map=[3] * 10)
         collator = object()
@@ -339,12 +370,66 @@ class TestNativeBatchSampler(unittest.TestCase):
                 target, datasets=(_TrackedDataset(), None, None), collate_fn=collator,
                 mesh_context=context,
                 training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
-                data_config={"seq_length": 16, "load_balance": "native_batch_sampler"},
+                data_config={"seq_length": 16, "load_balance": True},
             )
         self.assertIs(loaders[0], build.return_value)
         self.assertEqual(samplers, (None, None, None))
         self.assertIs(build.call_args.kwargs["collate_fn"], collator)
         self.assertEqual(next(iter(build.call_args.kwargs["batch_sampler"])), [3, 3])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_trainer_balance_disabled_preserves_native_loader(self) -> None:
+        """Feature: Disabled balancing.
+        Description: Construct the Trainer loader with false or omitted balancing options.
+        Expectation: Native DataLoader construction, sampling and collation are preserved.
+        """
+        context = SimpleNamespace(dp_rank=0, dp_size=1)
+        target = Target(FixedBatchDataLoader, target_path="hyper_parallel.data.batching.FixedBatchDataLoader")
+        for data_config in (None, {}, {"load_balance": False}):
+            with self.subTest(data_config=data_config):
+                loaders, samplers = build_dataloader(
+                    target,
+                    datasets=(_TrackedDataset(), None, None), collate_fn=tuple,
+                    mesh_context=context,
+                    training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
+                    data_config=data_config,
+                )
+                self.assertIsInstance(loaders[0], FixedBatchDataLoader)
+                self.assertIs(loaders[0].batch_sampler, samplers[0])
+                self.assertEqual(_batch_ids(next(iter(loaders[0]))), [0, 1])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_dataset_context_uses_boolean_balance_switch(self) -> None:
+        """Feature: Dataset ownership with balancing.
+        Description: Construct the Dataset context with true, false and omitted options.
+        Expectation: Collective source ownership is enabled only when balancing is true.
+        """
+        for data_config, expected in (({}, False), ({"load_balance": False}, False), ({"load_balance": True}, True)):
+            with self.subTest(data_config=data_config), patch(
+                    "hyper_parallel.data.text.build_dataset.create_dataloader_parallel_context",
+            ) as build:
+                context = _build_dataloader_context(object(), data_config)
+                self.assertIs(context, build.return_value)
+                self.assertIs(build.call_args.kwargs["collective_source"], expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_balance_switch_rejects_non_boolean_values(self) -> None:
+        """Feature: Boolean balancing option validation.
+        Description: Supply strings, integers and None to both configuration entry points.
+        Expectation: Invalid values fail before Dataset ownership or loader construction.
+        """
+        for value in (None, "native_batch_sampler", "true", "false", 0, 1):
+            with self.subTest(value=value):
+                data_config = {"load_balance": value}
+                with self.assertRaisesRegex(ValueError, "load_balance must be boolean"):
+                    _build_dataloader_context(object(), data_config)
+                with self.assertRaisesRegex(ValueError, "load_balance must be boolean"):
+                    build_dataloader(
+                        SimpleNamespace(), datasets=(_TrackedDataset(), None, None), collate_fn=tuple,
+                        mesh_context=SimpleNamespace(dp_rank=0, dp_size=1),
+                        training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
+                        data_config=data_config,
+                    )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_trainer_offline_mode_requires_explicit_metadata(self) -> None:
@@ -356,7 +441,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         target = SimpleNamespace(dataloader_type="single")
         data_config = {
             "seq_length": 16,
-            "load_balance": "native_batch_sampler",
+            "load_balance": True,
             "distributed_dataloader": {"metadata_mode": True},
         }
         with self.assertRaisesRegex(ValueError, "metadata_mode=True requires metadata"):
@@ -367,14 +452,18 @@ class TestNativeBatchSampler(unittest.TestCase):
                 data_config=data_config,
             )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_trainer_rejects_conflicting_selection_modes(self) -> None:
-        """The new opt-in must not silently replace an independent packing/selection stage."""
+        """Feature: Native selection mode validation.
+        Description: Enable balancing with streaming packing or a dynamic batch selector.
+        Expectation: Incompatible selection modes are rejected during construction.
+        """
         context = SimpleNamespace(dp_rank=0, dp_size=1, device_mesh=_StandaloneMesh(), pp_size=1)
         for target, config, message in (
                 (SimpleNamespace(), {"packing_stage": "distributed_dataloader"}, "packing_stage"),
                 (SimpleNamespace(_target_=DynamicBatchDataLoader), {}, "dynamic batching"),
         ):
-            data_config = {"seq_length": 16, "load_balance": "native_batch_sampler", **config}
+            data_config = {"seq_length": 16, "load_balance": True, **config}
             with self.subTest(config=config), self.assertRaisesRegex(ValueError, message):
                 build_dataloader(
                     target, datasets=(_TrackedDataset(), None, None), collate_fn=tuple,
@@ -383,8 +472,12 @@ class TestNativeBatchSampler(unittest.TestCase):
                     data_config=data_config,
                 )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_trainer_uses_rank_local_payload_device(self) -> None:
-        """Resolve the device in the build thread before background A2A starts."""
+        """Feature: Rank-local communication device selection.
+        Description: Build a CUDA loader while the current device is rank-local device 3.
+        Expectation: The loader receives cuda:3 and uses the default Gloo data transport.
+        """
         mesh = _StandaloneMesh()
         mesh.device_type = "cuda"
         context = SimpleNamespace(dp_rank=0, dp_size=1, device_mesh=mesh, pp_size=1)
@@ -401,7 +494,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                 SimpleNamespace(), datasets=(_TrackedDataset(), None, None), collate_fn=tuple,
                 mesh_context=context,
                 training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
-                data_config={"seq_length": 16, "load_balance": "native_batch_sampler"},
+                data_config={"seq_length": 16, "load_balance": True},
             )
         self.assertEqual(str(build.call_args.kwargs["device"]), "cuda:3")
         self.assertEqual(build.call_args.args[2].communication_backend, "gloo")

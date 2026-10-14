@@ -128,6 +128,10 @@ class DistributedDatasetConfig:
         metadata_mode: Whether metadata is precomputed and available by Dataset
             index. ``False`` means the Dataset Reader loads samples and calls
             ``metadata_fn`` during native sampler planning.
+        broadcast_plan: Whether one Planner computes and broadcasts each plan.
+            Defaults to ``True``. If ``False``, every data-plane rank computes
+            the plan from gathered metadata. Configuration and deterministic
+            cost/assignment policies must produce identical plans across ranks.
     """
 
     seq_len: int
@@ -148,6 +152,7 @@ class DistributedDatasetConfig:
     communication_backend: Literal["gloo", "hccl"] = "hccl"
     balance_group_size: int | None = None
     metadata_mode: bool = False
+    broadcast_plan: bool = True
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -183,6 +188,7 @@ class DistributedDatasetConfig:
                 "dataset_already_sharded",
                 "drop_last",
                 "metadata_mode",
+                "broadcast_plan",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean.")
@@ -748,6 +754,7 @@ def _build_distributed_dataloader_impl(
         metadata_reader=state.metadata_reader,
         direct_sample_loader=state.direct_sample_loader,
         metadata_mode=config.metadata_mode,
+        broadcast_plan=config.broadcast_plan,
         planner=state.planner,
         data_constructor=state.constructor,
         data_plane=DataPlaneTransport(
