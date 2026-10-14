@@ -703,10 +703,16 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         losses = self.compute_jt_losses(input_ids, shift_labels, shift_labels >= 0, position_ids=position_ids,
                                         actual_seq_len=actual_seq_len, sequence_start=sequence_start)
         # ``<token-domain>_loss[/<name>]`` keys: every JT objective is weighted by foundation tokens.
+        # Key order matters: the trainer reduces this dict with
+        # ``torch.stack(list(loss_dict.values())).sum()`` (hyper_parallel/trainer/base.py), which is
+        # insertion-order-dependent because float addition is not associative. MF sums ``(lm + aux) + mtp``
+        # (mindformers/wrapper/wrapper.py:433-452); matching that order here makes the scalar total loss
+        # bitwise identical to MF at step 301 instead of off by ~1 ULP. Not a correctness bug either way
+        # (both orders are valid), kept only for alignment experiments. See issue #188.
         return JTDeepseekV3Output(loss={
             "foundation_loss/lm": losses["lm_loss"],
-            "foundation_loss/mtp": losses["mtp_loss"],
             "foundation_loss/aux": losses["aux_loss"],
+            "foundation_loss/mtp": losses["mtp_loss"],
         })
 
     def _token_loss(self, logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
