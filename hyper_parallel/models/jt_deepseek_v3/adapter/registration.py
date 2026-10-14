@@ -42,8 +42,14 @@ JT_DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     sharding_rules=build_parameter_sharding_rules,
     expert_parallel=_load_expert_parallel,
     context_parallel=_load_context_parallel,
-    fsdp_wrap_modules=lambda model: tuple(
-        f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers))
+    fsdp_wrap_modules=lambda model: (
+        tuple(f"mtp.layers.{index}.transformer_layer" for index in range(len(model.mtp.layers)))
+        # Experiment-only: give the token embedding its own FSDP sub-unit so
+        # fsdp_adapter.py's _FP32_EMBEDDING_UNIT_SUFFIXES can store/compute it
+        # in FP32 (MF alignment; mirrors the FP32 router precedent). Matched
+        # by suffix (not a literal "model.embed_tokens") so it still finds
+        # the module if JTDeepseekV3Model's attribute name ever changes.
+        + tuple(name for name, _ in model.named_modules() if name.endswith(".embed_tokens"))
     ),
 )
 register_model_adapter(JT_DEEPSEEK_V3_ADAPTER_SPEC)

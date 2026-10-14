@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -74,6 +74,17 @@ def _get_checkpoint_wrapped_module(module: ModuleClass) -> ModuleClass | None:
         if isinstance(wrapped_module, ModuleClass):
             return wrapped_module
     return None
+
+
+# Experiment-only FP32 FSDP sub-unit selector (not a product default): FQN
+# suffixes that get their own float32 param_dtype wrap unit, mirroring the
+# FP32 router precedent (``*.mlp.gate``). ``model.embed_tokens`` is the sole
+# ``nn.Embedding`` instance; ``DeepseekV3MTP.forward`` receives it by
+# reference as its ``embedding`` argument rather than owning a second
+# instance (hyper_parallel/components/modules/mtp.py: "embedding: The main
+# model's shared token embedding; not registered here."), so one suffix
+# covers every call site.
+_FP32_EMBEDDING_UNIT_SUFFIXES = (".embed_tokens",)
 
 
 class FSDP2Manager:
@@ -618,6 +629,26 @@ class FSDP2Manager:
                 fsdp_sublayer_kwargs, _ = self._build_fully_shard_kwargs(
                     self._build_fsdp_actual_mesh(expert=True)
                 )
+            elif wrap_module.fqn.endswith(_FP32_EMBEDDING_UNIT_SUFFIXES):
+                # MF performs the embedding lookup in FP32 and casts the output
+                # once (mindformers/parallel_core/training_graph/base_models/
+                # common/embeddings/language_model_embedding.py:158, r1.8.0);
+                # HP's default FSDP policy keeps embed_tokens BF16 end-to-end.
+                # Give it its own FP32 param_dtype sub-unit like the FP32
+                # router precedent, but cast its output back to the model's
+                # BF16 compute dtype at this FSDP boundary -- unlike the
+                # router, a plain nn.Embedding has no custom forward of its
+                # own to perform that cast (modeling_jt_deepseek_v3.py stays
+                # untouched; the cast happens purely in the wrap policy).
+                fsdp_sublayer_kwargs = {
+                    **dense_fsdp_kwargs,
+                    "mp_policy": replace(
+                        dense_fsdp_kwargs["mp_policy"],
+                        param_dtype=torch.float32,
+                        cast_forward_inputs=False,
+                        output_dtype=dense_fsdp_kwargs["mp_policy"].param_dtype,
+                    ),
+                }
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,
                 source_shard_infos=_source_infos_for_fully_shard(managed_source_info),
