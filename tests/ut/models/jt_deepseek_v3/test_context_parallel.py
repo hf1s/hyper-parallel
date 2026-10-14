@@ -15,6 +15,7 @@
 """CPU contracts for JT token halos, head statistics and managed projections."""
 
 from copy import deepcopy
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 import unittest
@@ -22,9 +23,12 @@ from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import DefaultDeviceType
+from transformers.loss.loss_utils import ForCausalLMLoss
 
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP
 from hyper_parallel.components.losses import calculate_mtp_loss
+from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
 from hyper_parallel.models.jt_deepseek_v3.adapter.data.runtime import JTSequenceRuntime
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
 from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
@@ -119,6 +123,42 @@ class TestJTContextParallel(unittest.TestCase):
         expected = F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum") / 4
         torch.testing.assert_close(value, expected)
         torch.testing.assert_close(torch.autograd.grad(value, logits)[0], torch.autograd.grad(expected, logits)[0])
+
+    def test_chunked_mtp_depths_keep_independent_denominators(self) -> None:
+        """Retain distinct normalization counts across two queued MTP objectives.
+
+        Feature: Multiple MTP depths with CP chunking.
+        Description: Score two future-target sets with different valid counts and one shared head.
+        Expectation: Joint backward matches the full-sequence oracle for both hidden states and the head.
+        """
+        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
+        DefaultDeviceType.set_device_type("cpu")
+        torch.manual_seed(61)
+        head = torch.nn.Linear(4, 7, bias=False)
+        reference_head = deepcopy(head)
+        predictions = [torch.randn(1, 8, 4, requires_grad=True) for _ in range(2)]
+        reference_predictions = [value.detach().clone().requires_grad_() for value in predictions]
+        targets = [torch.tensor([[1, -100, -100, 3, 2, 1, -100, -100]]),
+                   torch.tensor([[-100, -100, 3, 2, 1, -100, -100, -100]])]
+        context = object.__new__(_JTTrainingContext)
+        context.cp_group = "cp"
+        local_loss = partial(projected_cross_entropy, head=head, loss_fn=ForCausalLMLoss,
+                             vocab_size=7, chunk_size=3)
+        expected = sum(F.cross_entropy(reference_head(hidden).flatten(0, 1), labels.flatten()) * 0.15
+                       for hidden, labels in zip(reference_predictions, targets))
+        counts = iter([labels.ge(0).sum() for labels in targets for _rank in range(2)])
+        with patch("hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel.dist.all_reduce",
+                   side_effect=lambda count, **_kwargs: count.copy_(next(counts))) as reduce:
+            actual = sum(context.projection_loss(local_loss, states, labels) * 0.15
+                         for hidden, target in zip(predictions, targets)
+                         for states, labels in zip(hidden.chunk(2, 1), target.chunk(2, 1)))
+            actual.backward()
+            self.assertEqual(reduce.call_count, 4, f"expected=4 count collectives, got={reduce.call_count}")
+        expected.backward()
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+        for actual_hidden, expected_hidden in zip(predictions, reference_predictions):
+            torch.testing.assert_close(actual_hidden.grad, expected_hidden.grad, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(head.weight.grad, reference_head.weight.grad, rtol=1e-6, atol=1e-7)
 
     def test_head_divisibility_fails_before_communication(self):
         """The TP-local head shard divides evenly over the CP mesh."""
