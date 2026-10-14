@@ -75,31 +75,41 @@ class MFParityAdamW(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            beta1, beta2 = group["betas"]
+            params_with_grad = [p for p in group["params"] if p.grad is not None]
+            if not params_with_grad:
+                continue
+            if any(p.grad.is_sparse for p in params_with_grad):
+                raise RuntimeError("MFParityAdamW does not support sparse gradients")
             group["step"] = (group.get("step") or 0) + 1
             step = group["step"]
-            for parameter in group["params"]:
-                if parameter.grad is None:
-                    continue
-                if parameter.grad.is_sparse:
-                    raise RuntimeError("MFParityAdamW does not support sparse gradients")
+            device = params_with_grad[0].device
+            # Every scalar constant below is computed as an FP32 tensor, as MF's muon.py
+            # casts them explicitly (``op_cast(beta1, mstype.float32)``, ...); a Python float
+            # scalar computed in double precision and narrowed later can round a value such
+            # as ``1 - beta2`` to a different FP32 bit pattern than computing it in FP32.
+            beta1, beta2, lr, eps = (
+                torch.tensor(value, device=device, dtype=torch.float32)
+                for value in (*group["betas"], group["lr"], group["eps"]))
+            one_minus_beta1, one_minus_beta2 = 1 - beta1, 1 - beta2
+            bias_correction1, bias_correction2 = 1 - beta1 ** step, 1 - beta2 ** step
+            step_size = lr / bias_correction1
+            decay_factor = 1 - lr * group["weight_decay"]
+
+            for parameter in params_with_grad:
                 state = self.state[parameter]
                 if not state:
                     state["exp_avg"] = torch.zeros_like(parameter.grad, memory_format=torch.preserve_format)
                     state["exp_avg_sq"] = torch.zeros_like(parameter.grad, memory_format=torch.preserve_format)
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
 
-                param_fp32 = parameter.float()
-                next_param = param_fp32 * (1 - group["lr"] * group["weight_decay"])
+                next_param = parameter.float() * decay_factor
                 gradient_fp32 = parameter.grad.float()
 
-                exp_avg.mul_(beta1).add_(gradient_fp32, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(gradient_fp32, gradient_fp32, value=1 - beta2)
+                exp_avg.copy_(exp_avg * beta1 + gradient_fp32 * one_minus_beta1)
+                exp_avg_sq.copy_(torch.addcmul(exp_avg_sq * beta2, gradient_fp32, gradient_fp32,
+                                               value=one_minus_beta2.item()))
 
-                bias_correction1 = 1 - beta1 ** step
-                bias_correction2 = 1 - beta2 ** step
-                step_size = group["lr"] / bias_correction1
-                denom = (exp_avg_sq / bias_correction2).sqrt() + group["eps"]
+                denom = (exp_avg_sq / bias_correction2).sqrt() + eps
                 next_param = next_param - (exp_avg / denom) * step_size
                 parameter.data.copy_(next_param.to(parameter.dtype))
 
