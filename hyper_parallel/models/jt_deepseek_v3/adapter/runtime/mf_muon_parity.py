@@ -255,6 +255,19 @@ def build_optimizer(
         matched_adamw_rms=matched_adamw_rms,
         last_block_scale=mf_last_block_scale,
     )
+    # Alignment-only MindFormers numerics. Injected through hooks the framework already
+    # exposes, so core/optimizer/muon.py stays untouched (see mf_muon_ns module docstring).
+    from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.mf_muon_ns import (  # pylint: disable=C0415
+        make_mf_muon_numerics,
+    )
+    numerics = make_mf_muon_numerics(
+        lambda name, shape: _block_groups(name, shape, model.config),
+        model,
+    )
+    muon_config.setdefault("fp32_update", True)
+    muon_config.setdefault("ns_per_param", True)
+    muon_config["zeropower_fn"] = numerics.zeropower_fn
+    muon_config["momentum_update_fn"] = numerics.momentum_update_fn
     _report_partition(model, matched_adamw_rms, mf_last_block_scale)
     return build_jt_optimizer(
         model=model,
