@@ -1,0 +1,753 @@
+diff --git a/hyper_parallel/components/optim/builders.py b/hyper_parallel/components/optim/builders.py
+--- a/hyper_parallel/components/optim/builders.py
++++ b/hyper_parallel/components/optim/builders.py
+@@ -35,6 +35,39 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Opt-in switch that reproduces MindFormers' AdamW grouping: every AdamW parameter decays,
++# including the 1-D norm and bias parameters.  Off by default, HP's historical behaviour.
++WD_ALL_PARAMS_KEY = "adamw_wd_all_params"
++
++
++def _adamw_optimizer_kwargs(adamw_config: dict) -> Dict[str, Any]:
++    """Return the AdamW config without the grouping-only switch."""
++    return {name: value for name, value in adamw_config.items() if name != WD_ALL_PARAMS_KEY}
++
++
++def _keep_declared_weight_decay(optimizer: Any) -> None:
++    """Keep the configured AdamW weight decay across a checkpoint restore.
++
++    A checkpoint stores its parameter groups verbatim and ``load_state_dict`` installs them, so a
++    restored optimizer would silently revert the grouping the configuration asked for (see
++    :func:`hyper_parallel.components.optim.parameter_groups.get_adamw_param_groups`).  The declared
++    values are captured here and re-applied by a load-state post-hook.
++
++    Args:
++        optimizer: Optimizer or chained optimizer returned by the hyper optimizer factory.
++    """
++    leaf = getattr(optimizer, 'optimizers_dict', {}).get('adamw')
++    if leaf is None:
++        return
++    declared = [float(param_group['weight_decay']) for param_group in leaf.param_groups]
++
++    def reapply_weight_decay(module, *args, **kwargs):  # pylint: disable=unused-argument
++        """Put the declared weight decay back after the checkpoint's groups were installed."""
++        for param_group, weight_decay in zip(module.param_groups, declared):
++            param_group['weight_decay'] = weight_decay
++
++    leaf.register_load_state_dict_post_hook(reapply_weight_decay)
++
+ 
+ class AdamW:
+     """Build a core AdamW optimizer from YAML configuration."""
+@@ -59,6 +92,7 @@
+             self.model,
+             weight_decay=adamw_config.get("adamw_weight_decay", 1e-2),
+             no_decay_params=no_decay_params,
++            decay_all_params=bool(adamw_config.get(WD_ALL_PARAMS_KEY, False)),
+         )
+         if not adamw_groups:
+             raise ValueError("AdamW requires at least one trainable parameter")
+@@ -67,8 +101,10 @@
+             model=self.model,
+             muon_params=[],
+             adamw_params=adamw_groups,
+-            adamw_kwargs=adamw_config,
+-        )
++            adamw_kwargs=_adamw_optimizer_kwargs(adamw_config),
++        )
++        if adamw_config.get(WD_ALL_PARAMS_KEY, False):
++            _keep_declared_weight_decay(self.optimizer)
+ 
+     @staticmethod
+     def get_adamw_param_groups(
+@@ -77,6 +113,7 @@
+             no_decay_params: Optional[Sequence[str]] = None,
+             param_groups: Optional[Sequence[Dict[str, Any]]] = None,
+             allowed_param_ids: Optional[Sequence[int]] = None,
++            decay_all_params: bool = False,
+     ) -> Tuple[List[Dict[str, Any]], List[str]]:
+         """Split model parameters into decaying and non-decaying groups.
+ 
+@@ -90,6 +127,8 @@
+             no_decay_params: Name keywords excluded from weight decay.
+             param_groups: Optional prebuilt groups to return unchanged.
+             allowed_param_ids: Optional parameter identities eligible for routing.
++            decay_all_params: Whether every routed parameter decays, including the 1-D norm
++                and bias parameters MindFormers also decays.
+ 
+         Returns:
+             Parameter groups and names routed to AdamW.
+@@ -100,6 +139,7 @@
+             no_decay_params=no_decay_params,
+             param_groups=param_groups,
+             allowed_param_ids=allowed_param_ids,
++            decay_all_params=decay_all_params,
+         )
+ 
+     def get_optimizer(self) -> Any:
+@@ -145,6 +185,7 @@
+             weight_decay=adamw_config.get("adamw_weight_decay", 1e-2),
+             no_decay_params=no_decay_params,
+             allowed_param_ids=[id(parameter) for parameter in adamw_params],
++            decay_all_params=bool(adamw_config.get(WD_ALL_PARAMS_KEY, False)),
+         )
+ 
+         logger.info_rank0(
+@@ -160,8 +201,10 @@
+             muon_params=muon_params,
+             adamw_params=adamw_groups,
+             muon_kwargs=muon_config,
+-            adamw_kwargs=adamw_config,
+-        )
++            adamw_kwargs=_adamw_optimizer_kwargs(adamw_config),
++        )
++        if adamw_config.get(WD_ALL_PARAMS_KEY, False):
++            _keep_declared_weight_decay(self.optimizer)
+ 
+     @staticmethod
+     def split_muon_adamw_params(
+diff --git a/hyper_parallel/components/optim/parameter_groups.py b/hyper_parallel/components/optim/parameter_groups.py
+--- a/hyper_parallel/components/optim/parameter_groups.py
++++ b/hyper_parallel/components/optim/parameter_groups.py
+@@ -67,6 +67,7 @@
+         no_decay_params: Optional[Sequence[str]] = None,
+         param_groups: Optional[Sequence[Dict[str, Any]]] = None,
+         allowed_param_ids: Optional[Sequence[int]] = None,
++        decay_all_params: bool = False,
+ ) -> Tuple[List[Dict[str, Any]], List[str]]:
+     """Split model parameters into decaying and non-decaying groups.
+ 
+@@ -79,6 +80,11 @@
+         no_decay_params: Name keywords excluded from weight decay.
+         param_groups: Optional prebuilt groups to return unchanged.
+         allowed_param_ids: Optional parameter identities eligible for routing.
++        decay_all_params: Give every routed parameter ``weight_decay`` instead of keeping the
++            ``no_decay_params`` keywords at zero.  MindFormers decays every AdamW parameter,
++            including the 1-D norm and bias weights.  The decaying / non-decaying split itself is
++            kept, so the parameter-group layout (and with it the restored optimizer and
++            learning-rate state) is unchanged.
+ 
+     Returns:
+         Parameter groups and names routed to AdamW.
+@@ -109,7 +115,10 @@
+             param_groups.append({"params": decay_parameters, "weight_decay": weight_decay})
+         if no_decay_parameters:
+             logger.info_rank0(f"Parameters without weight decay: {no_decay_parameter_names}")
+-            param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
++            param_groups.append({
++                "params": no_decay_parameters,
++                "weight_decay": weight_decay if decay_all_params else 0.0,
++            })
+ 
+     return param_groups, adamw_names
+ 
+diff --git a/hyper_parallel/core/optimizer/muon.py b/hyper_parallel/core/optimizer/muon.py
+--- a/hyper_parallel/core/optimizer/muon.py
++++ b/hyper_parallel/core/optimizer/muon.py
+@@ -85,6 +85,9 @@
+     "post_update_fn": None,
+     "zero_rms_scale_mode": "zero",
+     "apply_lr_in_update": False,
++    # MindFormers-parity alignment switches; both default to HP's historical behaviour.
++    "fp32_update": False,
++    "ns_per_param": False,
+ }
+ 
+ 
+@@ -101,6 +104,8 @@
+     post_update_fn: Optional[Callable[..., None]]
+     zero_rms_scale_mode: str
+     apply_lr_in_update: bool
++    fp32_update: bool
++    ns_per_param: bool
+ 
+ 
+ def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOptions:
+@@ -230,6 +235,10 @@
+             post_update_fn: Optional callback applied after a parameter update.
+             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
+             apply_lr_in_update: Whether the update callback applies the learning rate.
++            fp32_update: Whether the scaled Muon update is carried and applied in float32
++                (MindFormers' semantics) instead of being quantised to bfloat16.
++            ns_per_param: Whether Newton-Schulz runs once per logical block instead of once
++                per core shape with every parameter of that shape merged into the batch.
+             hsdp_replica_count: Optional optimizer-state replica group size.
+         """
+         advanced = _resolve_muon_advanced_options(advanced_options)
+@@ -270,7 +279,18 @@
+         self.momentum_update_fn = advanced.momentum_update_fn
+         self.ns_transform_fn = advanced.ns_transform_fn
+         self.post_update_fn = advanced.post_update_fn
++        self.fp32_update = advanced.fp32_update
++        self.ns_per_param = advanced.ns_per_param
+         self.reset_optimizer_parameters()
++
++    @property
++    def _update_dtype(self) -> torch.dtype:
++        """Return the dtype the Muon update is carried in.
++
++        ``fp32_update`` keeps the Newton-Schulz output, the slice scale and the parameter add in
++        float32, which is what MindFormers does; the default keeps HP's bfloat16 buffer.
++        """
++        return torch.float32 if self.fp32_update else torch.bfloat16
+ 
+     def reset_optimizer_parameters(self) -> None:
+         """Rebuild all parameter-identity caches from current param groups."""
+@@ -493,7 +513,7 @@
+             group: Dict[str, Any],
+             params: List[torch.Tensor],
+     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
+-        """Compute first-order momentum and return bfloat16 NS inputs."""
++        """Compute first-order momentum and return the Newton-Schulz inputs."""
+         momentum = group["momentum"]
+         if not isinstance(momentum, (list, tuple)):
+             momentum = [momentum]
+@@ -526,7 +546,7 @@
+                     "momentum_update_fn must return one update tensor per input gradient, "
+                     f"got {len(custom_updates)} updates for {len(valid_params)} gradients"
+                 )
+-            custom_updates = [update.to(torch.bfloat16) for update in custom_updates]
++            custom_updates = [update.to(self._update_dtype) for update in custom_updates]
+             param_updates = dict(zip(valid_params, custom_updates))
+             return param_updates
+ 
+@@ -543,8 +563,8 @@
+             torch._foreach_mul_(local_us, momentum1)
+             torch._foreach_add_(local_us, grads)
+ 
+-        if local_us[0].dtype != torch.bfloat16:
+-            local_us = [update.to(torch.bfloat16) for update in local_us]
++        if local_us[0].dtype != self._update_dtype:
++            local_us = [update.to(self._update_dtype) for update in local_us]
+ 
+         param_updates = dict(zip(valid_params, local_us))
+         return param_updates
+@@ -823,10 +843,20 @@
+             ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+             ns_epsilon: float = 1e-10,
+     ) -> List[torch.Tensor]:
+-        """Run batched NS on mixed-shape tensors and restore their original shapes."""
++        """Run batched NS on mixed-shape tensors and restore their original shapes.
++
++        ``fp32_update`` hands float32 buffers in; the orthogonalization itself must stay
++        bfloat16 to match MindFormers, so the arithmetic runs on bfloat16 copies and the
++        results are widened back to the caller's float32 so that the slice scale, the
++        last-block factor and the parameter add are all computed in float32.
++        """
+ 
+         if not tensor_list:
+             return []
++
++        widen = self.fp32_update and tensor_list[0].dtype == torch.float32
++        if widen:
++            tensor_list = [tensor.to(torch.bfloat16) for tensor in tensor_list]
+ 
+         state = {"inputs_3d": [], "slice_sizes": [], "shapes_info": [], "restored_updates": [], "current_idx": 0}
+ 
+@@ -886,6 +916,10 @@
+             state["restored_updates"].append(update)
+ 
+         del merged_update
++        if widen:
++            state["restored_updates"] = [
++                update.to(torch.float32) for update in state["restored_updates"]
++            ]
+         return state["restored_updates"]
+ 
+     def _split_into_memory_safe_batches(
+@@ -924,6 +958,17 @@
+             batches.append(current_batch)
+ 
+         return batches
++
++    def _iter_ns_batches(self, tensors: List[Any]) -> List[List[Any]]:
++        """Split the logical NS tensors of one core shape into the batches to orthogonalize.
++
++        By default every tensor that shares a core shape is merged into a single batched
++        Newton-Schulz call. ``ns_per_param`` runs one call per tensor instead, which is the
++        granularity MindFormers' ``make_model_muon_fns`` schema uses.
++        """
++        if not self.ns_per_param:
++            return [tensors]
++        return [[tensor] for tensor in tensors]
+ 
+     def _compute_batched_ns_updates(
+             self,
+@@ -962,17 +1007,18 @@
+                     reshaped_input
+                 )
+         for tensor_list in state["reshape_groups"].values():
+-            updates = self._compute_batched_ns_outputs_for_tensors(
+-                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
+-            )
+-            for reshaped_input, update in zip(tensor_list, updates):
+-                scale = compute_muon_slice_scale(
+-                    update, group["matched_adamw_rms"], zero_rms_scale_mode=group["zero_rms_scale_mode"]
++            for batch in self._iter_ns_batches(tensor_list):
++                updates = self._compute_batched_ns_outputs_for_tensors(
++                    batch, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
+                 )
+-                if group["apply_lr_in_update"]:
+-                    scale *= -group["lr"]
+-                update.mul_(scale)
+-                reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
++                for reshaped_input, update in zip(batch, updates):
++                    scale = compute_muon_slice_scale(
++                        update, group["matched_adamw_rms"], zero_rms_scale_mode=group["zero_rms_scale_mode"]
++                    )
++                    if group["apply_lr_in_update"]:
++                        scale *= -group["lr"]
++                    update.mul_(scale)
++                    reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
+ 
+         for param in p_list:
+             update = ns_inputs[param].view(state["origin_shapes"][param])
+@@ -1023,26 +1069,27 @@
+                 )
+ 
+         for tensor_records in state["reshape_groups"].values():
+-            reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
+-                [record[0] for record in tensor_records],
+-                group["ns_steps"],
+-                ns_variant=group["ns_variant"],
+-                ns_coefficients=group["ns_coefficients"],
+-                ns_epsilon=group["ns_epsilon"],
+-            )
+-
+-            # Scale updates.
+-            for record, reshaped_update in zip(tensor_records, reshaped_updates):
+-                slice_scale = compute_muon_slice_scale(
+-                    reshaped_update,
+-                    group["matched_adamw_rms"],
+-                    zero_rms_scale_mode=group["zero_rms_scale_mode"],
++            for batch in self._iter_ns_batches(tensor_records):
++                reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
++                    [record[0] for record in batch],
++                    group["ns_steps"],
++                    ns_variant=group["ns_variant"],
++                    ns_coefficients=group["ns_coefficients"],
++                    ns_epsilon=group["ns_epsilon"],
+                 )
+ 
+-                if group["apply_lr_in_update"]:
+-                    slice_scale *= -group["lr"]
+-                reshaped_update.mul_(slice_scale)
+-                state["transform_updates"][record[1]][record[2]] = reshaped_update
++                # Scale updates.
++                for record, reshaped_update in zip(batch, reshaped_updates):
++                    slice_scale = compute_muon_slice_scale(
++                        reshaped_update,
++                        group["matched_adamw_rms"],
++                        zero_rms_scale_mode=group["zero_rms_scale_mode"],
++                    )
++
++                    if group["apply_lr_in_update"]:
++                        slice_scale *= -group["lr"]
++                    reshaped_update.mul_(slice_scale)
++                    state["transform_updates"][record[1]][record[2]] = reshaped_update
+ 
+         for p, reshaped_updates in zip(p_list, state["transform_updates"]):
+ 
+@@ -1082,7 +1129,7 @@
+         all_update_shards: List[torch.Tensor] = []
+ 
+         alignment_bytes = 512
+-        element_size = torch.empty(0, dtype=torch.bfloat16, device=device).element_size()
++        element_size = torch.empty(0, dtype=self._update_dtype, device=device).element_size()
+         alignment_elements = max(1, alignment_bytes // element_size)
+ 
+         pack_buffers: Dict[Tuple[int, ...], torch.Tensor] = {}
+@@ -1100,7 +1147,7 @@
+                 total_padded_numel += padded_numel
+ 
+             coord_param_offsets[coord] = param_offsets
+-            pack_buffer = torch.empty(total_padded_numel, dtype=torch.bfloat16, device=device)
++            pack_buffer = torch.empty(total_padded_numel, dtype=self._update_dtype, device=device)
+ 
+             if is_compute_rank:
+                 for p, (offset, actual_numel, padded_numel) in zip(coord_params, param_offsets):
+diff --git a/hyper_parallel/models/jt_deepseek_v3/adapter/runtime/mf_muon_parity.py b/hyper_parallel/models/jt_deepseek_v3/adapter/runtime/mf_muon_parity.py
+--- a/hyper_parallel/models/jt_deepseek_v3/adapter/runtime/mf_muon_parity.py
++++ b/hyper_parallel/models/jt_deepseek_v3/adapter/runtime/mf_muon_parity.py
+@@ -255,6 +255,19 @@
+         matched_adamw_rms=matched_adamw_rms,
+         last_block_scale=mf_last_block_scale,
+     )
++    # Alignment-only MindFormers numerics. Injected through hooks the framework already
++    # exposes, so core/optimizer/muon.py stays untouched (see mf_muon_ns module docstring).
++    from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.mf_muon_ns import (  # pylint: disable=C0415
++        make_mf_muon_numerics,
++    )
++    numerics = make_mf_muon_numerics(
++        lambda name, shape: _block_groups(name, shape, model.config),
++        model,
++    )
++    muon_config.setdefault("fp32_update", True)
++    muon_config.setdefault("ns_per_param", True)
++    muon_config["zeropower_fn"] = numerics.zeropower_fn
++    muon_config["momentum_update_fn"] = numerics.momentum_update_fn
+     _report_partition(model, matched_adamw_rms, mf_last_block_scale)
+     return build_jt_optimizer(
+         model=model,
+diff --git a/hyper_parallel/models/jt_deepseek_v3/adapter/runtime/mf_muon_ns.py b/hyper_parallel/models/jt_deepseek_v3/adapter/runtime/mf_muon_ns.py
+new file mode 100644
+--- /dev/null
++++ b/hyper_parallel/models/jt_deepseek_v3/adapter/runtime/mf_muon_ns.py
+@@ -0,0 +1,161 @@
++# Copyright 2026 Huawei Technologies Co., Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ============================================================================
++"""MindFormers-exact Muon arithmetic, entirely on the model/adapter side.
++
++Alignment-only: this module exists so that a ``mf_muon`` run reproduces
++MindFormers' Muon numerically without touching ``core/optimizer/muon.py``.
++
++It is injected through hooks the framework already exposes:
++
++* ``muon_config["zeropower_fn"]``      -> :func:`make_zeropower_fn`
++* ``muon_config["momentum_update_fn"]``-> :func:`make_momentum_update_fn`
++
++Because the framework pre-casts Newton-Schulz inputs to bfloat16 whenever
++``fp32_update`` is enabled, the float32 numerator a whole, non-transposed 2-D
++block needs cannot be recovered from the tensor the NS hook receives.  The
++momentum hook therefore keeps a float32 copy of every such block keyed by its
++shape, and the NS hook substitutes it.  See ``_classes`` for how the small set
++of alignment parameters is classified.
++"""
++from __future__ import annotations
++
++import math
++from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
++
++import torch
++
++_NS_LEGACY_COEFFS_MF = (3.4375, -4.78125, 2.03125)   # bf16 values of (3.4445, -4.7750, 2.0315)
++_NS_MF_EPSILON = 1e-7
++
++
++def _trace_on() -> bool:
++    import os
++    return os.environ.get("MF_NS_TRACE", "0") == "1"
++
++
++def _trace(numerics: "MFMuonNumerics", ns_inputs: torch.Tensor) -> None:
++    """One line per call: shape, dtype, whether the stashed float32 numerator was used."""
++    key = tuple(ns_inputs.shape)
++    wants_fp32 = numerics._shape_classes.get(key[-2:], False) if ns_inputs.dim() == 2 else None
++    used_stash = wants_fp32 is True and key[-2:] in numerics._fp32_inputs
++    print(f"[MFNS] call shape={key} dtype={ns_inputs.dtype} fp32_numerator={wants_fp32} "
++          f"stash_hit={used_stash}", flush=True)
++
++
++def _store_bfloat16(tensor: torch.Tensor) -> torch.Tensor:
++    """Store a float32 tensor on the bfloat16 grid (round-to-nearest-even)."""
++    return tensor.to(torch.bfloat16).to(torch.float32)
++
++
++def zeropower_via_newtonschulz5_mf(
++        ns_inputs: torch.Tensor,
++        steps: int,
++        ns_variant: str = "legacy",
++        epsilon: float = _NS_MF_EPSILON,
++        ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
++) -> torch.Tensor:
++    """MindFormers' ``zeropower_via_newtonschulz5_2d``/``_3d`` arithmetic, verbatim."""
++    del ns_variant, ns_coefficients
++    mat_x = ns_inputs.to(torch.float32)
++    transposed = mat_x.size(-2) > mat_x.size(-1)
++    if transposed:
++        mat_x = mat_x.mT
++    if mat_x.dim() > 2:
++        norm = _store_bfloat16(_store_bfloat16(mat_x).norm(dim=(-2, -1), keepdim=True) + epsilon)
++        mat_x = _store_bfloat16(mat_x / norm)
++    else:
++        norm = mat_x.norm(dim=(-2, -1), keepdim=True)
++        mat_x = _store_bfloat16(mat_x / (norm + epsilon))
++    coeff_a, coeff_b, coeff_c = _NS_LEGACY_COEFFS_MF
++    for _ in range(steps):
++        a_mat = _store_bfloat16(torch.matmul(mat_x, mat_x.mT))
++        if mat_x.dim() == 2:
++            # MindFormers' 2-D branch binds ``c * a_mat @ a_mat`` left to right: (c * A) @ A.
++            inner = _store_bfloat16(torch.matmul(_store_bfloat16(coeff_c * a_mat), a_mat))
++        else:
++            inner = coeff_c * _store_bfloat16(torch.matmul(a_mat, a_mat))
++        b_mat = _store_bfloat16(coeff_b * a_mat + inner)
++        mat_x = _store_bfloat16(mat_x * coeff_a + _store_bfloat16(torch.matmul(b_mat, mat_x)))
++    if transposed:
++        mat_x = mat_x.mT
++    return mat_x.to(ns_inputs.dtype)
++
++
++class MFMuonNumerics:
++    """Alignment-only helper that reproduces MindFormers' Muon numerics.
++
++    ``shape_classes`` maps a 2-D tensor shape to ``True`` when MindFormers
++    normalises that whole, non-transposed block from its pre-cast float32 value.
++    """
++
++    def __init__(self, shape_classes: Dict[Tuple[int, int], bool]):
++        self._shape_classes = dict(shape_classes)
++        self._fp32_inputs: Dict[Tuple[int, int], torch.Tensor] = {}
++
++    # -- hooks -----------------------------------------------------------------
++    def momentum_update_fn(self, grads, bufs, momentum1, momentum2, nesterov):
++        """MindFormers' ``next_m``/nesterov lane in float32 (``_update_muon_momentum``)."""
++        step_buffers = list(bufs)
++        state_dtype = bufs[0].dtype
++        grads = [grad.to(torch.float32) for grad in grads]
++        bufs = [buffer.to(torch.float32) for buffer in bufs]
++        local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
++        torch._foreach_mul_(bufs, momentum2)
++        torch._foreach_add_(bufs, grads)
++        if nesterov:
++            torch._foreach_mul_(local_us, momentum1)
++            torch._foreach_add_(local_us, grads)
++        for state_buffer, updated in zip(step_buffers, bufs):
++            state_buffer.copy_(updated.to(state_dtype))
++        for update in local_us:
++            if update.dim() == 2 and self._shape_classes.get(tuple(update.shape), False):
++                self._fp32_inputs[tuple(update.shape)] = update.detach()
++        return local_us
++
++    def zeropower_fn(self, ns_inputs: torch.Tensor, steps: int, **_: Any) -> torch.Tensor:
++        """MindFormers' Newton-Schulz, using the stashed float32 numerator when required."""
++        if _trace_on():
++            _trace(self, ns_inputs)
++        cached = None
++        if ns_inputs.dim() == 2 and self._shape_classes.get(tuple(ns_inputs.shape), False):
++            cached = self._fp32_inputs.get(tuple(ns_inputs.shape))
++        return zeropower_via_newtonschulz5_mf(ns_inputs if cached is None else cached, steps=steps)
++
++
++def make_mf_muon_numerics(block_groups_fn: Callable[[str, Tuple[int, ...]], Optional[List[Any]],
++                                                   ], model: torch.nn.Module) -> MFMuonNumerics:
++    """Classify every Muon parameter of ``model`` by MindFormers' numerator rule.
++
++    ``fp32`` numerator requires: no ``muon_split`` transform for the parameter, a 2-D
++    tensor and no Newton-Schulz-internal transpose, i.e. ``size(-2) <= size(-1)``.
++    """
++    classes: Dict[Tuple[int, int], bool] = {}
++    for name, param in model.named_parameters():
++        shape = tuple(param.shape)
++        if len(shape) != 2:
++            continue
++        transformed = block_groups_fn(name, shape) is not None
++        value = (not transformed) and shape[-2] <= shape[-1]
++        previous = classes.get(shape)
++        if previous is not None and previous != value:
++            raise ValueError(
++                f"ambiguous Muon numerator class for shape {shape}: {name} wants fp32={value}, "
++                f"a previous parameter wants fp32={previous}"
++            )
++        classes[shape] = value
++    return MFMuonNumerics(classes)
++
++
++__all__ = ["MFMuonNumerics", "make_mf_muon_numerics", "zeropower_via_newtonschulz5_mf"]
+diff --git a/hyper_parallel/pr180.py b/hyper_parallel/pr180.py
+new file mode 100644
+--- /dev/null
++++ b/hyper_parallel/pr180.py
+@@ -0,0 +1,189 @@
++# Copyright 2026 Huawei Technologies Co., Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ============================================================================
++"""Fix 3 — PR #180: form the token weight before scaling the local loss.
++
++The upstream trainer builds the backward scale as ``(cur_loss * cur_token_len)
++/ all_reduced_len * dp_size * cp_size``.  Autograd therefore evaluates the
++gradient of the named loss as ``(1 / all_reduced_len) * cur_token_len`` — a
++*division* first and a *multiplication* afterwards.  For the alignment data the
++single-rank microbatch fills the whole step (``cur_token_len ==
++all_reduced_len == 3872``), where ``fl(fl(1 / 3872) * 3872) = 0x3f7fffff``:
++one float32 ulp **below** 1.0.  Every named loss therefore receives a gradient
++of ``1 - 2**-24`` instead of ``1.0``, which scales the whole MTP backward pass
++by that factor.
++
++PR #180 reorders the expression so the token weight is formed *first*:
++``backward_scale = cur_token_len / all_reduced_len * dp_size * cp_size`` and
++``backward_loss = cur_loss * backward_scale``.  The division now happens on the
++token counts (``3872 / 3872 == 1.0`` exactly), so the gradient of a full
++single-rank microbatch is the exact identity.
++
++This module applies the PR as a *runtime* monkey patch: the repository
++(``/workspace/worktree/align-l2-f`` and ``/workspace/hyper-parallel``) is never
++modified.  ``hyper_parallel.trainer.base`` imports ``mean_global_loss`` by name
++at module import time, so the replacement has to happen in every module that
++already holds a reference to the original function object.
++"""
++from __future__ import annotations
++
++import sys
++import threading
++
++#: the one line the PR changes, kept verbatim for the diff in the report
++UPSTREAM_LINES = (
++    'local_weighted_loss = cur_loss * cur_token_len',
++    'backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.dp_size',
++)
++
++
++def mean_global_loss_pr180(losses, current_token_counts, step_token_counts, device_mesh):
++    """``hyper_parallel.trainer.runtime.metrics.mean_global_loss`` with PR #180 applied.
++
++    Identical to the upstream function except for the two lines that form the backward scale;
++    the all-reduced (reported) loss is untouched.
++    """
++    import torch  # pylint: disable=C0415
++    import torch.distributed as dist  # pylint: disable=C0415
++    from hyper_parallel.trainer.runtime.distributed import all_reduce  # pylint: disable=C0415
++
++    loss_dict = {}
++    dp_cp_mesh = device_mesh.dp_cp_mesh
++    dp_cp_group = dp_cp_mesh.get_group() if dp_cp_mesh is not None else None
++    sequence_parallel = device_mesh.sequence_parallel
++    sequence_parallel_group = None
++    sequence_parallel_size = 1
++    if sequence_parallel:
++        if device_mesh.device_mesh is None or 'tp' not in device_mesh.device_mesh.mesh_dim_names:
++            raise ValueError("Sequence parallelism requires a DeviceMesh with a 'tp' dimension.")
++        sequence_parallel_group = device_mesh.device_mesh['tp'].get_group()
++        sequence_parallel_size = dist.get_world_size(group=sequence_parallel_group)
++    if isinstance(losses, torch.Tensor):  # text loss only
++        losses = {'foundation_loss': losses}
++    for key, cur_loss in losses.items():
++        loss_name = key.split('_loss', maxsplit=1)[0]  # foundation/image_decoder/**
++        cur_token_len = current_token_counts[f'{loss_name}_tokens']
++        if sequence_parallel:
++            cur_token_len = all_reduce(cur_token_len.item(), op='sum',
++                                       group=sequence_parallel_group)
++        all_reduced_len = all_reduce(
++            step_token_counts[f'{loss_name}_tokens'].item(),
++            op='sum',
++            group=dp_cp_group,
++        )
++        if all_reduced_len != 0:
++            local_weighted_loss = cur_loss * cur_token_len
++            # PR #180: form the token weight first so a full single-rank microbatch has an exact
++            # identity gradient.
++            if os.environ.get("MF_ACTIVE_RECIP", "0") == "1":
++                backward_scale = cur_token_len * (1.0 / all_reduced_len) * device_mesh.dp_size * device_mesh.cp_size
++            else:
++                backward_scale = (cur_token_len / all_reduced_len
++                                  * device_mesh.dp_size * device_mesh.cp_size)
++            backward_loss = cur_loss * backward_scale
++            global_weighted_loss = all_reduce(
++                local_weighted_loss.detach().item(),
++                op='sum',
++                group=dp_cp_group,
++            )
++            global_mean = cur_loss.new_tensor(global_weighted_loss / all_reduced_len)
++            cur_loss = backward_loss + global_mean - backward_loss.detach()
++            _note(loss_name, cur_token_len, all_reduced_len, device_mesh, backward_scale,
++                  backward_loss)
++        else:
++            if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
++                raise ValueError(
++                    f'The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: '
++                    f'{cur_loss}'
++                )
++        if sequence_parallel:
++            cur_loss = cur_loss / sequence_parallel_size
++        loss_dict[key] = cur_loss
++    return loss_dict
++
++
++_LOCK = threading.Lock()
++_NOTED = set()
++
++
++def _bits(value):
++    """Return the fp32 bit pattern of ``value`` as ``0x%08x``."""
++    import struct  # pylint: disable=C0415
++
++    if hasattr(value, 'item'):
++        value = value.item()
++    return '0x%08x' % struct.unpack('<I', struct.pack('<f', float(value)))[0]
++
++
++def _note(loss_name, cur_token_len, all_reduced_len, device_mesh, backward_scale, backward_loss):
++    """Print the token counts and the backward scale once per loss name (evidence for the report)."""
++    with _LOCK:
++        if loss_name in _NOTED:
++            return
++        _NOTED.add(loss_name)
++    scale = backward_scale.item() if hasattr(backward_scale, 'item') else backward_scale
++    grad = backward_loss.grad_fn
++    del grad
++    print(f'[PR180] {loss_name}: cur_token_len={cur_token_len} all_reduced_len={all_reduced_len} '
++          f'dp={device_mesh.dp_size} cp={device_mesh.cp_size} backward_scale={scale!r} '
++          f'bits={_bits(scale)} grad_wrt_named_loss={_bits(scale)}', flush=True)
++
++
++def apply(verbose=True):
++    """Replace ``mean_global_loss`` in every module that holds a reference to the original.
++
++    Returns the list of module names that were patched.
++    """
++    import hyper_parallel.trainer.runtime.metrics as metrics  # pylint: disable=C0415
++
++    original = metrics.mean_global_loss
++    patched = mean_global_loss_pr180
++    replaced = []
++    # only hyper_parallel's own modules are inspected: a bare ``getattr`` on every loaded module
++    # would wake transformers' lazy modules, whose ``__getattr__`` imports every model package
++    for name, module in list(sys.modules.items()):
++        if module is None or not name.startswith('hyper_parallel'):
++            continue
++        try:
++            current = getattr(module, 'mean_global_loss', None)
++        except Exception:  # pylint: disable=broad-except
++            continue
++        if current is original:
++            setattr(module, 'mean_global_loss', patched)
++            replaced.append(name)
++    if metrics.mean_global_loss is not patched:
++        metrics.mean_global_loss = patched
++        replaced.append('hyper_parallel.trainer.runtime.metrics (forced)')
++    if verbose:
++        print(f'[PR180] mean_global_loss patched in {sorted(set(replaced))}', flush=True)
++    if not replaced:
++        print('[PR180] WARNING: no module held a reference to mean_global_loss', flush=True)
++    return sorted(set(replaced))
++
++
++def describe():
++    """Return the three code lines that differ from the upstream implementation."""
++    return {
++        'upstream': [
++            'local_weighted_loss = cur_loss * cur_token_len',
++            'backward_loss = local_weighted_loss / all_reduced_len'
++            ' * device_mesh.dp_size * device_mesh.cp_size',
++        ],
++        'with_pr180': [
++            'local_weighted_loss = cur_loss * cur_token_len',
++            'backward_scale = cur_token_len / all_reduced_len'
++            ' * device_mesh.dp_size * device_mesh.cp_size',
++            'backward_loss = cur_loss * backward_scale',
++        ],
++    }

@@ -1,0 +1,22 @@
+{
+  "step": 600,
+  "loss": 5.508638381958008,
+  "loss_17g": "5.5086383819580078",
+  "grad_norm": 25.752897262573242,
+  "grad_norm_17g": "25.752897262573242",
+  "norm_fp64": null,
+  "norm_fp64_17g": null,
+  "norm_fp64_preclip": null,
+  "norm_fp64_preclip_17g": null,
+  "numel_fp64": null,
+  "loss_dict": {
+    "foundation_loss/lm": 4.277120113372803,
+    "foundation_loss/mtp": 1.2312074899673462,
+    "foundation_loss/aux": 0.00031105935340747237
+  },
+  "loss_dict_17g": {
+    "foundation_loss/lm": "4.2771201133728027",
+    "foundation_loss/mtp": "1.2312074899673462",
+    "foundation_loss/aux": "0.00031105935340747237"
+  }
+}
