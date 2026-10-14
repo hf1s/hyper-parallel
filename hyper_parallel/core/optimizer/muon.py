@@ -85,6 +85,9 @@ _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "post_update_fn": None,
     "zero_rms_scale_mode": "zero",
     "apply_lr_in_update": False,
+    # MindFormers-parity alignment switches; both default to HP's historical behaviour.
+    "fp32_update": False,
+    "ns_per_param": False,
 }
 
 
@@ -101,6 +104,8 @@ class _MuonAdvancedOptions:
     post_update_fn: Optional[Callable[..., None]]
     zero_rms_scale_mode: str
     apply_lr_in_update: bool
+    fp32_update: bool
+    ns_per_param: bool
 
 
 def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOptions:
@@ -230,6 +235,10 @@ class Muon(BaseDistributedOptimizer):
             post_update_fn: Optional callback applied after a parameter update.
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
+            fp32_update: Whether the scaled Muon update is carried and applied in float32
+                (MindFormers' semantics) instead of being quantised to bfloat16.
+            ns_per_param: Whether Newton-Schulz runs once per logical block instead of once
+                per core shape with every parameter of that shape merged into the batch.
             hsdp_replica_count: Optional optimizer-state replica group size.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
@@ -270,7 +279,18 @@ class Muon(BaseDistributedOptimizer):
         self.momentum_update_fn = advanced.momentum_update_fn
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
+        self.fp32_update = advanced.fp32_update
+        self.ns_per_param = advanced.ns_per_param
         self.reset_optimizer_parameters()
+
+    @property
+    def _update_dtype(self) -> torch.dtype:
+        """Return the dtype the Muon update is carried in.
+
+        ``fp32_update`` keeps the Newton-Schulz output, the slice scale and the parameter add in
+        float32, which is what MindFormers does; the default keeps HP's bfloat16 buffer.
+        """
+        return torch.float32 if self.fp32_update else torch.bfloat16
 
     def reset_optimizer_parameters(self) -> None:
         """Rebuild all parameter-identity caches from current param groups."""
@@ -493,7 +513,7 @@ class Muon(BaseDistributedOptimizer):
             group: Dict[str, Any],
             params: List[torch.Tensor],
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
-        """Compute first-order momentum and return bfloat16 NS inputs."""
+        """Compute first-order momentum and return the Newton-Schulz inputs."""
         momentum = group["momentum"]
         if not isinstance(momentum, (list, tuple)):
             momentum = [momentum]
@@ -526,7 +546,7 @@ class Muon(BaseDistributedOptimizer):
                     "momentum_update_fn must return one update tensor per input gradient, "
                     f"got {len(custom_updates)} updates for {len(valid_params)} gradients"
                 )
-            custom_updates = [update.to(torch.bfloat16) for update in custom_updates]
+            custom_updates = [update.to(self._update_dtype) for update in custom_updates]
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
@@ -543,8 +563,8 @@ class Muon(BaseDistributedOptimizer):
             torch._foreach_mul_(local_us, momentum1)
             torch._foreach_add_(local_us, grads)
 
-        if local_us[0].dtype != torch.bfloat16:
-            local_us = [update.to(torch.bfloat16) for update in local_us]
+        if local_us[0].dtype != self._update_dtype:
+            local_us = [update.to(self._update_dtype) for update in local_us]
 
         param_updates = dict(zip(valid_params, local_us))
         return param_updates
@@ -823,10 +843,20 @@ class Muon(BaseDistributedOptimizer):
             ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
             ns_epsilon: float = 1e-10,
     ) -> List[torch.Tensor]:
-        """Run batched NS on mixed-shape tensors and restore their original shapes."""
+        """Run batched NS on mixed-shape tensors and restore their original shapes.
+
+        ``fp32_update`` hands float32 buffers in; the orthogonalization itself must stay
+        bfloat16 to match MindFormers, so the arithmetic runs on bfloat16 copies and the
+        results are widened back to the caller's float32 so that the slice scale, the
+        last-block factor and the parameter add are all computed in float32.
+        """
 
         if not tensor_list:
             return []
+
+        widen = self.fp32_update and tensor_list[0].dtype == torch.float32
+        if widen:
+            tensor_list = [tensor.to(torch.bfloat16) for tensor in tensor_list]
 
         state = {"inputs_3d": [], "slice_sizes": [], "shapes_info": [], "restored_updates": [], "current_idx": 0}
 
@@ -886,6 +916,10 @@ class Muon(BaseDistributedOptimizer):
             state["restored_updates"].append(update)
 
         del merged_update
+        if widen:
+            state["restored_updates"] = [
+                update.to(torch.float32) for update in state["restored_updates"]
+            ]
         return state["restored_updates"]
 
     def _split_into_memory_safe_batches(
@@ -925,6 +959,17 @@ class Muon(BaseDistributedOptimizer):
 
         return batches
 
+    def _iter_ns_batches(self, tensors: List[Any]) -> List[List[Any]]:
+        """Split the logical NS tensors of one core shape into the batches to orthogonalize.
+
+        By default every tensor that shares a core shape is merged into a single batched
+        Newton-Schulz call. ``ns_per_param`` runs one call per tensor instead, which is the
+        granularity MindFormers' ``make_model_muon_fns`` schema uses.
+        """
+        if not self.ns_per_param:
+            return [tensors]
+        return [[tensor] for tensor in tensors]
+
     def _compute_batched_ns_updates(
             self,
             p_list: List[torch.nn.Parameter],
@@ -962,17 +1007,18 @@ class Muon(BaseDistributedOptimizer):
                     reshaped_input
                 )
         for tensor_list in state["reshape_groups"].values():
-            updates = self._compute_batched_ns_outputs_for_tensors(
-                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
-            )
-            for reshaped_input, update in zip(tensor_list, updates):
-                scale = compute_muon_slice_scale(
-                    update, group["matched_adamw_rms"], zero_rms_scale_mode=group["zero_rms_scale_mode"]
+            for batch in self._iter_ns_batches(tensor_list):
+                updates = self._compute_batched_ns_outputs_for_tensors(
+                    batch, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
                 )
-                if group["apply_lr_in_update"]:
-                    scale *= -group["lr"]
-                update.mul_(scale)
-                reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
+                for reshaped_input, update in zip(batch, updates):
+                    scale = compute_muon_slice_scale(
+                        update, group["matched_adamw_rms"], zero_rms_scale_mode=group["zero_rms_scale_mode"]
+                    )
+                    if group["apply_lr_in_update"]:
+                        scale *= -group["lr"]
+                    update.mul_(scale)
+                    reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
 
         for param in p_list:
             update = ns_inputs[param].view(state["origin_shapes"][param])
@@ -1023,26 +1069,27 @@ class Muon(BaseDistributedOptimizer):
                 )
 
         for tensor_records in state["reshape_groups"].values():
-            reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
-                [record[0] for record in tensor_records],
-                group["ns_steps"],
-                ns_variant=group["ns_variant"],
-                ns_coefficients=group["ns_coefficients"],
-                ns_epsilon=group["ns_epsilon"],
-            )
-
-            # Scale updates.
-            for record, reshaped_update in zip(tensor_records, reshaped_updates):
-                slice_scale = compute_muon_slice_scale(
-                    reshaped_update,
-                    group["matched_adamw_rms"],
-                    zero_rms_scale_mode=group["zero_rms_scale_mode"],
+            for batch in self._iter_ns_batches(tensor_records):
+                reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
+                    [record[0] for record in batch],
+                    group["ns_steps"],
+                    ns_variant=group["ns_variant"],
+                    ns_coefficients=group["ns_coefficients"],
+                    ns_epsilon=group["ns_epsilon"],
                 )
 
-                if group["apply_lr_in_update"]:
-                    slice_scale *= -group["lr"]
-                reshaped_update.mul_(slice_scale)
-                state["transform_updates"][record[1]][record[2]] = reshaped_update
+                # Scale updates.
+                for record, reshaped_update in zip(batch, reshaped_updates):
+                    slice_scale = compute_muon_slice_scale(
+                        reshaped_update,
+                        group["matched_adamw_rms"],
+                        zero_rms_scale_mode=group["zero_rms_scale_mode"],
+                    )
+
+                    if group["apply_lr_in_update"]:
+                        slice_scale *= -group["lr"]
+                    reshaped_update.mul_(slice_scale)
+                    state["transform_updates"][record[1]][record[2]] = reshaped_update
 
         for p, reshaped_updates in zip(p_list, state["transform_updates"]):
 
@@ -1082,7 +1129,7 @@ class Muon(BaseDistributedOptimizer):
         all_update_shards: List[torch.Tensor] = []
 
         alignment_bytes = 512
-        element_size = torch.empty(0, dtype=torch.bfloat16, device=device).element_size()
+        element_size = torch.empty(0, dtype=self._update_dtype, device=device).element_size()
         alignment_elements = max(1, alignment_bytes // element_size)
 
         pack_buffers: Dict[Tuple[int, ...], torch.Tensor] = {}
@@ -1100,7 +1147,7 @@ class Muon(BaseDistributedOptimizer):
                 total_padded_numel += padded_numel
 
             coord_param_offsets[coord] = param_offsets
-            pack_buffer = torch.empty(total_padded_numel, dtype=torch.bfloat16, device=device)
+            pack_buffer = torch.empty(total_padded_numel, dtype=self._update_dtype, device=device)
 
             if is_compute_rank:
                 for p, (offset, actual_numel, padded_numel) in zip(coord_params, param_offsets):
