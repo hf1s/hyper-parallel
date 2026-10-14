@@ -104,6 +104,9 @@ class HSDPStateV2:
         self.param_group = None
         self._move_states_to_device()
         self._init_hsdp_params()
+        # HSDPParam owns the consumed metadata; release references to replaced parameters.
+        self.source_shard_infos = None
+        self.raw_replicate_params.clear()
         self.is_shard = True
         self.module_name = None
         # requires_gradient_sync
