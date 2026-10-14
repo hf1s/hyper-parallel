@@ -622,6 +622,39 @@ class JTDeepseekV3Model(DeepseekV32Model):
         self.post_init()
 
 
+class JTDeepseekV3OutputHead(nn.Linear):
+    """Cast the live weight per call, so its FP32 leaf gathers every chunk's gradient.
+
+    ``_projection_loss`` calls this shared head once per loss chunk and once per MTP
+    depth; a plain ``nn.Linear`` accumulates every call's weight gradient in whatever
+    dtype the chunk matmul ran in, rounding each contribution before it is even summed.
+    MindFormers' shared ``output_layer`` keeps its parameter at FP32 (``params_dtype``,
+    mindformers/parallel_core/training_graph/tensor_parallel/layers.py:308) and only
+    casts a local copy down to ``compute_dtype`` for the matmul (same file, line 362);
+    gpt_model.py:361 builds that one ``ColumnParallelLinear`` and reuses it for the main
+    and MTP logits. Casting inside forward instead of storing a low-precision weight lets
+    autograd restore FP32 on the way back to this leaf, so ``weight.grad`` accumulates at
+    FP32 across every chunk and depth before the optimizer reads it.
+
+    MindFormers also has a ``head-native-grad`` factor (``alignment_native_gradient``)
+    that additionally reorients the weight-gradient GEMM to match its native kernel's
+    memory layout; that is a separate factor and is intentionally left out here.
+    """
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        """Project hidden states through the weight cast to the input's dtype.
+
+        Args:
+            values: Hidden activations, ``[..., hidden]``.
+
+        Returns:
+            Logits, ``[..., vocab]``, in ``values``'s dtype.
+        """
+        weight = self.weight.to(values.dtype)
+        bias = None if self.bias is None else self.bias.to(values.dtype)
+        return F.linear(values, weight, bias)  # pylint: disable=not-callable
+
+
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     """JT DeepSeek-V3 causal LM whose forward returns the LM, MTP and router auxiliary losses."""
 
@@ -646,7 +679,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT rotary computation currently requires rope_type='default'")
         self.model = JTDeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = JTDeepseekV3OutputHead(config.hidden_size, config.vocab_size, bias=False)
         mtp_config = copy.deepcopy(config)
         depth = config.num_nextn_predict_layers
         mtp_config.mlp_layer_types = ["sparse"] * depth
