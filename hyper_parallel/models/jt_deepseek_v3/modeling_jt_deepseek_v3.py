@@ -46,6 +46,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.components.functional.rms_norm import rms_norm
+from hyper_parallel.components.functional.swiglu import swiglu
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
@@ -129,6 +130,42 @@ class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
             Normalized activations with the input dtype.
         """
         return rms_norm(hidden_states.float(), self.weight.float(), self.variance_epsilon).to(hidden_states.dtype)
+
+
+class JTDeepseekV3MLP(DeepseekV32MLP):
+    """Fuse the gate/up projections' activation into one SwiGLU kernel call, as MindFormers does.
+
+    MF's dense MLP and MoE shared experts run one ``linear_fc1`` GEMM that produces a
+    doubled-width gate/up projection, then a fused SwiGLU kernel that chunks it in half and
+    computes ``silu(first_half) * second_half`` in one op (MF:
+    ``parallel_core/training_graph/transformer/mlp.py:90-93,145-152`` selects the fused
+    activation; ``training_graph/activation.py:29-47``'s ``FusedSwiGlu`` wraps the real
+    Ascend ``Swiglu`` op, and ``activation.py:63-86``'s ``SwiGlu`` gives the same contract in
+    explicit ops). The HF base class instead runs two separate ``gate_proj``/``up_proj``
+    matmuls and combines them as ``act_fn(gate_proj(x)) * up_proj(x)``. This concatenates the
+    two projections' outputs and replaces the elementwise product with :func:`swiglu`'s fused
+    kernel, matching MF's forward rounding.
+
+    MF's ``dense-interleaved`` and ``silu-ir-grad`` precision-probe factors change this
+    further and are intentionally not ported here: ``dense-interleaved`` would additionally
+    pack ``gate_proj``/``up_proj`` into one interleaved weight so the projection is a single
+    GEMM instead of two concatenated ones; ``silu-ir-grad`` would additionally replace the
+    SwiGLU backward with MF's observed GraphKernel SiLUGrad op order instead of the fused
+    kernel's own gradient.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project, fuse the SwiGLU activation, then project back down.
+
+        Args:
+            hidden_states: Input activations, ``[..., hidden]``.
+
+        Returns:
+            MLP output, shaped like ``hidden_states``.
+        """
+        hidden_states = hidden_states.to(self.gate_proj.weight.dtype)
+        projected = torch.cat((self.gate_proj(hidden_states), self.up_proj(hidden_states)), dim=-1)
+        return self.down_proj(swiglu(projected, dim=-1))
 
 
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
@@ -415,7 +452,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.experts = JTDeepseekV3Experts(config)
         self.gate = JTDeepseekV3Gate(config)
-        self.shared_experts = DeepseekV32MLP(
+        self.shared_experts = JTDeepseekV3MLP(
             config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
         # Ranks holding shards of the same sequences (TP with sequence parallelism); the JT builder sets it.
         self.sequence_partition_group = None
@@ -560,7 +597,7 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = JTDeepseekV3Attention(config, layer_idx)
         self.mlp = (JTDeepseekV3MoE(config)
-                    if config.mlp_layer_types[layer_idx] == "sparse" else DeepseekV32MLP(config))
+                    if config.mlp_layer_types[layer_idx] == "sparse" else JTDeepseekV3MLP(config))
         self.input_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
 
