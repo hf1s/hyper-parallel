@@ -45,6 +45,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
+from hyper_parallel.components.functional.rms_norm import rms_norm
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
@@ -109,6 +110,25 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         rotated = torch.cat((-second, first), dim=-1)
         output = ordered * cos.unsqueeze(1).float() + rotated * sin.unsqueeze(1).float()
         return output.to(values.dtype)
+
+
+class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
+    """Normalize in FP32 and round to the activation dtype once, as MindFormers does.
+
+    The HF base class casts its BF16-stored weight up for every forward; keeping the
+    normalization itself in FP32 throughout removes that extra BF16 rounding.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize with FP32 weights and accumulation, then restore the input dtype.
+
+        Args:
+            hidden_states: Input activations, ``[..., hidden]``.
+
+        Returns:
+            Normalized activations with the input dtype.
+        """
+        return rms_norm(hidden_states.float(), self.weight.float(), self.variance_epsilon).to(hidden_states.dtype)
 
 
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
@@ -281,10 +301,10 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         self.scaling = self.qk_head_dim ** -0.5
         self.attention_dropout, self.is_causal, self.sliding_window = config.attention_dropout, True, None
         self.q_a_proj = nn.Linear(config.hidden_size, self.q_lora_rank, bias=False)
-        self.q_a_layernorm = DeepseekV32RMSNorm(self.q_lora_rank, config.rms_norm_eps)
+        self.q_a_layernorm = JTDeepseekV3RMSNorm(self.q_lora_rank, config.rms_norm_eps)
         self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
-        self.kv_a_layernorm = DeepseekV32RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
+        self.kv_a_layernorm = JTDeepseekV3RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
@@ -466,15 +486,16 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """Run the routed experts on this rank without expert parallelism.
 
         Mirrors the EP pipeline on one rank: tokens are sorted by expert and computed by
-        :meth:`JTDeepseekV3Experts.forward_expert_major`, the routing weights are cast to the
-        activation dtype, and the weighted outputs are summed per token with ``index_add_``. The
-        routed output therefore does not depend on whether expert parallelism is enabled.
+        :meth:`JTDeepseekV3Experts.forward_expert_major`. The per-slot products and their sum over
+        the top-k experts of one token stay in FP32 until :meth:`forward` rounds the combined MoE
+        output once, as MindFormers does. The routed output therefore does not depend on whether
+        expert parallelism is enabled.
 
         Args:
             hidden: Pad-prefixed hidden states, ``[1, padding + tokens, hidden]``.
 
         Returns:
-            The weighted routed-expert output, shaped like ``hidden``.
+            The FP32 weighted routed-expert output, shaped like ``hidden``.
         """
         indices, probabilities = self.route(hidden)
         flat = hidden.reshape(-1, hidden.shape[-1])
@@ -483,8 +504,9 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         sources = torch.arange(flat.shape[0], device=flat.device).repeat_interleave(indices.shape[1])[order]
         counts = expert_ids.new_zeros(self.experts.num_experts).scatter_add_(0, expert_ids, torch.ones_like(expert_ids))
         outputs = self.experts.forward_expert_major(flat[sources], counts)
-        weights = probabilities.reshape(-1).to(flat.dtype)[order].unsqueeze(-1)
-        return torch.zeros_like(flat).index_add_(0, sources, outputs * weights).reshape(hidden.shape)
+        weights = probabilities.reshape(-1).float()[order].unsqueeze(-1)
+        combined = flat.new_zeros(flat.shape, dtype=torch.float32).index_add_(0, sources, outputs.float() * weights)
+        return combined.reshape(hidden.shape)
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
@@ -501,20 +523,27 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         del owner, hidden
         return routed
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run the routed experts on pad-prefixed tokens and add the shared experts.
+    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+        """Combine the routed and shared branches, and an optional residual, in FP32.
+
+        ``local_routed_forward`` already returns an FP32 tensor; this adds the shared-expert
+        branch and the residual in FP32 too, then rounds to the activation dtype once.
 
         Args:
             hidden_states: Hidden states, ``[1, tokens, hidden]``.
+            residual: Optional residual added before the final rounding.
 
         Returns:
-            The MoE output, shaped like ``hidden_states``.
+            The combined output with the input shape and dtype.
         """
         hidden = hidden_states
         if self.padding:
             hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
         routed = self.ep_compute(hidden)
-        return routed[:, self.padding:] + self.shared_experts(hidden_states)
+        combined = routed[:, self.padding:].float() + self.shared_experts(hidden_states).float()
+        if residual is not None:
+            combined = combined + residual.float()
+        return combined.to(hidden_states.dtype)
 
 
 class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
@@ -532,8 +561,8 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         self.self_attn = JTDeepseekV3Attention(config, layer_idx)
         self.mlp = (JTDeepseekV3MoE(config)
                     if config.mlp_layer_types[layer_idx] == "sparse" else DeepseekV32MLP(config))
-        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: Any = None,
                 position_ids: Any = None, past_key_values: Any = None, use_cache: bool = False,
@@ -567,7 +596,10 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         )
         hidden_states = residual + branch
         residual = hidden_states
-        branch = self.mlp(self.post_attention_layernorm(residual))
+        normalized = self.post_attention_layernorm(residual)
+        if isinstance(self.mlp, JTDeepseekV3MoE):
+            return self.mlp(normalized, residual=residual)
+        branch = self.mlp(normalized)
         return residual + branch
 
 
@@ -584,7 +616,7 @@ class JTDeepseekV3Model(DeepseekV32Model):
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
-        self.norm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()
@@ -621,8 +653,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.mtp = DeepseekV3MTP(
             hidden_size=config.hidden_size, num_layers=depth,
             decoder_factory=lambda index: JTDeepseekV3Decoder(mtp_config, index),
-            norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
-            output_norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
+            norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
+            output_norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
         )
         self.loss_tp_mesh = None
         self.loss_sequence_parallel_size = 1
