@@ -44,10 +44,16 @@ def enable_high_precision_for_bf16() -> None:
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
 
-def enable_full_determinism(seed: int) -> None:
+def enable_full_determinism(seed: int, *, close_matmul_k_shift: bool = True) -> None:
     """
     Helper function for reproducibility in distributed training.
     See https://pytorch.org/docs/stable/notes/randomness.html for details.
+
+    Args:
+        seed: Seed applied to Python, NumPy, and framework generators.
+        close_matmul_k_shift: On NPU, disable CANN matmul K-shift when true.
+            False explicitly permits K-shift while retaining the other deterministic
+            settings. Select this policy before the first matmul in a fresh process.
     """
 
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -55,9 +61,9 @@ def enable_full_determinism(seed: int) -> None:
     os.environ["NCCL_DETERMINISTIC"] = "1"
     os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
     if IS_NPU_AVAILABLE:
-        # The environment variable required to enable deterministic mode on Ascend NPUs.
+        # Keep the historical default while allowing explicit reference-compatible matmul ordering.
         os.environ["NCCL_DETERMINISTIC"] = "true"
-        os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
+        os.environ["CLOSE_MATMUL_K_SHIFT"] = "1" if close_matmul_k_shift else "0"
 
     random.seed(seed)
     np.random.seed(seed)
@@ -75,14 +81,19 @@ def enable_full_determinism(seed: int) -> None:
         torch.npu.manual_seed_all(seed)
 
 
-def set_seed(seed: int | None, full_determinism: bool = False) -> None:
+def set_seed(seed: int | None, full_determinism: bool = False, *, close_matmul_k_shift: bool = True) -> None:
     """
     Sets a manual seed on all devices.
+
+    Args:
+        seed: Seed to apply, or ``None`` to leave the process unchanged.
+        full_determinism: Whether to configure deterministic algorithms as well as RNGs.
+        close_matmul_k_shift: NPU matmul policy used only with full determinism.
     """
     if seed is None:
         return
     if full_determinism:
-        enable_full_determinism(seed)
+        enable_full_determinism(seed, close_matmul_k_shift=close_matmul_k_shift)
     else:
         set_seed_func(seed)
 
