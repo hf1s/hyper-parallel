@@ -90,6 +90,9 @@ class GMMFunction(torch.autograd.Function):
         )
         dx = dx_list[0]
 
+        if not ctx.needs_input_grad[2]:
+            return None, dx, None, None, None
+
         grad_weight = None
         use_fusion = False
         if ctx.gemm_fusion:
@@ -111,10 +114,9 @@ class GMMFunction(torch.autograd.Function):
                 group_type=2
             )
 
-            if getattr(weight, 'zero_out_wgrad', False):
-                grad_weight = torch.zeros_like(weight)
-            else:
-                grad_weight = torch.empty_like(weight)
+            # FSDP also retains ordinary contributions from shared parameter uses.
+            # A fused contribution must therefore return a neutral placeholder.
+            grad_weight = torch.zeros_like(weight)
 
             original_weight.grad_added_to_main_grad = True
         else:

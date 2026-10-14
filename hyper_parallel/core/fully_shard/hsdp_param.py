@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch._prims_common import make_contiguous_strides_for
+from torch.distributed.tensor import DTensor as TorchDTensor
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -756,6 +757,9 @@ class HSDPParamV2:
             unsharded_param,
             requires_grad=self.sharded_param.requires_grad,
         )
+        if self.mp_policy.apply_grad_on_fp32_main_grad and self.reduce_dtype == torch.float32:
+            self._unsharded_param.main_grad = None
+            self._unsharded_param.grad_added_to_main_grad = False
 
     def to_sharded(self) -> None:
         self._setattr_on_modules(self.sharded_param)
@@ -804,7 +808,8 @@ class HSDPParamV2:
         return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:
-        if self._unsharded_param.grad is None:
+        self._accumulate_fused_grad_if_needed()
+        if not hasattr(self, "_unsharded_param") or self._unsharded_param.grad is None:
             return
         # Keep local gradients alive across no-sync / delayed-sync steps even
         # after the parameter transitions back to the sharded view.
@@ -818,6 +823,7 @@ class HSDPParamV2:
             self.unsharded_accumulated_grad += unsharded_grad
 
     def accumulate_unsharded_grad_if_needed(self) -> None:
+        self._accumulate_fused_grad_if_needed()
         if (
             self.unsharded_accumulated_grad is not None
             and self.unsharded_param.grad is not None
@@ -827,6 +833,27 @@ class HSDPParamV2:
                 grad = grad.to(self.reduce_dtype)
             self.unsharded_param.grad = None
             self.unsharded_accumulated_grad += grad
+
+    def _accumulate_fused_grad_if_needed(self) -> None:
+        """Transfer a fused local main_grad before the existing reduction path."""
+        parameter = getattr(self, "_unsharded_param", None)
+        if parameter is None or not getattr(parameter, "grad_added_to_main_grad", False):
+            return
+        gradient = getattr(parameter, "main_grad", None)
+        if not isinstance(gradient, torch.Tensor) or isinstance(gradient, (DTensor, TorchDTensor)):
+            raise ValueError("The fused weight gradient must be a local FP32 tensor")
+        if (gradient.dtype != torch.float32 or gradient.shape != self._orig_size
+                or gradient.device != parameter.device or gradient.requires_grad
+                or self.reduce_dtype != torch.float32):
+            raise ValueError("The fused weight gradient must match the local parameter and FP32 reduction")
+        if self.unsharded_accumulated_grad is None:
+            self.unsharded_accumulated_grad = gradient
+        else:
+            self.unsharded_accumulated_grad += gradient
+        # Ownership moves to the accumulator; freeing this storage would also
+        # invalidate the reduction input. Mixed ordinary gradients are added next.
+        parameter.main_grad = None
+        parameter.grad_added_to_main_grad = False
 
     def alloc_unsharded_param_buffers(self) -> None:
         """
