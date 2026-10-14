@@ -45,6 +45,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
+from hyper_parallel.core.activation_memory import is_recomputing
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
@@ -420,7 +421,10 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
         scores = self.gate.pop_router_logits().sigmoid()
-        self.auxiliary_loss = self.routing_statistics(indices, scores)
+        auxiliary_loss = self.routing_statistics(indices, scores)
+        # Keep replay's operator sequence, but let the loss own only the original forward graph.
+        if not is_recomputing():
+            self.auxiliary_loss = auxiliary_loss
         flat_indices = indices.reshape(-1)
         # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
         counts = flat_indices.new_zeros(config.n_routed_experts, dtype=torch.float32).scatter_add_(
@@ -612,6 +616,14 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT routing currently requires n_group=topk_group=1")
         if config.rope_parameters["rope_type"] != "default":
             raise ValueError("JT rotary computation currently requires rope_type='default'")
+        self.loss_chunk_size = getattr(config, "loss_chunk_size", 0)
+        # Existing chunked JT recipes checkpoint the head and CE independently of decoder layers.
+        self.loss_recompute = getattr(config, "loss_recompute", True)
+        if not isinstance(self.loss_recompute, bool):
+            raise ValueError("loss_recompute must be a bool")
+        if (isinstance(self.loss_chunk_size, bool) or not isinstance(self.loss_chunk_size, int)
+                or self.loss_chunk_size < 0):
+            raise ValueError("loss_chunk_size must be a nonnegative integer; zero disables chunking")
         self.model = JTDeepseekV3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -626,10 +638,6 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         )
         self.loss_tp_mesh = None
         self.loss_sequence_parallel_size = 1
-        self.loss_chunk_size = getattr(config, "loss_chunk_size", 0)
-        if (isinstance(self.loss_chunk_size, bool) or not isinstance(self.loss_chunk_size, int)
-                or self.loss_chunk_size < 0):
-            raise ValueError("loss_chunk_size must be a nonnegative integer; zero disables chunking")
         # Ranks holding the same attention heads (DP+CP); the JT builder sets it for QK clipping.
         self.qk_clip_group = None
         # Ranks holding different batch data (DP+CP); the JT builder sets it to sum expert token counts.
@@ -695,6 +703,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             hidden, targets, head=self.lm_head, loss_fn=self.loss_function,
             vocab_size=self.config.vocab_size, chunk_size=self.loss_chunk_size,
             sequence_parallel_size=self.loss_sequence_parallel_size, tp_mesh=self.loss_tp_mesh,
+            recompute=self.loss_recompute,
         )
 
     @staticmethod

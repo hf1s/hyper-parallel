@@ -94,7 +94,8 @@ class TestParallelCrossEntropy:
         torch.testing.assert_close(local_logits.grad, reference_logits.grad.chunk(2, dim=-1)[rank])
 
     @pytest.mark.parametrize("tp_size,sequence_parts", ((1, 1), (2, 1), (2, 2)))
-    def test_sequence_and_vocab_shards(self, tp_size: int, sequence_parts: int) -> None:
+    @pytest.mark.parametrize("recompute", (False, True))
+    def test_sequence_and_vocab_shards(self, tp_size: int, sequence_parts: int, recompute: bool) -> None:
         """Tail chunks, empty chunks and two MTP target depths keep reference gradients."""
         rank = dist.get_rank() % tp_size
         device_mesh = init_device_mesh("cpu", (2 // tp_size, tp_size), mesh_dim_names=("dp", "tp"))
@@ -117,7 +118,7 @@ class TestParallelCrossEntropy:
                                       loss_parallel=True, device_mesh=device_mesh)
             _bind_statistics_groups(head, context)
             actual = projected_cross_entropy(local, targets, head=head, loss_fn=causal_lm_loss_parallel,
-                                              vocab_size=13, chunk_size=4,
+                                              vocab_size=13, chunk_size=4, recompute=recompute,
                                               sequence_parallel_size=sequence_parts, tp_mesh=head.loss_tp_mesh)
             reference_hidden = hidden.clone().requires_grad_()
             reference_weight = weight.clone().requires_grad_()

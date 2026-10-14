@@ -16,8 +16,9 @@
 
 Both helpers avoid full ``[batch, sequence, vocabulary]`` logits.
 ``chunked_cross_entropy`` precomputes first-order gradients from a local weight
-and returns a loss sum. ``projected_cross_entropy`` checkpoints a caller-owned
-head and loss, preserving TP/SP wrappers, and returns a token mean.
+and returns a loss sum. ``projected_cross_entropy`` chunks a caller-owned head
+and loss, preserving TP/SP wrappers, and returns a token mean with an explicit
+checkpoint policy.
 """
 
 from __future__ import annotations
@@ -232,14 +233,17 @@ def projected_cross_entropy(
     loss_fn: Callable[..., torch.Tensor],
     vocab_size: int,
     chunk_size: int,
+    recompute: bool,
     sequence_parallel_size: int = 1,
     tp_mesh: Any = None,
     ignore_index: int = -100,
 ) -> torch.Tensor:
-    """Return token-mean CE without materializing or retaining full-sequence logits.
+    """Return token-mean CE with chunked projection and optional recomputation.
 
-    This TP/SP variant of ``chunked_cross_entropy`` checkpoints the caller-owned
-    head and CE instead of precomputing gradients from a local weight directly.
+    This TP/SP variant of ``chunked_cross_entropy`` uses a caller-owned head and
+    CE instead of precomputing gradients from a local weight directly. Callers
+    explicitly choose whether to checkpoint each chunk, independently of any
+    Transformer-layer activation checkpointing policy.
     The ordinary head and loss keep ownership of vocabulary sharding and gradient
     communication. With sequence parallelism, the head gathers rank-local chunks
     in rank order; targets are rearranged into exactly that same order. One global
@@ -253,6 +257,9 @@ def projected_cross_entropy(
         vocab_size: Global vocabulary size.
         chunk_size: Maximum global token positions per row projected at once;
             must be divisible by sequence_parallel_size.
+        recompute: Explicitly checkpoint each projection and CE chunk. When false,
+            ordinary autograd retains chunk intermediates until backward; chunk
+            size alone does not bound the total saved activation memory.
         sequence_parallel_size: Number of contiguous equal sequence shards.
         tp_mesh: Loss-parallel mesh, re-entered during checkpoint recomputation.
         ignore_index: Label value excluded from both loss and token count.
@@ -260,6 +267,8 @@ def projected_cross_entropy(
     Returns:
         Scalar FP32 token mean, or differentiable zero when all labels are ignored.
     """
+    if not isinstance(recompute, bool):
+        raise TypeError("recompute must be a bool")
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
     if (isinstance(sequence_parallel_size, bool) or not isinstance(sequence_parallel_size, int)
@@ -293,7 +302,9 @@ def projected_cross_entropy(
         else:
             labels = torch.cat([targets[:, rank * local_length + start:rank * local_length + stop]
                                 for rank in range(sequence_parallel_size)], dim=1)
-        total = total + checkpoint(project_and_score, states, labels, use_reentrant=False)
+        chunk_loss = (checkpoint(project_and_score, states, labels, use_reentrant=False)
+                      if recompute else project_and_score(states, labels))
+        total = total + chunk_loss
     return total
 
 

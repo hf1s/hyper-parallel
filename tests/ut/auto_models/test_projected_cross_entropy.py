@@ -15,7 +15,9 @@
 """Projected loss preserves eager CE gradients while bounding retained logits."""
 
 import copy
+from itertools import product
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -38,8 +40,9 @@ class TestProjectedCrossEntropy(unittest.TestCase):
     def test_loss_and_scaled_gradients(self) -> None:
         """Uneven chunks, empty chunks and frozen inputs keep the eager objective."""
         cases = ((1, False, False), (3, False, False), (20, False, False), (3, True, False), (3, False, True))
-        for chunk_size, frozen_hidden, frozen_head in cases:
-            with self.subTest(chunk_size=chunk_size, frozen_hidden=frozen_hidden, frozen_head=frozen_head):
+        for recompute, (chunk_size, frozen_hidden, frozen_head) in product((False, True), cases):
+            with self.subTest(recompute=recompute, chunk_size=chunk_size,
+                              frozen_hidden=frozen_hidden, frozen_head=frozen_head):
                 torch.manual_seed(21)
                 hidden = torch.randn(2, 7, 5, requires_grad=not frozen_hidden)
                 head = nn.Linear(5, 13)
@@ -49,7 +52,7 @@ class TestProjectedCrossEntropy(unittest.TestCase):
                 targets = torch.tensor([[-100, -100, -100, 3, 4, -100, 6],
                                         [-100, -100, -100, 8, -100, 9, 1]])
                 actual = projected_cross_entropy(hidden, targets, head=head, loss_fn=ForCausalLMLoss,
-                                                   vocab_size=13, chunk_size=chunk_size)
+                                                   vocab_size=13, chunk_size=chunk_size, recompute=recompute)
                 expected = ForCausalLMLoss(logits=reference_head(reference_hidden), labels=None,
                                            vocab_size=13, shift_labels=targets)
                 (actual * 0.37).backward()
@@ -65,7 +68,7 @@ class TestProjectedCrossEntropy(unittest.TestCase):
         hidden = torch.randn(1, 5, 3, requires_grad=True)
         head = nn.Linear(3, 11, bias=False)
         loss = projected_cross_entropy(hidden, torch.full((1, 5), -100), head=head,
-                                       loss_fn=ForCausalLMLoss, vocab_size=11, chunk_size=2)
+                                       loss_fn=ForCausalLMLoss, vocab_size=11, chunk_size=2, recompute=True)
         loss.backward(retain_graph=True)
         loss.backward()
         torch.testing.assert_close(loss, torch.zeros_like(loss))
@@ -88,7 +91,7 @@ class TestProjectedCrossEntropy(unittest.TestCase):
 
         with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
             loss = projected_cross_entropy(hidden, torch.zeros(1, 11, dtype=torch.long), head=head,
-                                           loss_fn=ForCausalLMLoss, vocab_size=97, chunk_size=3)
+                                           loss_fn=ForCausalLMLoss, vocab_size=97, chunk_size=3, recompute=True)
         loss.backward()
         handle.remove()
         self.assertEqual(projected_lengths[:4], [3, 3, 3, 2])
@@ -105,4 +108,35 @@ class TestProjectedCrossEntropy(unittest.TestCase):
             with self.subTest(chunk_size=chunk_size, parts=parts, length=length), self.assertRaises(ValueError):
                 projected_cross_entropy(hidden, torch.zeros(1, length, dtype=torch.long), head=head,
                                          loss_fn=ForCausalLMLoss, vocab_size=11, chunk_size=chunk_size,
-                                         sequence_parallel_size=parts)
+                                         sequence_parallel_size=parts, recompute=True)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_disabling_recompute_keeps_chunks_without_backward_replay(self) -> None:
+        """An explicit off policy retains logits but never invokes checkpoint or replays the head."""
+        hidden = torch.randn(1, 11, 5, requires_grad=True)
+        head = nn.Linear(5, 97, bias=False)
+        lengths = []
+        handle = head.register_forward_hook(lambda _module, _args, output: lengths.append(output.shape[1]))
+        self.addCleanup(handle.remove)
+        saved_shapes = []
+
+        def save(tensor: torch.Tensor) -> torch.Tensor:
+            """Record retained geometry without holding additional tensor references."""
+            saved_shapes.append(tuple(tensor.shape))
+            return tensor
+
+        with patch("hyper_parallel.components.losses.chunked_cross_entropy.checkpoint", side_effect=AssertionError), \
+                torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
+            loss = projected_cross_entropy(hidden, torch.zeros(1, 11, dtype=torch.long), head=head,
+                                           loss_fn=ForCausalLMLoss, vocab_size=97, chunk_size=3, recompute=False)
+            loss.backward()
+        self.assertEqual(lengths, [3, 3, 3, 2])
+        self.assertTrue(any(97 in shape for shape in saved_shapes), saved_shapes)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_recompute_requires_a_boolean(self) -> None:
+        """String YAML values must not accidentally enable checkpointing."""
+        with self.assertRaisesRegex(TypeError, "recompute must be a bool"):
+            projected_cross_entropy(torch.randn(1, 3, 5), torch.zeros(1, 3, dtype=torch.long),
+                                    head=nn.Linear(5, 7), loss_fn=ForCausalLMLoss,
+                                    vocab_size=7, chunk_size=2, recompute="off")
