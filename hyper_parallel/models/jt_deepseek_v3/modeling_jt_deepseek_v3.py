@@ -820,10 +820,13 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         normalized = self.model.norm(hidden)
         lm_loss = (self._projection_loss(normalized, targets) if self.enable_chunk_loss
                    else self._token_loss(self.lm_head(normalized), labels, loss_mask))
+        mtp_input_mask = (
+            sequence_end_mask if getattr(cfg, "mtp_input_document_mask", True) else None
+        )
         mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens,
                               head=None if self.enable_chunk_loss else self.lm_head,
                               decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs,
-                              sequence_end_mask=sequence_end_mask)
+                              sequence_end_mask=mtp_input_mask)
         for layer in self.mtp.layers:
             auxiliary = auxiliary + layer.transformer_layer.mlp.pop_auxiliary_loss()
         shift_targets = partial(self.shift_mtp_inputs, pad_value=-100)
@@ -838,4 +841,4 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             mtp_loss = calculate_mtp_loss(mtp_output.logits, targets, self._mtp_token_loss, vocab_size=cfg.vocab_size,
                                           loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets,
                                           sequence_end_mask=sequence_end_mask)
-        return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}
+        return {"lm_loss": lm_loss, "aux_loss": auxiliary, "mtp_loss": mtp_loss}
