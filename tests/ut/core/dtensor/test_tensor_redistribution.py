@@ -15,8 +15,7 @@
 """Coverage supplement tests for hyper_parallel.core.dtensor.tensor_redistribution."""
 
 import os
-
-
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, MagicMock, Mock
 
@@ -24,6 +23,7 @@ import torch
 import numpy as np
 
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor import placement_types, tensor_redistribution
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
@@ -107,6 +107,85 @@ class TestUnevenShardRedistribution(_MockedTestCase):
         with self.assertRaisesRegex(NotImplementedError, "uneven chunk-sharded"):
             TensorRedistribution().redistribution(input_tensor, target_layout)
 
+    def _placement_layout(self, mesh_shape, placements, tensor_ndim):
+        """Build actual layout geometry without creating communication groups."""
+        names = tuple(f"axis{index}" for index in range(len(mesh_shape)))
+        ranks = tuple(range(int(np.prod(mesh_shape))))
+        layout = self._make_layout(mesh_shape, names, rank_list=ranks)
+        layout.set_placements(placements)
+        layout.placement_to_tensor_map(tensor_ndim)
+        return layout
+
+    def _assert_rejected_before_communication(self, source, target, shape):
+        """An invalid shape must not enter partial reduction or normal redistribution."""
+        value = SimpleNamespace(layout=source, shape=torch.Size(shape))
+        redistribution = tensor_redistribution.TensorRedistribution()
+        with patch.object(redistribution, "reduce_partial") as reduce, \
+                patch.object(redistribution, "_redistribution_normal") as normal:
+            with self.assertRaisesRegex(NotImplementedError, "equal-sized shards"):
+                redistribution.redistribution(value, target)
+            reduce.assert_not_called()
+            normal.assert_not_called()
+
+    def test_unmarked_uneven_source_is_rejected(self):
+        """Ordinary Shard must not imply an equal-sized all-gather for uneven rows."""
+        source = self._placement_layout((2,), (placement_types.Shard(0),), 2)
+        target = self._placement_layout((2,), (placement_types.Replicate(),), 2)
+        for rows in (1, 3):
+            with self.subTest(rows=rows):
+                self._assert_rejected_before_communication(source, target, (rows, 64))
+
+    def test_unmarked_uneven_target_is_rejected(self):
+        """Replicate to Shard must reject the same unsupported geometry on every rank."""
+        source = self._placement_layout((2,), (placement_types.Replicate(),), 2)
+        target = self._placement_layout((2,), (placement_types.Shard(1),), 2)
+        self._assert_rejected_before_communication(source, target, (64, 3))
+
+    def test_multi_axis_shard_count_is_checked(self):
+        """Divisibility by one mesh axis does not imply divisibility by both axes."""
+        source = self._placement_layout((2, 2), (placement_types.Shard(0), placement_types.Shard(0)), 2)
+        target = self._placement_layout((2, 2), (placement_types.Replicate(), placement_types.Replicate()), 2)
+        self._assert_rejected_before_communication(source, target, (2, 64))
+
+    def test_uneven_shape_is_rejected_before_partial_reduction(self):
+        """Shape validation must run before a partial layout enters communication."""
+        source = self._placement_layout((2, 2), (placement_types.Shard(0), placement_types.Partial()), 2)
+        target = self._placement_layout((2, 2), (placement_types.Replicate(), placement_types.Replicate()), 2)
+        self._assert_rejected_before_communication(source, target, (3, 64))
+
+    def test_direct_partial_reduction_checks_source_and_target(self):
+        """The public reduction path must not discard uneven global-shape metadata."""
+        layouts = (
+            ((placement_types.Shard(0), placement_types.Partial()),
+             (placement_types.Shard(0), placement_types.Replicate())),
+            ((placement_types.Replicate(), placement_types.Partial()),
+             (placement_types.Replicate(), placement_types.Shard(0))),
+        )
+        redistribution = tensor_redistribution.TensorRedistribution()
+        for source_placements, target_placements in layouts:
+            with self.subTest(source=source_placements, target=target_placements):
+                source = self._placement_layout((2, 2), source_placements, 2)
+                target = self._placement_layout((2, 2), target_placements, 2)
+                value = SimpleNamespace(layout=source, shape=torch.Size((3, 64)))
+                with patch.object(redistribution, "_allreduce_along_dev_dim") as all_reduce, \
+                        patch.object(redistribution, "_reduce_scatter_along_dev_dim_with_axis") as reduce_scatter:
+                    with self.assertRaisesRegex(NotImplementedError, "equal-sized shards"):
+                        redistribution.reduce_partial(value, target)
+                    all_reduce.assert_not_called()
+                    reduce_scatter.assert_not_called()
+
+    def test_even_and_zero_sized_shapes_keep_the_existing_path(self):
+        """Empty global tensors and ordinary even shards remain valid."""
+        source = self._placement_layout((2,), (placement_types.Shard(0),), 2)
+        target = self._placement_layout((2,), (placement_types.Replicate(),), 2)
+        redistribution = tensor_redistribution.TensorRedistribution()
+        for rows in (0, 2, 4):
+            with self.subTest(rows=rows), patch.object(redistribution, "_redistribution_normal") as normal:
+                value = SimpleNamespace(layout=source, shape=torch.Size((rows, 64)))
+                result = redistribution.redistribution(value, target)
+                self.assertIs(result, normal.return_value)
+                normal.assert_called_once_with(value, target)
+
 
 # ===========================================================================
 # TensorRedistribution method tests
@@ -160,14 +239,13 @@ class TestConstructAllSplit(_MockedTestCase):
     """Tests for ConstructAllSplit."""
     def test_basic(self):
         """Test basic."""
-        from hyper_parallel.core.dtensor import tensor_redistribution as tr_mod
         from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
         tr = TensorRedistribution()
         tr.rank_id = 0
         x = torch.arange(16).reshape(2, 8)
 
         # args: (split_dim, split_size, group); rank 0 -> index 0 of the split.
-        with patch.object(tr_mod.torch, "chunk", wraps=torch.chunk) as mock_chunk:
+        with patch.object(tensor_redistribution.torch, "chunk", wraps=torch.chunk) as mock_chunk:
             result = tr._construct_all_split(x, 1, 4, [0, 1, 2, 3])
         mock_chunk.assert_called_once_with(x, 4, dim=1)
         self.assertTrue(torch.equal(result, x.chunk(4, dim=1)[0]))
