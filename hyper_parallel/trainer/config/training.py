@@ -38,6 +38,7 @@ class TrainingConfig:
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
     seed: Optional[int] = None
     enable_full_determinism: bool = False
+    close_matmul_k_shift: bool = True
     gc_steps: int = 0
     empty_cache_steps: int = 0
     empty_cache_before_backward: bool = False

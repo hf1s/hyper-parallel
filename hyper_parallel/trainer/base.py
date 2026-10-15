@@ -284,7 +284,11 @@ class BaseTrainer(Stateful, ABC):
         self.dp_cp_mesh = self.mesh.dp_cp_mesh
 
         # Set random seed
-        set_seed(self.config.training.seed, self.config.training.enable_full_determinism)
+        set_seed(
+            self.config.training.seed,
+            self.config.training.enable_full_determinism,
+            self.config.training.close_matmul_k_shift,
+        )
 
         # Enable high precision for bf16
         enable_high_precision_for_bf16()

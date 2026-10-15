@@ -29,6 +29,10 @@ import torch_npu
 from transformers import PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
+from hyper_parallel.models.jt_deepseek_v3.adapter.precision_probe import (
+    PrecisionFSDP,
+    configure_precision,
+)
 from hyper_parallel.models.build_options import FSDP2Config, get_device_id
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
@@ -103,7 +107,8 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
 
 
 def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
-                    distributed_setup: Any, **infrastructure_options: Any) -> PreTrainedModel:
+                   distributed_setup: Any, factors: tuple = (),
+                   **infrastructure_options: Any) -> PreTrainedModel:
     """Build the JT model and load its converted ``model.npz`` weights.
 
     Args:
@@ -128,6 +133,12 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
         strategy_config=distributed_setup.strategy_config or FSDP2Config(),
     )
     planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
+    if factors:
+        fsdp = PrecisionFSDP(
+            framework_setup.strategy_config,
+            mesh,
+            fp32_main_params=framework_setup.fp32_main_params,
+        )
     with torch.device("meta"):
         model = JTDeepseekV3ForCausalLM(config)
         model, _ = _apply_module_replacement_actions(
@@ -136,6 +147,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
             weights_mapping=get_model_conversion_mapping(model),
             context=_build_replacement_context(distributed_setup, None),
         )
+        configure_precision(model, factors)
     model.to_empty(device="cpu")
     with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
         arrays = {name: archive[name] for name in archive.files}
