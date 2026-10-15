@@ -165,10 +165,11 @@ with closing(build_distributed_dataloader(
 
 Both policies are optional builder arguments. Omitting `cost_model` constructs
 `DefaultCostModel(model_config)`; omitting `balancing_algorithm` constructs
-`LPTBalancingAlgorithm()`. Neither callback needs communication or H2D code.
+`FeasibleLPTBalancingAlgorithm()`, which attempts bounded repair after a greedy
+dead end. Neither callback needs communication or H2D code.
 
 ```python
-from hyper_parallel.distributed_data import LPTBalancingAlgorithm
+from hyper_parallel.distributed_data import FeasibleLPTBalancingAlgorithm
 
 loader = build_distributed_dataloader(
     None, mesh, config, device=device,
@@ -177,7 +178,7 @@ loader = build_distributed_dataloader(
     pack_fn=pack_samples,
     collate_fn=list,
     cost_model=my_cost_model,
-    balancing_algorithm=LPTBalancingAlgorithm(objective="makespan"),
+    balancing_algorithm=FeasibleLPTBalancingAlgorithm(objective="makespan"),
 )
 ```
 

@@ -191,6 +191,86 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
         dist.destroy_process_group()
 
 
+def _window_loader(
+        mesh: object, *, metadata_mode: bool, repack: bool, broadcast_plan: bool, accumulation: int,
+) -> object:
+    records = [
+        {"id": index, "parts": [{"id": index, "part": part} for part in range(2)]}
+        for index in range(44)
+    ]
+    sampler = build_dataset_batch_sampler(
+        total_samples=len(records), micro_batch_size=1, global_batch_size=2 * accumulation,
+        dp_rank=dist.get_rank() // 2, dp_world_size=2,
+    )
+
+    def metadata(sample: dict) -> SampleMetadata:
+        """Assign uneven native-record costs to exercise cross-round placement.
+
+        Args:
+            sample: A native record or one independently repacked sequence.
+        """
+        tokens = 1 if "part" in sample else 2
+        return SampleMetadata(tokens, cost=WorkloadCost(llm=tokens * (9 if sample["id"] % 2 == 0 else 1)))
+
+    options = {"metadata": [metadata(sample) for sample in records]} if metadata_mode else {"metadata_fn": metadata}
+    if repack:
+        options.update(split_fn=lambda sample: sample["parts"], pack_fn=lambda samples, _: tuple(samples))
+    return build_distributed_dataloader(
+        records, mesh,
+        DistributedDatasetConfig(
+            seq_len=4, local_batch_size=1, communication_backend="gloo", balance_window_size=3,
+            metadata_mode=metadata_mode, broadcast_plan=broadcast_plan,
+        ),
+        batch_sampler=sampler, cost_model=lambda item: item.cost, device="cpu", **options,
+    )
+
+
+def _window_output(batch: tuple, repack: bool) -> list[tuple[int, int]]:
+    samples = [sample for packed in batch for sample in packed] if repack else batch
+    return [(sample["id"], sample.get("part", -1)) for sample in samples]
+
+
+def _check_window_membership(outputs: list, repack: bool, accumulation: int) -> None:
+    assert outputs[0] == outputs[1] and outputs[2] == outputs[3], f"TP batches differ: outputs={outputs}"
+    start = 0
+    while start < len(outputs[0]):
+        rounds = min(3, accumulation - start % accumulation, len(outputs[0]) - start)
+        stop = start + rounds
+        actual = Counter(item for rank in (0, 2) for batch in outputs[rank][start:stop] for item in batch)
+        expected = Counter(
+            (index, part) for index in range(start * 2, stop * 2) for part in (range(2) if repack else (-1,))
+        )
+        assert actual == expected, f"Window membership differs: actual={actual}, expected={expected}"
+        start = stop
+
+
+def test_accumulation_window_dp2_tp2_gloo() -> None:
+    """Verify real payload redistribution, TP broadcast, and partial-window replay."""
+    dist.init_process_group("gloo", timeout=timedelta(seconds=90))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+        for accumulation in (3, 10):
+            for metadata_mode, repack in ((False, False), (True, False), (False, True)):
+                for broadcast_plan in (False, True):
+                    options = {
+                        "metadata_mode": metadata_mode, "repack": repack,
+                        "broadcast_plan": broadcast_plan, "accumulation": accumulation,
+                    }
+                    with _window_loader(mesh, **options) as loader:
+                        first = _window_output(next(loader), repack)
+                        state = loader.state_dict()
+                        remaining = [_window_output(batch, repack) for batch in loader]
+                    outputs = _gather([first] + remaining)
+                    _check_window_membership(outputs, repack, accumulation)
+                    with _window_loader(mesh, **options) as resumed:
+                        resumed.load_state_dict(state)
+                        actual = [_window_output(batch, repack) for batch in resumed]
+                        assert actual == remaining, f"Window replay differs: actual={actual}, expected={remaining}"
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 def _check_repacked_tokens(records: list[dict], gathered: list[dict]) -> None:
     """Check token and target conservation across the two DP representatives."""
     expected = Counter(
@@ -259,3 +339,117 @@ def _run_sequence_repacking(mesh: object, broadcast_plan: bool) -> None:
         resumed.load_state_dict(saved_state)
         remaining = [{name: value.tolist() for name, value in batch.items()} for batch in resumed]
     assert remaining == delivered[1:], f"Repacked checkpoint replay differs: actual={remaining}"
+
+
+def _check_full_pack_documents(records: list[dict], gathered: list[dict]) -> None:
+    """Compare each received attention segment with its complete original document."""
+    for rank in (0, 2):
+        value = gathered[rank]
+        offsets = value["cu_seq_lens"]
+        assert offsets[0] == 0 and offsets[-1] == 10, f"Invalid repaired boundaries: offsets={offsets}"
+        for start, end in zip(offsets, offsets[1:]):
+            document = value["input_ids"][0][start:end]
+            original = records[(document[0] - 1) // 10]
+            original_start = (document[0] - 1) % 10
+            original_offsets = original["cu_seq_lens"].tolist()
+            source_index = original_offsets.index(original_start)
+            expected_end = original_offsets[source_index + 1]
+            expected = original["input_ids"][original_start:expected_end].tolist()
+            assert document == expected, f"Document boundary changed: actual={document}, expected={expected}"
+
+
+def _full_pack_records() -> tuple[list[dict], dict[int, int]]:
+    """Create full records whose token lengths lead greedy LPT into a dead end."""
+    records, costs = [], {}
+    for index in range(14):
+        lengths = (6, 2, 2) if index % 2 == 0 else (5, 3, 2)
+        weights = (90, 70, 50) if index % 2 == 0 else (100, 80, 60)
+        ids = torch.arange(index * 10 + 1, index * 10 + 11)
+        labels = ids + 1
+        labels[::3] = -100
+        offsets = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+        records.append({"input_ids": ids, "labels": labels, "cu_seq_lens": torch.tensor(offsets)})
+        costs.update({int(ids[start]): weight for start, weight in zip(offsets, weights)})
+    return records, costs
+
+
+def _run_full_pack_repair(mesh: object, accumulation: int, broadcast_plan: bool) -> None:
+    """Exercise repaired full packs, repeated records, window tails, and checkpoint replay."""
+    records, costs = _full_pack_records()
+    mapping = [0, 1] * 7
+
+    def build_loader() -> object:
+        """Create a fresh sampler and source reader for the same occurrence stream."""
+        return build_distributed_dataloader(
+            records, mesh, DistributedDatasetConfig(
+                seq_len=10, local_batch_size=1, communication_backend="gloo", balance_window_size=3,
+                broadcast_plan=broadcast_plan,
+            ),
+            batch_sampler=build_dataset_batch_sampler(
+                total_samples=len(records), micro_batch_size=1, global_batch_size=2 * accumulation,
+                dp_rank=dist.get_rank() // 2, dp_world_size=2, index_mapping=mapping,
+            ),
+            device="cpu", split_fn=split_packed_text_sample, pack_fn=pack_indexed_text_samples,
+            collate_fn=collate_indexed_text_sequences,
+            metadata_fn=lambda sample: SampleMetadata(
+                sample["input_ids"].numel(), cost=WorkloadCost(llm=costs[int(sample["input_ids"][0])]),
+            ),
+            cost_model=lambda item: item.cost,
+        )
+
+    delivered, window_tokens, window_positions = [], Counter(), Counter()
+    saved = None
+    with build_loader() as loader:
+        for step, batch in enumerate(loader):
+            output = {name: value.tolist() for name, value in batch.items()}
+            delivered.append(output)
+            gathered = _gather(output)
+            assert gathered[0] == gathered[1] and gathered[2] == gathered[3], (
+                f"Repaired TP batches differ: batches={gathered}"
+            )
+            _check_full_pack_documents(records, gathered)
+            for rank in (0, 2):
+                value = gathered[rank]
+                window_tokens.update(zip(value["input_ids"][0], value["labels"][0]))
+            plans = _gather(loader.last_plan)
+            assert plans[0] == plans[2], f"Repaired plans differ: plans={plans}"
+            window_positions.update(key.global_sample_position for key in plans[0].selected_keys)
+            if step == 0:
+                saved = loader.state_dict()
+                if dist.get_rank() == 0:
+                    decision = loader._planner.last_balance_decision
+                    assert decision["accepted"], f"Full-pack repair was not accepted: decision={decision}"
+            if (step + 1) % accumulation == 0 or step == 6:
+                start = step // accumulation * accumulation
+                expected_positions = Counter({position: 3 for position in range(start * 2, (step + 1) * 2)})
+                expected_tokens = Counter(
+                    (token, label) for position in range(start * 2, (step + 1) * 2)
+                    for token, label in zip(records[mapping[position]]["input_ids"].tolist(),
+                                            records[mapping[position]]["labels"].tolist())
+                )
+                assert window_positions == expected_positions, (
+                    f"Occurrences changed: actual={window_positions}, expected={expected_positions}"
+                )
+                assert window_tokens == expected_tokens, (
+                    f"Tokens or labels changed: actual={window_tokens}, expected={expected_tokens}"
+                )
+                window_tokens.clear()
+                window_positions.clear()
+    assert saved is not None, f"No checkpoint was captured: delivered={len(delivered)}"
+    with build_loader() as restored:
+        restored.load_state_dict(saved)
+        actual = [{name: value.tolist() for name, value in batch.items()} for batch in restored]
+    assert actual == delivered[1:], f"Repaired replay differs: actual={actual}, expected={delivered[1:]}"
+
+
+def test_full_pack_repair_dp2_tp2_gloo() -> None:
+    """Verify repairs with and without gradient accumulation under both plan modes."""
+    dist.init_process_group("gloo", timeout=timedelta(seconds=90))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+        for accumulation in (1, 3):
+            for broadcast_plan in (False, True):
+                _run_full_pack_repair(mesh, accumulation, broadcast_plan)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()

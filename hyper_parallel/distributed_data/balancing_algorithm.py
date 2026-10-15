@@ -58,7 +58,11 @@ class BalancingAlgorithm(Protocol):
         """
 
     def objective(self, rank_costs: Sequence[WorkloadCost]) -> float:
-        """Return a finite, non-negative score; a lower score is better."""
+        """Return a finite, non-negative score; a lower score is better.
+
+        Args:
+            rank_costs: Additive workloads for one synchronous round.
+        """
 
 
 @dataclass
@@ -171,16 +175,121 @@ class LPTBalancingAlgorithm:
         return math.fsum((load / mean - 1.0) ** 2 for load in loads) / len(loads)
 
 
+class FeasibleLPTBalancingAlgorithm(LPTBalancingAlgorithm):
+    """Repair greedy dead ends in small, full, token-only packing domains.
+
+    Suffix subset sums preserve feasible completion for two bins. Larger
+    domains improve pairs from the known-feasible reference. Repairs require
+    one bin per rank, at most sixteen bins, and no extra packing budgets.
+    Each pair's bitset table is limited to an estimated 32 MiB, not process RSS.
+    The planner still applies its window objective and minimum-gain gate.
+    """
+
+    def assign(
+            self,
+            samples: Sequence[SampleMetadata],
+            *,
+            reference_bins: Sequence[Sequence[SampleKey]],
+            constraints: PackingConstraints,
+            data_parallel_size: int,
+            local_batch_size: int,
+    ) -> Sequence[Sequence[SampleKey]]:
+        """Keep successful LPT assignments and repair bounded full-bin failures.
+
+        Args:
+            samples: Selected occurrences with estimated workload costs.
+            reference_bins: Known-feasible original grouping.
+            constraints: Token capacity and optional physical stage budgets.
+            data_parallel_size: Number of target ranks, including window rounds.
+            local_batch_size: Required non-empty bins per target rank.
+        """
+        candidate = super().assign(
+            samples, reference_bins=reference_bins, constraints=constraints,
+            data_parallel_size=data_parallel_size, local_batch_size=local_batch_size,
+        )
+        if (
+                candidate is not reference_bins or local_batch_size != 1
+                or constraints.packing_budgets or not 2 <= len(reference_bins) <= 16
+        ):
+            return candidate
+        lookup = {item.key: item for item in samples}
+        capacity = constraints.seq_len
+        if any(sum(lookup[key].pack_tokens for key in keys) != capacity for keys in reference_bins):
+            return reference_bins
+        if len(reference_bins) == 2:
+            ordered = sorted(samples, key=lambda item: (-item.cost.llm, -item.pack_tokens, item.key))
+            return self._repair_full_bins(ordered, capacity, reference_bins)
+        return self._repair_bin_pairs(lookup, reference_bins, capacity)
+
+    def _repair_bin_pairs(
+            self,
+            lookup: dict[SampleKey, SampleMetadata],
+            reference_bins: Sequence[Sequence[SampleKey]],
+            capacity: int,
+    ) -> Sequence[Sequence[SampleKey]]:
+        bins = [tuple(keys) for keys in reference_bins]
+        costs = [math.fsum(lookup[key].cost.llm for key in keys) for keys in bins]
+        pairs = [(left, right) for left in range(len(bins)) for right in range(left + 1, len(bins))]
+        pairs.sort(key=lambda pair: (-abs(costs[pair[0]] - costs[pair[1]]), pair))
+        changed = False
+        for left, right in pairs:
+            items = [lookup[key] for index in (left, right) for key in bins[index]]
+            items.sort(key=lambda item: (-item.cost.llm, -item.pack_tokens, item.key))
+            candidate = self._repair_full_bins(items, capacity, (bins[left], bins[right]))
+            candidate_costs = [math.fsum(lookup[key].cost.llm for key in keys) for keys in candidate]
+            if max(candidate_costs) < max(costs[left], costs[right]):
+                bins[left], bins[right] = candidate
+                costs[left], costs[right] = candidate_costs
+                changed = True
+        return tuple(bins) if changed else reference_bins
+
+    @staticmethod
+    def _repair_full_bins(
+            ordered: Sequence[SampleMetadata],
+            capacity: int,
+            reference_bins: Sequence[Sequence[SampleKey]],
+    ) -> Sequence[Sequence[SampleKey]]:
+        table_bytes = (len(ordered) + 1) * ((capacity + 8) // 8)
+        if table_bytes > 32 * 1024 * 1024:
+            return reference_bins
+        suffix = [1] * (len(ordered) + 1)
+        mask = (1 << (capacity + 1)) - 1
+        for index in range(len(ordered) - 1, -1, -1):
+            reachable = suffix[index + 1]
+            suffix[index] = (reachable | reachable << ordered[index].pack_tokens) & mask
+        remaining = [capacity, capacity]
+        costs = [0.0, 0.0]
+        bins: list[list[SampleKey]] = [[], []]
+        for index, item in enumerate(ordered):
+            for rank in sorted(range(2), key=lambda candidate_rank: (costs[candidate_rank], candidate_rank)):
+                if item.pack_tokens > remaining[rank]:
+                    continue
+                first_remaining = remaining[0] - (item.pack_tokens if rank == 0 else 0)
+                # With a fixed total of two full bins, filling the first bin's
+                # remaining space also guarantees completion of the second.
+                if not (suffix[index + 1] >> first_remaining) & 1:
+                    continue
+                bins[rank].append(item.key)
+                remaining[rank] -= item.pack_tokens
+                costs[rank] += item.cost.llm
+                break
+            else:
+                return reference_bins
+        return tuple(tuple(keys) for keys in bins)
+
+
 def resolve_balancing_algorithm(algorithm: BalancingAlgorithm | None = None) -> BalancingAlgorithm:
-    """Resolve the default assignment policy or validate an explicit one.
+    """Default to LPT with bounded feasibility repair or validate an explicit policy.
 
     Args:
         algorithm: Optional deterministic assignment and objective implementation.
     """
-    resolved = LPTBalancingAlgorithm() if algorithm is None else algorithm
+    resolved = FeasibleLPTBalancingAlgorithm() if algorithm is None else algorithm
     if not callable(getattr(resolved, "assign", None)) or not callable(getattr(resolved, "objective", None)):
         raise ValueError("balancing_algorithm must provide callable assign() and objective() methods.")
     return resolved
 
 
-__all__ = ["BalancingAlgorithm", "LPTBalancingAlgorithm", "resolve_balancing_algorithm"]
+__all__ = [
+    "BalancingAlgorithm", "FeasibleLPTBalancingAlgorithm", "LPTBalancingAlgorithm", "resolve_balancing_algorithm",
+]

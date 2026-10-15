@@ -19,8 +19,13 @@ from __future__ import annotations
 import copy
 import operator
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from concurrent.futures import Future
+from dataclasses import dataclass, replace
+from queue import Queue
+from threading import Thread
 from typing import Any
+
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.schema import SampleKey, SampleMetadata
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
@@ -66,8 +71,19 @@ def preserve_sample(samples: Sequence[Any], seq_len: int) -> Any:
     return samples[0]
 
 
+@dataclass
+class _ReaderWindow:
+    """Keep one window's data and cursor independent of speculative sampling."""
+
+    metadata: tuple[SampleMetadata, ...]
+    samples: dict[SampleKey, Any]
+    sampler_state: dict[str, Any]
+    rounds: int
+    delivered_rounds: int = 0
+
+
 class BatchSamplerReader:
-    """Read precisely one native local batch, with no read-ahead selection or stride.
+    """Read a bounded window of native batches within one optimizer step.
 
     Only the DP Constructor owns this reader. Payload loading is deferred until
     after planning when metadata is available; otherwise it precedes metadata
@@ -83,6 +99,8 @@ class BatchSamplerReader:
             metadata_fn: Callable[[Any], SampleMetadata] | None,
             sample_loader: PlannedSampleLoader | None,
             split_fn: Callable[[Any], Sequence[Any]] | None = None,
+            balance_window_size: int = 1,
+            device: Any = None,
     ) -> None:
         """Store the validated native sampler and metadata/payload sources."""
         if metadata is None and (sample_loader is None or not callable(metadata_fn)):
@@ -95,11 +113,15 @@ class BatchSamplerReader:
         self._metadata_fn = metadata_fn
         self._sample_loader = sample_loader
         self._split_fn = split_fn
+        self._balance_window_size = balance_window_size
+        self._device = torch.device(device) if device is not None else None
+        self._window: _ReaderWindow | None = None
+        self._next_window: Future[_ReaderWindow | None] | None = None
+        self._window_thread: Thread | None = None
+        self._window_requests: Queue[Future[_ReaderWindow | None] | None] = Queue(maxsize=1)
         self._sampler.enable_source_batch_resume()
         self._committed_state = copy.deepcopy(sampler.state_dict())
         self._iterator = None
-        self._buffer: tuple[SampleMetadata, ...] = ()
-        self._payloads: dict[SampleKey, Any] = {}
         self._exhausted = False
 
     @property
@@ -110,7 +132,7 @@ class BatchSamplerReader:
     @property
     def buffer_size(self) -> int:
         """Return the number of pending native sample occurrences."""
-        return len(self._buffer)
+        return len(self.metadata())
 
     @property
     def batch_position(self) -> int:
@@ -118,53 +140,120 @@ class BatchSamplerReader:
         return self._committed_state["consumed_samples"]
 
     def prepare_next_step(self) -> None:
-        """Prepare exactly one sampler yield for the next distributed step."""
-        if self._buffer or self._exhausted:
-            return None
+        """Activate the next window only after the current window is delivered."""
+        if self._window is not None or self._exhausted:
+            return
+        if self._next_window is None:
+            self._window = self._read_window()
+        else:
+            self._window = self._next_window.result()
+            self._next_window = None
+        self._exhausted = self._window is None
+
+    def _read_window(self) -> _ReaderWindow | None:
+        # Only one read runs at a time. It must not mutate the active window
+        # while that window's samples are being routed and committed.
         try:
             if self._iterator is None:
                 self._iterator = iter(self._sampler)
-            try:
-                indices = next(self._iterator)
-            except StopIteration:
-                self._exhausted = True
+            keys, rounds = self._read_window_keys()
+            if not keys:
                 return None
-            keys = self._sample_keys(indices)
+            samples = {}
             if self._metadata is None:
-                self._payloads = self._sample_loader.fetch_samples(keys)
+                samples = self._sample_loader.fetch_samples(keys)
                 if self._split_fn is not None:
-                    keys = self._split_payloads(keys)
-                metadata = [self._metadata_fn(self._payloads[key]) for key in keys]
+                    samples = self._split_payloads(samples)
+                    keys = tuple(samples)
+                metadata = [self._metadata_fn(samples[key]) for key in keys]
             else:
                 metadata = [self._metadata[key.dataset_index] for key in keys]
             if any(not isinstance(item, SampleMetadata) for item in metadata):
                 raise ValueError("BatchSampler metadata must contain SampleMetadata entries.")
-            self._buffer = tuple(
-                replace(item, key=key)
-                for key, item in zip(keys, metadata)
+            return _ReaderWindow(
+                metadata=tuple(replace(item, key=key) for key, item in zip(keys, metadata)),
+                samples=samples,
+                sampler_state=copy.deepcopy(self._sampler.state_dict()),
+                rounds=rounds,
             )
         except StopIteration as exc:
             # A user callback's StopIteration must not masquerade as dataset EOF.
             raise RuntimeError(f"Native BatchSampler callback raised StopIteration: {exc}") from exc
-        return None
 
-    def _split_payloads(self, keys: Sequence[SampleKey]) -> tuple[SampleKey, ...]:
+    def _read_window_keys(self) -> tuple[tuple[SampleKey, ...], int]:
+        round_size = self._sampler.global_micro_batch_size
+        accumulation_steps = self._sampler.global_batch_size // round_size
+        round_in_step = self._sampler.consumed_samples // round_size % accumulation_steps
+        window_size = min(self._balance_window_size, accumulation_steps - round_in_step)
+        keys = []
+        rounds = 0
+        for _ in range(window_size):
+            position = self._sampler.consumed_samples
+            try:
+                indices = next(self._iterator)
+            except StopIteration:
+                break
+            keys.extend(self._sample_keys(indices, position))
+            rounds += 1
+        return tuple(keys), rounds
+
+    def _split_payloads(self, samples: Mapping[SampleKey, Any]) -> dict[SampleKey, Any]:
         payloads = {}
-        for key in keys:
-            sequences = tuple(self._split_fn(self._payloads[key]))
+        for key, sample in samples.items():
+            sequences = tuple(self._split_fn(sample))
             if not sequences:
                 raise ValueError("split_fn must return at least one independent sequence per Dataset output.")
             for index, sequence in enumerate(sequences):
                 payloads[replace(key, sequence_index=index)] = sequence
-        self._payloads = payloads
-        return tuple(payloads)
+        return payloads
 
-    def _sample_keys(self, indices: Sequence[int]) -> tuple[SampleKey, ...]:
+    def _prefetch_next_window(self) -> None:
+        if self._balance_window_size == 1 or self._next_window is not None:
+            return
+        self._next_window = Future()
+        if self._window_thread is None:
+            # DataLoader may fork workers here. A plain thread avoids inheriting
+            # ThreadPoolExecutor shutdown hooks that try to join the forked thread.
+            self._window_thread = Thread(
+                target=self._run_window_prefetch,
+                name=f"hp-window-reader-rank-{self._reader_rank}", daemon=True,
+            )
+            self._window_thread.start()
+        self._window_requests.put(self._next_window)
+
+    def _run_window_prefetch(self) -> None:
+        device_bound = False
+        while True:
+            future = self._window_requests.get()
+            if future is None:
+                return
+            try:
+                if not device_bound:
+                    # New DataLoader pin-memory workers inherit this thread's device.
+                    device_module = getattr(torch, self._device.type, None) if self._device is not None else None
+                    if device_module is not None and hasattr(device_module, "set_device"):
+                        device_module.set_device(self._device)
+                    device_bound = True
+                window = self._read_window()
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(window)
+
+    def close(self) -> None:
+        """Drain speculative CPU reads before resetting the sampler or exiting."""
+        if self._window_thread is not None:
+            self._window_requests.put(None)
+            self._window_thread.join()
+            self._window_thread = None
+        self._next_window = None
+
+    def _sample_keys(self, indices: Sequence[int], batch_position: int) -> tuple[SampleKey, ...]:
         if len(indices) != self._sampler.micro_batch_size:
             raise ValueError("Native BatchSampler must yield exactly local_batch_size indices on every DP rank.")
         # A native sampler exposes local indices, not its internal permutation
         # positions. Stable DP-major occurrence slots preserve duplicates.
-        start = self.batch_position + self._sampler.dp_rank * self._sampler.micro_batch_size
+        start = batch_position + self._sampler.dp_rank * self._sampler.micro_batch_size
         keys = []
         for offset, index in enumerate(indices):
             if isinstance(index, bool):
@@ -173,8 +262,8 @@ class BatchSamplerReader:
         return tuple(keys)
 
     def metadata(self) -> tuple[SampleMetadata, ...]:
-        """Return metadata for this one frozen native local batch."""
-        return self._buffer
+        """Return metadata for the undelivered occurrences in the frozen window."""
+        return () if self._window is None else self._window.metadata
 
     def selected_payloads(self, selected_keys: set[SampleKey]) -> tuple[tuple[SampleKey, Any], ...]:
         """Return already-read payloads without rereading their Dataset indices.
@@ -185,27 +274,52 @@ class BatchSamplerReader:
         Returns:
             Selected key-payload pairs in buffered sample order.
         """
-        return tuple((item.key, self._payloads[item.key]) for item in self._buffer if item.key in selected_keys)
+        return tuple(
+            (item.key, self._window.samples[item.key]) for item in self.metadata() if item.key in selected_keys
+        )
 
     def commit(self, selected_keys: set[SampleKey]) -> None:
-        """Advance saved progress only after this entire round is delivered.
+        """Retire delivered occurrences and commit the cursor at the window end.
 
         Args:
-            selected_keys: Every sample occurrence in the delivered local round.
+            selected_keys: Source-owned occurrences delivered in this distributed round.
         """
-        if not self._buffer or selected_keys != {item.key for item in self._buffer}:
+        window = self._window
+        remaining = {item.key for item in self.metadata()}
+        if window is None or not selected_keys <= remaining:
             raise ValueError("Native BatchSampler commit must consume the complete pending local batch.")
-        self._committed_state = copy.deepcopy(self._sampler.state_dict())
-        self._buffer = ()
-        self._payloads = {}
+        last_round = window.delivered_rounds + 1 == window.rounds
+        if last_round and selected_keys != remaining:
+            raise ValueError("Native BatchSampler commit must consume the complete pending local batch.")
+        window.metadata = tuple(item for item in window.metadata if item.key not in selected_keys)
+        for key in selected_keys:
+            window.samples.pop(key, None)
+        window.delivered_rounds += 1
+        if last_round:
+            self._committed_state = window.sampler_state
+            self._window = None
+        self._prefetch_next_window()
+
+    @property
+    def window_partially_delivered(self) -> bool:
+        """Return whether a checkpoint must retain the remaining window plan."""
+        return self._window is not None and self._window.delivered_rounds > 0
 
     def state_dict(self) -> dict[str, Any]:
         """Snapshot the delivered native cursor, excluding speculative prefetch."""
-        return copy.deepcopy({
+        state = {
             "epoch": self._committed_state["epoch"],
             "sampler": self._committed_state,
             "sample_loader": self._sample_loader.state_dict() if self._sample_loader is not None else None,
-        })
+        }
+        if self.window_partially_delivered:
+            state["window"] = {
+                "sampler": self._window.sampler_state,
+                "metadata": self._window.metadata,
+                "rounds": self._window.rounds,
+                "delivered_rounds": self._window.delivered_rounds,
+            }
+        return copy.deepcopy(state)
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore the original native cursor before the next sampler yield.
@@ -221,11 +335,30 @@ class BatchSamplerReader:
             raise ValueError("Native BatchSampler checkpoint epoch is inconsistent.")
         if (state.get("sample_loader") is None) != (self._sample_loader is None):
             raise ValueError("Native BatchSampler checkpoint payload reader ownership changed.")
+        self.close()
         self._sampler.load_state_dict(sampler_state)
         if self._sample_loader is not None:
             self._sample_loader.load_state_dict(state["sample_loader"])
         self._committed_state = copy.deepcopy(self._sampler.state_dict())
         self._reset_pending()
+        if "window" in state:
+            self._restore_window(state["window"])
+
+    def _restore_window(self, window: Mapping[str, Any]) -> None:
+        self._sampler.load_state_dict(window["sampler"])
+        metadata = tuple(window["metadata"])
+        samples = {}
+        if self._metadata is None:
+            remaining_keys = {item.key for item in metadata}
+            source_keys = tuple(dict.fromkeys(replace(item.key, sequence_index=0) for item in metadata))
+            samples = self._sample_loader.fetch_samples(source_keys)
+            if self._split_fn is not None:
+                samples = self._split_payloads(samples)
+            samples = {key: sample for key, sample in samples.items() if key in remaining_keys}
+        self._window = _ReaderWindow(
+            metadata=metadata, samples=samples, sampler_state=copy.deepcopy(window["sampler"]),
+            rounds=window["rounds"], delivered_rounds=window["delivered_rounds"],
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Delegate epoch changes to the native sampler without changing its policy.
@@ -233,6 +366,7 @@ class BatchSamplerReader:
         Args:
             epoch: Epoch to apply to the sampler and sample loader.
         """
+        self.close()
         self._sampler.load_state_dict(self._committed_state)
         self._sampler.set_epoch(epoch)
         if self._sample_loader is not None:
@@ -242,6 +376,5 @@ class BatchSamplerReader:
 
     def _reset_pending(self) -> None:
         self._iterator = None
-        self._buffer = ()
-        self._payloads = {}
+        self._window = None
         self._exhausted = False

@@ -133,6 +133,7 @@ def _build_distributed_packing_config(
         "prefetch_factor",
         "persistent_workers",
         "dataset_already_sharded",
+        "balance_window_size",
     }
     conflicting_options = sorted(set(options) & derived_options)
     if conflicting_options:
@@ -151,6 +152,7 @@ def _build_distributed_packing_config(
         prefetch_factor=getattr(dataloader_target, "prefetch_factor", None),
         persistent_workers=bool(getattr(dataloader_target, "persistent_workers", False)),
         dataset_already_sharded=False,
+        balance_window_size=data_config.get("balance_window_size", 1),
         **options,
     )
 

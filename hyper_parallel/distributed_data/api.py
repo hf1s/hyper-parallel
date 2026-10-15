@@ -84,12 +84,15 @@ class DistributedDatasetConfig:
 
     ``seq_len`` and ``local_batch_size`` are the only required sizing inputs.
     One iterator yield contains ``local_batch_size`` packed sequences on each
-    DP rank. Optimizer gradient accumulation and global batch size remain
-    Trainer concerns.
+    DP rank. Native sampler global batch size defines optimizer boundaries.
 
     Args:
         seq_len: Maximum token count in one non-oversized packed sequence.
         local_batch_size: Packed sequences constructed per DP rank and yield.
+        balance_window_size: Maximum native sampler micro-batches planned together.
+            Defaults to one. Windows stop at optimizer and epoch boundaries;
+            gradient accumulation is inferred from the native sampler's global
+            batch size. External-step sources support only one.
         dp_dim_names: Named mesh dimensions that define DP coordinates.
         balance_group_size: Optional number of DP ranks in each independent
             local-balancing group. ``None`` preserves launcher/node grouping.
@@ -153,6 +156,7 @@ class DistributedDatasetConfig:
     balance_group_size: int | None = None
     metadata_mode: bool = False
     broadcast_plan: bool = True
+    balance_window_size: int = 1
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -165,7 +169,7 @@ class DistributedDatasetConfig:
         PackingConstraints(self.seq_len, self.oversized_policy, self.packing_budgets)
 
     def _validate_integer_fields(self) -> None:
-        for name in ("seq_len", "local_batch_size"):
+        for name in ("seq_len", "local_batch_size", "balance_window_size"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
@@ -477,6 +481,8 @@ class _BuildState:
             metadata=metadata, metadata_fn=metadata_fn,
             sample_loader=None if config.metadata_mode else sample_loader,
             split_fn=split_fn,
+            balance_window_size=config.balance_window_size,
+            device=self.communication_device,
         )
         if config.metadata_mode:
             self.metadata_reader = reader
@@ -572,10 +578,12 @@ def build_distributed_dataloader(
     payload A2A. Metadata-only streaming selection is not supported.
 
     With ``batch_sampler``, native HP sampling owns step selection:
-    one sampler yield per DP Constructor fixes one forward/backward round.
+    ``balance_window_size`` consecutive sampler yields per DP Constructor are
+    planned together, stopping at optimizer and epoch boundaries. Each iterator
+    yield still returns exactly one forward/backward round.
     Dataset outputs stay whole by default. Online ``split_fn`` decomposes each
     selected output into independent sequences; ``pack_fn`` rebuilds the planned
-    bins without changing the original sampler round's membership or cursor.
+    bins without changing the original sampler window's sample membership.
 
     Args:
         dataset: BatchSampler mode requires a shared mapping Dataset

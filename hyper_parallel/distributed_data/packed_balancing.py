@@ -587,6 +587,8 @@ def build_local_balancing_dataloader(
         Iteration returns device-ready batches. last_host_batch retains the CPU
         view for metering without a device-to-host copy.
     """
+    if config.balance_window_size != 1:
+        raise ValueError("balance_window_size > 1 requires a native batch_sampler.")
     cost_model = resolve_cost_model(cost_model, model_config)
     balancing_algorithm = resolve_balancing_algorithm(balancing_algorithm)
     device = _resolve_device(device, communication_backend=config.communication_backend)

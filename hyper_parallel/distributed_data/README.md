@@ -68,12 +68,13 @@ and model-parallel batch broadcast still follow the normal loading path.
 - `local_batch_size` is the number of sequences returned per DP rank and yield.
   Native BatchSampler mode treats each whole Dataset output as one such unit.
 - One synchronized iterator step covers `local_batch_size * dp_size` bins.
-  Gradient accumulation and optimizer global batch size remain Trainer concerns.
+  `balance_window_size` defaults to one. Native loading can jointly plan several
+  accumulation rounds, bounded by the sampler's optimizer and epoch boundaries.
 - Native BatchSampler fixes index occurrences and uses singleton reference bins;
   `external_step_source` fixes samples and lets HP preserve the original packing
   bins.
   Balancing may only rearrange that frozen sample set. It cannot skip expensive
-  samples, borrow future samples, or change step membership.
+  samples or change window membership. External sources retain one-step membership.
 - In source mode, the packer must agree with metadata token accounting,
   including special tokens and reserved image placeholders. If sample-level
   placement fails, the Planner falls back to the known-feasible reference bins.
@@ -168,8 +169,8 @@ each DP Constructor advances its native BatchSampler once
 ```
 
 For DP=2 and `local_batch_size=2`, if native samplers yield `[0, 1]` and
-`[2, 3]`, only these four occurrences can be balanced in that round. No samples
-are borrowed from another gradient-accumulation round. Index mappings that
+`[2, 3]`, the default window balances only these four occurrences. Larger windows
+collect consecutive rounds within the same optimizer step. Index mappings that
 repeat a Dataset index remain repeated occurrences; routing keys distinguish
 them by `global_sample_position` rather than deduplicating the index.
 In this mode that position is a stable DP-major occurrence slot within the
@@ -191,6 +192,121 @@ dataset:
 to enable balancing; other types, including the former `native_batch_sampler`
 string, are rejected.
 
+### Balance several gradient-accumulation rounds
+
+Set `dataset.data_config.balance_window_size` to the
+maximum number of consecutive forward/backward rounds to plan together. For
+DP8, micro-batch size one, accumulation ten, and a three-round window:
+
+```yaml
+training:
+  global_batch_size: 80
+  micro_batch_size: 1
+dataset:
+  data_config:
+    load_balance: true
+    repack_sequences: true
+    balance_window_size: 3
+```
+
+Each optimizer step uses windows of `3 + 3 + 3 + 1` rounds. A three-round
+window jointly balances 24 original records across eight ranks and three
+micro-batches. With `repack_sequences: true`, the independent sequences inside
+those records can be repacked across that entire window. Without repacking,
+whole records are redistributed. Each `next(loader)` still returns one normal
+micro-batch; optimizer frequency and global sample membership stay unchanged.
+
+For direct construction, pass `balance_window_size=3` in
+`DistributedDatasetConfig`. Accumulation is derived from
+`batch_sampler.global_batch_size / batch_sampler.global_micro_batch_size`.
+The positive integer defaults to one. Values larger than accumulation are
+clipped at the next optimizer boundary. Epoch tails contain only the available
+complete distributed micro-batches; windows never borrow from the next epoch.
+External-step loaders require `balance_window_size=1`.
+In Trainer configuration, this option belongs directly under `data_config`;
+placing it inside `distributed_dataloader` is rejected.
+
+Planning treats each `(micro-batch, DP rank)` as a destination. Custom assignment
+policies therefore receive `DP size * window rounds` virtual ranks, ordered by
+micro-batch then physical DP rank. The acceptance gate sums the per-round
+objectives; the default makespan objective estimates the sum of each round's
+slowest-rank cost. Samples are transferred, collated, and copied to the device
+one micro-batch at a time.
+
+For LPT policies with one pack per rank and multiple rounds, the planner also
+schedules intact packs by decreasing backbone cost. It compares the unscheduled
+candidate, scheduled candidate, and scheduled original layout using the sum of
+per-round objectives, preserving better candidates for variance or custom LPT
+objectives. Every candidate is validated before scheduling, and the final gain
+must still strictly exceed `min_balance_gain` relative to the original order.
+This can improve a window even when document-level repacking fails. It does not
+change attention boundaries inside a pack. Single-round windows, multiple local
+packs per rank, and non-LPT custom policies retain their existing behavior.
+
+With `balance_window_size > 1`, native Readers keep two source windows. Once
+current-window delivery starts, a dedicated CPU reader begins loading the next
+window, including splitting records and extracting metadata. A slow next-window
+read does not block delivery of the current window's remaining micro-batches.
+For accumulation three and a window of three, the next optimizer step's reads
+start before the first current micro-batch begins computing. Planning and accelerator
+transfers still follow the existing per-micro-batch hooks; the future window is
+planned when it becomes current. At a window boundary, `prefetch_plan()` can still
+wait for unfinished source reads before launching metadata communication.
+Metadata mode prefetches only indexed metadata and still fetches payloads after planning.
+
+At most the current window's remaining source samples and one future window are
+retained in host memory. Larger windows increase host memory and initial latency;
+`balance_window_size=1` retains ordinary one-micro-batch prefetching. `close()` drains
+the extra reader before returning, and epoch changes discard its speculative work.
+
+The Trainer retains its existing per-micro-batch loss normalization. If valid
+token counts differ between rounds, cross-round rearrangement can change token
+weights; optimizer sample conservation does not imply identical losses or gradients.
+Window-level token normalization is not enabled by this data-loading option.
+
+At a window boundary, checkpoints save the committed sampler cursor. Inside a
+window they additionally save the remaining plans, lightweight metadata, the
+sampler position after reading the window, and the number of delivered rounds.
+The prefetched future window is excluded, even if its read has already advanced
+the live sampler. Checkpoints use the active window's saved ending cursor rather
+than the live sampler cursor. They do not save raw sample tensors. Restore rereads
+only the required source records and reuses the saved remaining plans, preserving
+the delivered prefix when the Dataset and split callback are deterministic.
+
+### Repair full-pack greedy dead ends
+
+Ordinary LPT can fragment remaining capacity and fall back to the original
+layout even when that layout is feasible. The default assignment policy,
+`FeasibleLPTBalancingAlgorithm`, automatically attempts bounded feasibility repair
+after greedy failure. For offline-packed text, enable balancing and document
+repacking in the Trainer with:
+
+```yaml
+dataset:
+  data_config:
+    load_balance: true
+    repack_sequences: true
+```
+
+No separate repair option is needed. The builder and planner use the same
+default policy. An explicitly supplied or configured `balancing_algorithm`
+is preserved; callers can select `LPTBalancingAlgorithm()` for ordinary greedy
+assignment without repair.
+
+Repair runs only after greedy assignment fails, with one pack per rank, two to
+sixteen full packs, and no additional `packing_budgets`. It uses suffix subset
+sums to keep two-pack completion feasible, then improves pairs in larger
+domains. Each pair's estimated bitset table is capped at 32 MiB; this is not a
+process-memory limit. Unsupported domains retain the ordinary LPT path.
+In a window, the pack count includes all rounds, so DP4 with three rounds has
+twelve packs. The heuristic does not guarantee an optimal layout.
+
+Feasibility repair also applies to a single round without gradient accumulation.
+Intact-pack round scheduling requires multiple rounds and also applies to
+ordinary LPT. Both preserve the selected sample occurrences and use the
+existing capacity checks and benefit gate. Checkpoint replay retains saved
+pending plans; changing a policy does not replan an already checkpointed window.
+
 The Trainer builds its normal `build_dataset_batch_sampler` first, including
 `single`/`cyclic`, `data_sharding`, and the supported index rearrangement map.
 It passes that sampler to the collective loader instead of applying another
@@ -209,7 +325,7 @@ dataloader:
   cost_model:
     _target_: my_training.cost.SampleCost  # user-provided factory
   balancing_algorithm:
-    _target_: hyper_parallel.distributed_data.LPTBalancingAlgorithm
+    _target_: hyper_parallel.distributed_data.FeasibleLPTBalancingAlgorithm
     objective: makespan
 ```
 
@@ -253,7 +369,7 @@ Current boundaries of the native-sampler path:
   training parity are outside this sampler integration. The Trainer path rejects PP and
   a second `DynamicBatchDataLoader` selection stage.
 
-### Repack offline-packed text within a native round
+### Repack offline-packed text within a native window
 
 Set `dataset.data_config.repack_sequences: true` alongside
 `packing_stage: dataset` and `load_balance: true`.
@@ -267,8 +383,8 @@ and `collate_indexed_text_sequences`. Metadata and workload costs are evaluated
 per independent sequence. The original records remain the sampler's unit of
 selection and checkpoint progress. A runtime `SampleKey.sequence_index`
 distinguishes sequences within each record occurrence, including repeated
-Dataset indices. All sequences in a round are delivered before its cursor is
-committed; restore rereads the original records and replans that round.
+Dataset indices. All sequences in a window are delivered before its sampler
+cursor is committed; partial-window checkpoints retain the remaining plans.
 
 Use `TextParallelBatch(source_type="indexed_source", reset_position_ids=True)`
 with `create_attention_mask_in_dataloader: true`. Compressed attention also
@@ -405,7 +521,7 @@ The source only iterates raw local steps; HP derives metadata, caches payloads,
 and applies packing/collation. HP does not infer step boundaries by scanning
 source metadata. Source recovery belongs to the caller's training components.
 
-All paths use the same cost-model and assignment pipeline (default: LPT),
+All paths use the same cost-model and assignment pipeline (default: LPT with bounded repair),
 one-step double buffering, and automatic H2D on the selected accelerator.
 There is no balance-enable or synchronous-loader switch. CPU execution keeps
 batches on the host. The original step membership and gain gate are unchanged.
@@ -604,7 +720,8 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
   may use Gloo, NCCL, or HCCL.
 - `drop_last=True`; every DP rank receives the same number of non-empty bins.
 - Native sampler checkpoints are per rank and save the delivered record cursor,
-  excluding prefetched payloads. Sample keys and plans replay when the Dataset stream is deterministic for a
+  excluding prefetched payloads. Partially delivered windows also save their
+  remaining metadata and plans. Sample keys and plans replay when the Dataset stream is deterministic for a
   given epoch; arbitrary Dataset/worker RNG state is not captured.
   Every training rank must save and restore its own loader state.
 - Elastic resharding and structured zero-copy tensor transport are separate

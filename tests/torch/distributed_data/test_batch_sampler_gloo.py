@@ -30,3 +30,27 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
         file_name=str(Path(__file__).with_name("_test_batch_sampler_gloo.py")),
         case_name="test_native_batch_sampler_dp2_tp2_gloo", num_proc=4,
     )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_accumulation_window_dp2_tp2_gloo() -> None:
+    """Feature: Accumulation-window native loading.
+    Description: Balance windows with three or ten accumulation rounds using DP2/TP2 and restore inside a window.
+    Expectation: Samples remain inside their windows; both data paths and repacking replay exactly.
+    """
+    torchrun_case(
+        file_name=str(Path(__file__).with_name("_test_batch_sampler_gloo.py")),
+        case_name="test_accumulation_window_dp2_tp2_gloo", num_proc=4,
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_full_pack_repair_dp2_tp2_gloo() -> None:
+    """Feature: Feasible full-pack repair.
+    Description: Repair DP2 packs with accumulation one or three, repeated records, and both plan modes.
+    Expectation: Tokens, targets, boundaries and sample occurrences survive routing and checkpoint replay.
+    """
+    torchrun_case(
+        file_name=str(Path(__file__).with_name("_test_batch_sampler_gloo.py")),
+        case_name="test_full_pack_repair_dp2_tp2_gloo", num_proc=4,
+    )

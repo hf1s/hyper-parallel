@@ -17,7 +17,7 @@
 import copy
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -30,6 +30,11 @@ from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.data.text.build_dataset import _build_dataloader_context
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
 from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
+from hyper_parallel.distributed_data.balancing_algorithm import (
+    FeasibleLPTBalancingAlgorithm,
+    LPTBalancingAlgorithm,
+    resolve_balancing_algorithm,
+)
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.trainer.config.target import Target
 from tests.common.mark_utils import arg_mark
@@ -379,9 +384,10 @@ class TestNativeBatchSampler(unittest.TestCase):
                 target, datasets=(_TrackedDataset(), None, None), collate_fn=collator,
                 mesh_context=context,
                 training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
-                data_config={"seq_length": 16, "load_balance": True},
+                data_config={"seq_length": 16, "load_balance": True, "balance_window_size": 3},
             )
         self.assertIs(loaders[0], build.return_value)
+        self.assertEqual(build.call_args.args[2].balance_window_size, 3)
         self.assertEqual(samplers, (None, None, None))
         self.assertIs(build.call_args.kwargs["collate_fn"], collator)
         self.assertEqual(next(iter(build.call_args.kwargs["batch_sampler"])), [3, 3])
@@ -406,6 +412,49 @@ class TestNativeBatchSampler(unittest.TestCase):
                 self.assertIsInstance(loaders[0], FixedBatchDataLoader)
                 self.assertIs(loaders[0].batch_sampler, samplers[0])
                 self.assertEqual(_batch_ids(next(iter(loaders[0]))), [0, 1])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_trainer_defaults_to_feasibility_repair(self) -> None:
+        """Feature: Default feasibility-repair selection.
+        Description: Build a balanced loader without an explicit assignment policy.
+        Expectation: The shared default policy includes bounded feasibility repair.
+        """
+        context = SimpleNamespace(dp_rank=0, dp_size=1, device_mesh=_StandaloneMesh(), pp_size=1)
+        with patch("hyper_parallel.data.batching.build_dataloader.build_distributed_dataloader") as build:
+            build_dataloader(
+                SimpleNamespace(), datasets=(_TrackedDataset(), None, None), collate_fn=tuple,
+                mesh_context=context,
+                training_config=SimpleNamespace(micro_batch_size=1, global_batch_size=1, seed=7),
+                data_config={"seq_length": 16, "load_balance": True},
+            )
+            algorithm = resolve_balancing_algorithm(build.call_args.kwargs["balancing_algorithm"])
+            self.assertIs(type(algorithm), FeasibleLPTBalancingAlgorithm)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_trainer_preserves_explicit_balancing_policies(self) -> None:
+        """Feature: Explicit assignment policy selection.
+        Description: Supply a policy directly or through a configured target.
+        Expectation: The explicit policy overrides the repair default without being replaced.
+        """
+        context = SimpleNamespace(dp_rank=0, dp_size=1, device_mesh=_StandaloneMesh(), pp_size=1)
+        options = {
+            "datasets": (_TrackedDataset(), None, None), "collate_fn": tuple, "mesh_context": context,
+            "training_config": SimpleNamespace(micro_batch_size=1, global_batch_size=1, seed=7),
+        }
+        policy = LPTBalancingAlgorithm(objective="balance")
+        for configured in (False, True):
+            target = SimpleNamespace(balancing_algorithm=SimpleNamespace(build=Mock(return_value=policy))) if (
+                configured
+            ) else SimpleNamespace()
+            supplied = None if configured else policy
+            with self.subTest(configured=configured), patch(
+                    "hyper_parallel.data.batching.build_dataloader.build_distributed_dataloader",
+            ) as build:
+                build_dataloader(
+                    target, **options, data_config={"seq_length": 16, "load_balance": True},
+                    balancing_algorithm=supplied,
+                )
+                self.assertIs(resolve_balancing_algorithm(build.call_args.kwargs["balancing_algorithm"]), policy)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_dataset_context_uses_boolean_balance_switch(self) -> None:

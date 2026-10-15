@@ -17,10 +17,11 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
 from threading import Condition, Thread
-from typing import Any
+from typing import Any, Union
 
 import torch  # pylint: disable=forbidden-backend-import
 
@@ -44,6 +45,7 @@ from hyper_parallel.distributed_data.transport import (
 
 
 _PREFETCH_PENDING = object()
+_PlanControl = Union[DistributedPackingPlan, tuple[DistributedPackingPlan, ...], None]
 
 
 def _validate_loader_components(
@@ -146,6 +148,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._last_plan: DistributedPackingPlan | None = None
         self._pending_local_keys: set[SampleKey] = set()
         self._pending_plan: DistributedPackingPlan | None = None
+        self._window_plans: deque[DistributedPackingPlan] = deque()
         self._prefetch_thread: Thread | None = None
         self._prefetch_condition = Condition()
         # ``None`` is a valid result (it signals end of stream), so a unique
@@ -185,6 +188,10 @@ class DistributedDataLoader(Iterator[Any]):
         if not self._caller_collectives or self._stopped or self._prefetch_phase != "metadata":
             return
         local_metadata = self._take_prefetched()
+        if self._window_plans:
+            self._prefetch_phase = "plan"
+            self._start_prefetch(lambda: self._window_plans[0])
+            return
         work = None
         with self._prefetch_stream_context():
             if self._data_plane.is_member:
@@ -192,7 +199,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._prefetch_phase = "plan"
         self._start_prefetch(lambda: self._finish_metadata_plan(work))
 
-    def _finish_metadata_plan(self, work: ControlGatherWork | None) -> DistributedPackingPlan | None:
+    def _finish_metadata_plan(self, work: ControlGatherWork | None) -> _PlanControl:
         if work is None:
             return None
         gathered_metadata = work.wait()
@@ -209,7 +216,7 @@ class DistributedDataLoader(Iterator[Any]):
         with self._prefetch_stream_context():
             if self._data_plane.is_member and self._broadcast_plan:
                 plan = self._data_plane.broadcast_from_planner(plan)
-            self._set_pending_plan(plan)
+            plan = self._set_pending_plan(plan)
             work = None
             if plan is not None and not self._metadata_mode:
                 work = self._data_plane.begin_exchange_prepared(self._prepare_outgoing(plan, self._pending_local_keys))
@@ -384,6 +391,9 @@ class DistributedDataLoader(Iterator[Any]):
             self._prefetch_result = _PREFETCH_PENDING
             self._prefetch_in_flight = False
             self._stopped = True
+            reader = self._planning_reader()
+            if reader is not None:
+                reader.close()
 
     def __enter__(self) -> "DistributedDataLoader":
         """Support deterministic cleanup on early loop exit."""
@@ -411,6 +421,11 @@ class DistributedDataLoader(Iterator[Any]):
                 self._direct_sample_loader.state_dict() if self._direct_sample_loader is not None else None
             ),
         }
+        reader = self._planning_reader()
+        if reader is not None and reader.window_partially_delivered:
+            state["window_plans"] = tuple(
+                ([self._pending_plan] if self._pending_plan is not None else []) + list(self._window_plans)
+            )
         try:
             copied_state = copy.deepcopy(state)
         except Exception as exc:
@@ -436,6 +451,7 @@ class DistributedDataLoader(Iterator[Any]):
         epoch, step, stopped = self._validate_checkpoint_values(state)
         reader_state, metadata_reader_state, direct_sample_state = self._validate_component_states(state, epoch)
         self._restore_component_states(reader_state, metadata_reader_state, direct_sample_state)
+        self._window_plans = deque(state.get("window_plans", ()))
         self._epoch = epoch
         self._step = step
         self._stopped = stopped
@@ -530,6 +546,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._stopped = False
         self._last_plan = None
         self._pending_plan = None
+        self._window_plans.clear()
         self._prefetch_phase = "metadata"
 
     def _produce_on_data_plane(self) -> Any:
@@ -537,7 +554,7 @@ class DistributedDataLoader(Iterator[Any]):
         if plan is None:
             return None
 
-        self._set_pending_plan(plan)
+        plan = self._set_pending_plan(plan)
         local_selected_keys = self._pending_local_keys
         if self._metadata_mode:
             return self._produce_metadata_batch(plan)
@@ -546,11 +563,18 @@ class DistributedDataLoader(Iterator[Any]):
         received_payloads = self._data_plane.exchange_prepared(outgoing)
         return self._construct_received_payloads(plan, received_payloads)
 
-    def _set_pending_plan(self, plan: DistributedPackingPlan | None) -> None:
+    def _set_pending_plan(
+            self, plan: _PlanControl,
+    ) -> DistributedPackingPlan | None:
+        if isinstance(plan, tuple):
+            self._window_plans = deque(plan)
+        if self._window_plans:
+            plan = self._window_plans.popleft()
         self._pending_plan = plan
         self._pending_local_keys = set() if plan is None else {
             key for key in plan.selected_keys if key.reader_rank == self._topology.global_rank
         }
+        return plan
 
     def _produce_metadata_batch(self, plan: DistributedPackingPlan) -> Any:
         """Directly read constructor-assigned shared indices without payload A2A."""
@@ -580,9 +604,11 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError("The Data Constructor must return a non-None batch.")
         return local_batch
 
-    def _next_plan_control(self) -> DistributedPackingPlan | None:
-        """Plan exactly one source-selected step, or return None at end of stream."""
+    def _next_plan_control(self) -> _PlanControl:
+        """Reuse the current window or plan a new one; None means end of stream."""
         local_metadata = self._prepare_local_metadata()
+        if self._window_plans:
+            return self._window_plans[0]
         if not self._broadcast_plan:
             return self._build_plan_control(self._data_plane.all_gather_object(local_metadata))
         gathered_metadata = self._data_plane.gather_object_to_planner(local_metadata)
@@ -592,7 +618,7 @@ class DistributedDataLoader(Iterator[Any]):
         return self._data_plane.broadcast_from_planner(plan)
 
     def _prepare_local_metadata(self) -> tuple[SampleMetadata, ...]:
-        """Prepare one local sampler batch and return its planning metadata."""
+        """Prepare the local sampler window and return its planning metadata."""
         if self._topology.global_rank not in self._dataset_reader_ranks:
             return ()
         planning_reader = self._planning_reader()
@@ -601,8 +627,8 @@ class DistributedDataLoader(Iterator[Any]):
 
     def _build_plan_control(
             self, gathered_metadata: tuple[tuple[SampleMetadata, ...], ...],
-    ) -> DistributedPackingPlan | None:
-        """Return the current step's plan; None means end of stream."""
+    ) -> _PlanControl:
+        """Return the native window's plans; None means end of stream."""
         # Collective order identifies the source rank even when its metadata is empty.
         reader_metadata = [
             metadata for rank, metadata in zip(self._data_plane.ranks, gathered_metadata)
@@ -610,17 +636,17 @@ class DistributedDataLoader(Iterator[Any]):
         ]
         return self._plan_native_batch(reader_metadata)
 
-    def _plan_native_batch(self, reader_metadata: list[tuple[SampleMetadata, ...]]) -> DistributedPackingPlan | None:
-        """Plan this forward/backward round exactly as native DP samplers selected it."""
+    def _plan_native_batch(
+            self, reader_metadata: list[tuple[SampleMetadata, ...]],
+    ) -> _PlanControl:
+        """Plan the native sampler window, returning one plan per training round."""
         if all(not metadata for metadata in reader_metadata):
             return None
         if any(not metadata for metadata in reader_metadata):
             raise ValueError("Native BatchSampler ranks exhausted at different forward/backward rounds.")
-        if any(
-            len({item.key.global_sample_position for item in metadata}) != self._planner.local_batch_size
-            for metadata in reader_metadata
-        ):
-            raise ValueError("Native BatchSampler ranks must each provide exactly local_batch_size samples.")
+        counts = {len({item.key.global_sample_position for item in metadata}) for metadata in reader_metadata}
+        if len(counts) != 1 or next(iter(counts)) % self._planner.local_batch_size:
+            raise ValueError("Native BatchSampler ranks must provide equal complete micro-batch windows.")
         samples = tuple(sorted(
             (item for metadata in reader_metadata for item in metadata),
             key=lambda item: (item.key.global_sample_position, item.key.sequence_index),
@@ -628,7 +654,8 @@ class DistributedDataLoader(Iterator[Any]):
         original_bins = {}
         for item in samples:
             original_bins.setdefault(item.key.global_sample_position, []).append(item.key)
-        return self._planner.plan(
+        plan = self._planner.plan if next(iter(counts)) == self._planner.local_batch_size else self._planner.plan_window
+        return plan(
             samples, reference_bins=tuple(tuple(keys) for keys in original_bins.values()), step=self._step,
         )
 

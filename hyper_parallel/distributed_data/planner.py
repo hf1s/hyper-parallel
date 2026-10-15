@@ -92,6 +92,7 @@ class DynamicPackingPlanner:
         ):
             raise ValueError("min_balance_gain must be in [0, 1).")
         self.data_parallel_size = data_parallel_size
+        self._objective_group_size = data_parallel_size
         self.seq_len = seq_len
         self.local_batch_size = local_batch_size
         self.oversized_policy = oversized_policy
@@ -154,6 +155,21 @@ class DynamicPackingPlanner:
         candidate, candidate_costs = self._build_rank_packing_plans(
             candidate_keys, samples_by_key, audit=audit_candidate,
         )
+        if (
+                self._objective_group_size < self.data_parallel_size and self.local_batch_size == 1
+                and isinstance(self.balancing_algorithm, LPTBalancingAlgorithm)
+        ):
+            # Validate assignments before scheduling so a feasible reference
+            # cannot hide an invalid candidate from a custom LPT subclass.
+            scheduled = (
+                self._schedule_window_bins(batches, costs)
+                for batches, costs in ((candidate, candidate_costs), (original, reference_costs))
+            )
+            # Cost sorting need not improve normalized variance or subclass
+            # objectives, so retain the original candidate as an option.
+            candidate, candidate_costs = min(
+                ((candidate, candidate_costs), *scheduled), key=lambda result: self._objective_value(result[1]),
+            )
         accepted = self._accept_candidate(reference_costs, candidate_costs)
         local_batches, rank_costs = (candidate, candidate_costs) if accepted else (original, reference_costs)
         return DistributedPackingPlan(
@@ -163,6 +179,55 @@ class DynamicPackingPlanner:
             rank_costs=rank_costs,
             validate=False,
         )
+
+    def plan_window(
+            self,
+            samples: Sequence[SampleMetadata],
+            *,
+            reference_bins: Sequence[Sequence[SampleKey]],
+            step: int,
+    ) -> tuple[DistributedPackingPlan, ...]:
+        """Balance native rounds jointly over rank-by-micro-batch destinations.
+
+        Args:
+            samples: The frozen union of the window's native sample occurrences.
+            reference_bins: Original bins ordered by micro-batch, DP rank, then local bin.
+            step: First distributed micro-batch index in the window.
+
+        Returns:
+            One ordinary distributed plan per micro-batch. The benefit gate sums
+            per-round objectives so improvements do not hide a slower window.
+        """
+        rounds, remainder = divmod(len(reference_bins), self.distributed_bin_count)
+        if not rounds or remainder:
+            raise ValueError("A balancing window must contain complete distributed micro-batches.")
+        window_planner = copy(self)
+        window_planner.data_parallel_size *= rounds
+        plan = window_planner.plan(samples, reference_bins=reference_bins, step=step)
+        self.last_sample_costs = window_planner.last_sample_costs
+        self.last_balance_decision = window_planner.last_balance_decision
+        return tuple(
+            DistributedPackingPlan(
+                step=step + offset,
+                seq_len=self.seq_len,
+                local_batches=plan.local_batches[start:start + self.data_parallel_size],
+                rank_costs=plan.rank_costs[start:start + self.data_parallel_size],
+                validate=False,
+            )
+            for offset, start in enumerate(range(0, len(plan.local_batches), self.data_parallel_size))
+        )
+
+    @staticmethod
+    def _schedule_window_bins(
+            local_batches: tuple[tuple[PackingBinPlan, ...], ...],
+            rank_costs: tuple[WorkloadCost, ...],
+    ) -> tuple[tuple[tuple[PackingBinPlan, ...], ...], tuple[WorkloadCost, ...]]:
+        """Group intact, validated packs by cost within the frozen window."""
+        order = sorted(
+            range(len(local_batches)),
+            key=lambda index: (-rank_costs[index].llm, local_batches[index][0].sample_keys),
+        )
+        return tuple(local_batches[index] for index in order), tuple(rank_costs[index] for index in order)
 
     def _estimate_samples(
             self, samples: Sequence[SampleMetadata],
@@ -230,6 +295,13 @@ class DynamicPackingPlanner:
         return accepted
 
     def _objective_value(self, rank_costs: Sequence[WorkloadCost]) -> float:
+        scores = (
+            self._round_objective(rank_costs[start:start + self._objective_group_size])
+            for start in range(0, len(rank_costs), self._objective_group_size)
+        )
+        return math.fsum(scores)
+
+    def _round_objective(self, rank_costs: Sequence[WorkloadCost]) -> float:
         score = self.balancing_algorithm.objective(rank_costs)
         if (
                 not isinstance(score, (int, float)) or isinstance(score, bool)
