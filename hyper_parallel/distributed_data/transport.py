@@ -52,6 +52,27 @@ class PreparedPayloadExchange:
 
 
 @dataclass
+class ControlGatherWork:
+    """Retain control buffers until the consumer waits and decodes on the launch stream."""
+
+    encoded: torch.Tensor | None = None
+    sizes: tuple[int, ...] = ()
+    gathered: tuple[torch.Tensor, ...] = ()
+    data_work: Any = None
+    completed_values: tuple[Any, ...] | None = None
+
+    def wait(self) -> tuple[Any, ...]:
+        """Wait for gathered bytes and decode them with the launch device and stream bound."""
+        if self.completed_values is None:
+            if self.data_work is not None:
+                self.data_work.wait()
+            self.completed_values = tuple(
+                _decode_control(payload, size) for payload, size in zip(self.gathered, self.sizes)
+            )
+        return self.completed_values
+
+
+@dataclass
 class PayloadExchangeWork:
     """Main-thread-launched asynchronous payload exchange.
 
@@ -139,24 +160,36 @@ def all_gather_control_object(
     Returns:
         Gathered values in process-group rank order.
     """
+    return _begin_all_gather_control_object(value, group=group, device=device, backend=backend).wait()
+
+
+def _begin_all_gather_control_object(
+        value: Any,
+        *,
+        group: Any = None,
+        device: Any = None,
+        backend: str | None = None,
+) -> ControlGatherWork:
+    """Exchange lengths on the caller, then launch accelerator bytes without decoding."""
     effective_backend = _control_backend(group, backend)
     if not _is_accelerator_backend(effective_backend):
         gathered = [None] * dist.get_world_size(group)
         dist.all_gather_object(gathered, value, group=group)
-        return tuple(gathered)
+        return ControlGatherWork(completed_values=tuple(gathered))
     resolved = _require_control_device(device, effective_backend)
     encoded, encoded_size = _encode_control(value, resolved)
     local_size = torch.tensor([encoded_size], dtype=torch.int64, device=resolved)
     sizes = [torch.empty_like(local_size) for _ in range(dist.get_world_size(group))]
     dist.all_gather(sizes, local_size, group=group)
-    max_size = max(int(item.item()) for item in sizes)
+    host_sizes = tuple(int(item.item()) for item in sizes)
+    max_size = max(host_sizes)
     if encoded.numel() < max_size:
         padded = torch.zeros((max_size,), dtype=torch.uint8, device=resolved)
         padded[:encoded.numel()] = encoded
         encoded = padded
     gathered = [torch.empty_like(encoded) for _ in sizes]
-    dist.all_gather(gathered, encoded, group=group)
-    return tuple(_decode_control(payload, int(size.item())) for payload, size in zip(gathered, sizes))
+    work = dist.all_gather(gathered, encoded, group=group, async_op=True)
+    return ControlGatherWork(encoded=encoded, sizes=host_sizes, gathered=tuple(gathered), data_work=work)
 
 
 def broadcast_control_object(
@@ -533,41 +566,9 @@ def _decode_payload_value(schema: Any, binary: bytearray) -> Any:
         raise ValueError("Payload metadata contains an invalid schema node.")
     tag = schema[0]
     if tag == _TENSOR_TAG:
-        if len(schema) != 5:
-            raise ValueError("Tensor payload descriptor has an invalid field count.")
-        _, dtype_name, shape, offset, size = schema
-        dtype = _payload_dtype(dtype_name)
-        shape = tuple(shape)
-        if any(not isinstance(dim, int) or dim < 0 for dim in shape):
-            raise ValueError(f"Tensor payload descriptor has an invalid shape: {shape!r}.")
-        if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size < 0:
-            raise ValueError("Tensor payload descriptor has an invalid byte range.")
-        end = offset + size
-        if end > len(binary):
-            raise ValueError("Tensor payload descriptor points outside the binary buffer.")
-        element_count = 1
-        for dim in shape:
-            element_count *= dim
-        expected_size = element_count * torch.empty((), dtype=dtype).element_size()
-        if expected_size != size:
-            raise ValueError(
-                f"Tensor payload byte size mismatch: expected {expected_size}, got {size}."
-            )
-        if size == 0:
-            return torch.empty(shape, dtype=dtype)
-        tensor = torch.frombuffer(memoryview(binary)[offset:end], dtype=dtype, count=element_count)
-        return tensor.reshape(shape)
+        return _decode_tensor_payload(schema, binary)
     if tag in (_BYTES_TAG, _BYTEARRAY_TAG):
-        if len(schema) != 3:
-            raise ValueError("Byte payload descriptor has an invalid field count.")
-        _, offset, size = schema
-        if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size < 0:
-            raise ValueError("Byte payload descriptor has an invalid byte range.")
-        end = offset + size
-        if end > len(binary):
-            raise ValueError("Byte payload descriptor points outside the binary buffer.")
-        raw = bytes(binary[offset:end])
-        return bytearray(raw) if tag == _BYTEARRAY_TAG else raw
+        return _decode_bytes_payload(schema, binary)
     if tag == "__hp_mapping__":
         return {
             key: _decode_payload_value(child, binary)
@@ -580,6 +581,48 @@ def _decode_payload_value(schema: Any, binary: bytearray) -> Any:
     if tag == "__hp_value__":
         return schema[1]
     raise ValueError(f"Unknown payload metadata schema tag: {tag!r}.")
+
+
+def _decode_tensor_payload(schema: tuple, binary: bytearray) -> torch.Tensor:
+    """Reconstruct a tensor view after validating its descriptor."""
+    if len(schema) != 5:
+        raise ValueError("Tensor payload descriptor has an invalid field count.")
+    _, dtype_name, shape, offset, size = schema
+    dtype = _payload_dtype(dtype_name)
+    shape = tuple(shape)
+    if any(not isinstance(dim, int) or dim < 0 for dim in shape):
+        raise ValueError(f"Tensor payload descriptor has an invalid shape: {shape!r}.")
+    if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size < 0:
+        raise ValueError("Tensor payload descriptor has an invalid byte range.")
+    end = offset + size
+    if end > len(binary):
+        raise ValueError("Tensor payload descriptor points outside the binary buffer.")
+    element_count = 1
+    for dim in shape:
+        element_count *= dim
+    expected_size = element_count * torch.empty((), dtype=dtype).element_size()
+    if expected_size != size:
+        raise ValueError(
+            f"Tensor payload byte size mismatch: expected {expected_size}, got {size}."
+        )
+    if size == 0:
+        return torch.empty(shape, dtype=dtype)
+    tensor = torch.frombuffer(memoryview(binary)[offset:end], dtype=dtype, count=element_count)
+    return tensor.reshape(shape)
+
+
+def _decode_bytes_payload(schema: tuple, binary: bytearray) -> bytes | bytearray:
+    """Reconstruct a byte sequence after validating its descriptor."""
+    if len(schema) != 3:
+        raise ValueError("Byte payload descriptor has an invalid field count.")
+    tag, offset, size = schema
+    if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size < 0:
+        raise ValueError("Byte payload descriptor has an invalid byte range.")
+    end = offset + size
+    if end > len(binary):
+        raise ValueError("Byte payload descriptor points outside the binary buffer.")
+    raw = bytes(binary[offset:end])
+    return bytearray(raw) if tag == _BYTEARRAY_TAG else raw
 
 
 def _payload_dtype(dtype_name: Any) -> torch.dtype:
@@ -754,9 +797,22 @@ class DataPlaneTransport:
         Returns:
             Values in data-plane rank order.
         """
+        return self.begin_all_gather_object(value).wait()
+
+    def begin_all_gather_object(self, value: Any) -> ControlGatherWork:
+        """Launch control gathering and defer accelerator result decoding to the consumer.
+
+        Args:
+            value: Rank-local control value.
+
+        Returns:
+            Work retaining communication buffers. Wait on the launch device and
+            stream before using the result. Accelerator length exchange remains
+            synchronous; Gloo and single-rank results are already complete.
+        """
         if len(self._ranks) == 1:
-            return (value,)
-        return all_gather_control_object(
+            return ControlGatherWork(completed_values=(value,))
+        return _begin_all_gather_control_object(
             value,
             group=self._control_group,
             device=self._communication_device,

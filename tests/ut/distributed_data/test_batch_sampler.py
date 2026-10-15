@@ -334,7 +334,7 @@ class TestNativeBatchSampler(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_metadata_reader_advances_only_on_complete_commit(self) -> None:
         """Feature: Transactional sampler progress.
-        Description: Reject partial commits and restore committed progress with an optional legacy version field.
+        Description: Reject empty or partial commits, repeat preparation, and restore committed progress.
         Expectation: Saved progress advances only after the full batch is consumed.
         """
         sampler = _sampler()
@@ -342,12 +342,21 @@ class TestNativeBatchSampler(unittest.TestCase):
             sampler, reader_rank=0,
             metadata=[SampleMetadata(1)] * 10, metadata_fn=None, sample_loader=None,
         )
+        with self.assertRaisesRegex(ValueError, "complete pending"):
+            reader.commit(set())
         self.assertIsNone(reader.prepare_next_step())
+        self.assertIsNone(reader.prepare_next_step())
+        self.assertEqual(sampler.consumed_samples, 2)
         saved = copy.deepcopy(reader.state_dict())
         self.assertEqual(saved["sampler"]["consumed_samples"], 0)
         with self.assertRaisesRegex(ValueError, "complete pending"):
             reader.commit({reader.metadata()[0].key})
         reader.commit({item.key for item in reader.metadata()})
+        self.assertEqual(reader.state_dict()["sampler"]["consumed_samples"], 2)
+        with self.assertRaisesRegex(ValueError, "complete pending"):
+            reader.commit(set())
+        self.assertIsNone(reader.prepare_next_step())
+        self.assertEqual(sampler.consumed_samples, 4)
         self.assertEqual(reader.state_dict()["sampler"]["consumed_samples"], 2)
         reader.load_state_dict({**saved, "version": 0})
         self.assertEqual(reader.state_dict(), saved)

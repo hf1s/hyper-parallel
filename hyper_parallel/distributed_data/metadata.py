@@ -88,7 +88,7 @@ class PlannedSampleLoader:
                 this loader's Dataset.
 
         Returns:
-            Mapping from every requested key to its materialized payload.
+            Mapping from every requested key to its Dataset sample.
         """
         if any(not isinstance(key, SampleKey) for key in sample_keys):
             raise ValueError("sample_keys must contain SampleKey values.")
@@ -103,19 +103,19 @@ class PlannedSampleLoader:
         # DataLoader retains this list, so replace its contents instead of rebinding it.
         self._indices[:] = (key.dataset_index for key in sample_keys)
         iterator = iter(self._data_loader)
-        payloads = {}
+        samples_by_key = {}
         for expected_key in sample_keys:
             try:
-                indexed_payload = next(iterator)
+                indexed_sample = next(iterator)
             except StopIteration as exc:
                 raise ValueError("Plan-aware DataLoader exhausted before all requested samples were read.") from exc
-            if indexed_payload.dataset_index != expected_key.dataset_index:
+            if indexed_sample.dataset_index != expected_key.dataset_index:
                 raise ValueError(
                     f"Plan-aware DataLoader expected index {expected_key.dataset_index}, "
-                    f"but returned {indexed_payload.dataset_index}."
+                    f"but returned {indexed_sample.dataset_index}."
                 )
-            payloads[expected_key] = indexed_payload.payload
-        return payloads
+            samples_by_key[expected_key] = indexed_sample.payload
+        return samples_by_key
 
     def state_dict(self) -> dict[str, Any]:
         """Return the epoch required to seed future plan-aware workers."""

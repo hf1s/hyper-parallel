@@ -431,10 +431,17 @@ order. Both loader adapters expose the same idempotent scheduling hooks:
 ```python
 batch = next(loader)
 loss = forward(batch)
-loader.prefetch_plan()  # gather metadata, then plan in the CPU worker
+loader.prefetch_plan()  # launch metadata gathering; wait, decode and plan in the worker
 backward(loss)
 loader.prefetch()       # launch routing; construct and H2D in the worker
 ```
+
+Accelerator metadata gathering first exchanges serialized lengths on the caller,
+then launches the byte AllGather with `async_op=True`. The producer waits for
+that result, copies metadata to CPU, decodes it and computes the plan on the same
+data stream used for launch. The hook can return before the metadata bytes arrive.
+The length exchange and waiting for local metadata remain synchronous; this is
+not a fully nonblocking metadata pipeline.
 
 HP's Trainer invokes these hooks automatically before synchronizing loss.
 External training loops should invoke them at the same boundaries to overlap

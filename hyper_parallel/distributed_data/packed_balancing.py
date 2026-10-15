@@ -40,7 +40,7 @@ from hyper_parallel.distributed_data.schema import (
     SampleKey,
     SampleMetadata,
 )
-from hyper_parallel.distributed_data.transport import DataPlaneTransport, PayloadExchangeWork
+from hyper_parallel.distributed_data.transport import ControlGatherWork, DataPlaneTransport, PayloadExchangeWork
 
 if TYPE_CHECKING:
     from hyper_parallel.distributed_data.api import DistributedDatasetConfig
@@ -111,10 +111,11 @@ class _LocalBalancingIterator(Iterator[Any]):
         return self._loader._deliver_batch(result, self._step)
 
     def prefetch_plan(self) -> None:
-        """Gather next-step metadata on the caller and start CPU planning.
+        """Launch metadata gathering and finish decoding and planning in the worker.
 
         All ranks call at the same training boundary, after enqueueing compute
-        and before host synchronization. No device-wide wait is introduced.
+        and before host synchronization. The variable-length size exchange
+        remains synchronous; no device-wide wait is introduced.
         """
         if not self._loader._uses_synchronous_collectives or self.finished:
             return
@@ -128,9 +129,9 @@ class _LocalBalancingIterator(Iterator[Any]):
             self.finished = True
             return
         with self._loader._data_stream_context():
-            gathered = self._loader._transport.all_gather_object(self._prepared_source_step.metadata)
+            work = self._loader._transport.begin_all_gather_object(self._prepared_source_step.metadata)
         self._phase = "plan"
-        self._start_worker(self._prepare_plan, gathered)
+        self._start_worker(self._prepare_plan, work)
 
     def prefetch(self) -> None:
         """Launch next-step payload exchange on the caller, then finish off-thread.
@@ -155,8 +156,9 @@ class _LocalBalancingIterator(Iterator[Any]):
         self._phase = "batch"
         self._start_worker(self._finish_batch, pending)
 
-    def _prepare_plan(self, gathered: Sequence[Any]) -> None:
-        self._planned = self._loader._make_plan(gathered, self._step)
+    def _prepare_plan(self, work: ControlGatherWork) -> None:
+        with self._loader._data_stream_context():
+            self._planned = self._loader._make_plan(work.wait(), self._step)
 
     def _finish_batch(self, pending: _PendingBatch) -> None:
         with self._loader._data_stream_context():

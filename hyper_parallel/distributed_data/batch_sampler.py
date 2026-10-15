@@ -97,7 +97,6 @@ class BatchSamplerReader:
         self._split_fn = split_fn
         self._sampler.enable_source_batch_resume()
         self._committed_state = copy.deepcopy(sampler.state_dict())
-        self._pending_state: dict[str, Any] | None = None
         self._iterator = None
         self._buffer: tuple[SampleMetadata, ...] = ()
         self._payloads: dict[SampleKey, Any] = {}
@@ -131,10 +130,6 @@ class BatchSamplerReader:
                 self._exhausted = True
                 return None
             keys = self._sample_keys(indices)
-            self._pending_state = copy.deepcopy(self._sampler.state_dict())
-            expected_position = self.batch_position + self._sampler.global_micro_batch_size
-            if self._pending_state["consumed_samples"] != expected_position:
-                raise ValueError("Native BatchSampler must advance exactly one global local-batch round per yield.")
             if self._metadata is None:
                 self._payloads = self._sample_loader.fetch_samples(keys)
                 if self._split_fn is not None:
@@ -198,10 +193,9 @@ class BatchSamplerReader:
         Args:
             selected_keys: Every sample occurrence in the delivered local round.
         """
-        if selected_keys != {item.key for item in self._buffer} or self._pending_state is None:
+        if not self._buffer or selected_keys != {item.key for item in self._buffer}:
             raise ValueError("Native BatchSampler commit must consume the complete pending local batch.")
-        self._committed_state = self._pending_state
-        self._pending_state = None
+        self._committed_state = copy.deepcopy(self._sampler.state_dict())
         self._buffer = ()
         self._payloads = {}
 
@@ -248,7 +242,6 @@ class BatchSamplerReader:
 
     def _reset_pending(self) -> None:
         self._iterator = None
-        self._pending_state = None
         self._buffer = ()
         self._payloads = {}
         self._exhausted = False

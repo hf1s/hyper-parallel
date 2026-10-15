@@ -36,6 +36,7 @@ from hyper_parallel.distributed_data.schema import (
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
+    ControlGatherWork,
     DataPlaneTransport,
     ModelParallelTransport,
     PreparedPayloadExchange,
@@ -180,21 +181,24 @@ class DistributedDataLoader(Iterator[Any]):
         return self._data_plane.communication_backend in ("hccl", "nccl")
 
     def prefetch_plan(self) -> None:
-        """Gather metadata on the caller after current-step compute submission."""
+        """Launch metadata gathering; wait, decode and plan on the producer thread."""
         if not self._caller_collectives or self._stopped or self._prefetch_phase != "metadata":
             return
         local_metadata = self._take_prefetched()
-        gathered_metadata = None
+        work = None
         with self._prefetch_stream_context():
             if self._data_plane.is_member:
-                if self._broadcast_plan:
-                    gathered_metadata = self._data_plane.gather_object_to_planner(local_metadata)
-                else:
-                    gathered_metadata = self._data_plane.all_gather_object(local_metadata)
+                work = self._data_plane.begin_all_gather_object(local_metadata)
         self._prefetch_phase = "plan"
-        self._start_prefetch(
-            lambda: self._build_plan_control(gathered_metadata) if gathered_metadata is not None else None
-        )
+        self._start_prefetch(lambda: self._finish_metadata_plan(work))
+
+    def _finish_metadata_plan(self, work: ControlGatherWork | None) -> DistributedPackingPlan | None:
+        if work is None:
+            return None
+        gathered_metadata = work.wait()
+        if self._broadcast_plan and self._topology.global_rank != self._data_plane.planner_rank:
+            return None
+        return self._build_plan_control(gathered_metadata)
 
     def prefetch(self) -> None:
         """Launch next-step routing on the caller, then construct and copy off-thread."""

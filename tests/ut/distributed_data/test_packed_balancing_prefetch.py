@@ -38,7 +38,7 @@ class _SynchronousCollectiveLoader:
         self.config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, broadcast_plan=broadcast_plan)
         self.events = []
         self._transport = Mock()
-        self._transport.all_gather_object.side_effect = self._gather
+        self._transport.begin_all_gather_object.side_effect = self._gather
         self._transport.broadcast_from_planner.side_effect = self._broadcast
 
     def _event(self, name, step):
@@ -53,6 +53,10 @@ class _SynchronousCollectiveLoader:
 
     def _gather(self, step):
         self._event("gather", step)
+        return Mock(wait=lambda: self._wait_metadata(step))
+
+    def _wait_metadata(self, step):
+        self._event("metadata_wait", step)
         return step
 
     def _make_plan(self, gathered, step):
@@ -107,7 +111,7 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
                     iterator.close()
                 for step in (0, 1):
                     events = [event for event in loader.events if event[1] == step]
-                    expected_events = ["source", "gather", "plan"]
+                    expected_events = ["source", "gather", "metadata_wait", "plan"]
                     if broadcast_plan:
                         expected_events.append("broadcast")
                     expected_events.extend(("exchange", "collate"))
@@ -116,6 +120,37 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
                         expected = "MainThread" if name in ("gather", "broadcast", "exchange") else \
                             "hp-local-balance-prefetch"
                         self.assertEqual(thread, expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_metadata_completion_does_not_block_launch(self) -> None:
+        """Feature: Background local-step metadata completion.
+        Description: Delay the gathered result after the foreground launches metadata exchange.
+        Expectation: Planning hooks return while completion is pending and iteration later delivers the batch.
+        """
+        loader = _SynchronousCollectiveLoader()
+        iterator = _LocalBalancingIterator(loader)
+        started, release = threading.Event(), threading.Event()
+        original = loader._wait_metadata
+
+        def delayed(step: int) -> int:
+            """Hold metadata completion until the foreground confirms launch returned."""
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("metadata completion timed out")
+            return original(step)
+
+        try:
+            self.assertEqual(next(iterator), [0])
+            with patch.object(loader, "_wait_metadata", side_effect=delayed):
+                iterator.prefetch_plan()
+                iterator.prefetch_plan()
+                self.assertTrue(started.wait(5))
+                self.assertEqual(iterator._phase, "plan")
+                release.set()
+                self.assertEqual(next(iterator), [1])
+        finally:
+            release.set()
+            iterator.close()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_payload_completion_does_not_block_launch(self) -> None:
@@ -154,7 +189,7 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
         Description: Fail planning and collation in the background worker.
         Expectation: The consumer receives the original worker exception.
         """
-        for method in ("_make_plan", "_finish_batch"):
+        for method in ("_wait_metadata", "_make_plan", "_finish_batch"):
             with self.subTest(method=method):
                 loader = _SynchronousCollectiveLoader()
                 iterator = _LocalBalancingIterator(loader)

@@ -28,6 +28,7 @@ from hyper_parallel.distributed_data.transport import (
     DataGroups,
     DataPlaneTransport,
     ModelParallelTransport,
+    _decode_control,
     _decode_model_batch,
     _encode_model_batch,
     create_data_groups,
@@ -132,6 +133,55 @@ class TestPayloadCodec(unittest.TestCase):
 
 class TestDataPlaneTransport(unittest.TestCase):
     """Verify control metadata and payload bytes use their designated groups."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_control_gather_defers_decode_and_retains_variable_length_buffers(self) -> None:
+        """Feature: Deferred control gather completion.
+        Description: Gather differently sized objects using a mocked accelerator backend and delayed data work.
+        Expectation: Launch neither waits nor decodes the result, and repeated waits return the same objects.
+        """
+        values = (None, {"metadata": list(range(40))})
+        payloads = [pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL) for value in values]
+        transport = DataPlaneTransport(DataGroups((0, 1), "control", None, None, 0, True), 0)
+        work = Mock()
+
+        def gather(outputs: list[torch.Tensor], source: torch.Tensor, **kwargs: Any) -> Any:
+            """Populate lengths immediately and bytes only when the consumer waits."""
+            self.assertEqual(kwargs["group"], "control")
+            if source.dtype == torch.int64:
+                for output, payload in zip(outputs, payloads):
+                    output.fill_(len(payload))
+                self.assertFalse(kwargs.get("async_op", False))
+                return None
+            self.assertTrue(kwargs["async_op"])
+
+            def complete() -> None:
+                """Populate received bytes only after the consumer waits."""
+                for output, payload in zip(outputs, payloads):
+                    output.zero_()
+                    output[:len(payload)].copy_(torch.tensor(list(payload), dtype=torch.uint8))
+
+            work.wait.side_effect = complete
+            return work
+
+        with (
+            patch("hyper_parallel.distributed_data.transport._control_backend", return_value="hccl"),
+            patch(
+                "hyper_parallel.distributed_data.transport._require_control_device", return_value=torch.device("cpu"),
+            ),
+            patch("hyper_parallel.distributed_data.transport.dist.get_world_size", return_value=2),
+            patch("hyper_parallel.distributed_data.transport.dist.all_gather", side_effect=gather),
+            patch("hyper_parallel.distributed_data.transport._decode_control", wraps=_decode_control) as decode,
+        ):
+            pending = transport.begin_all_gather_object(values[0])
+            work.wait.assert_not_called()
+            decode.assert_not_called()
+            self.assertEqual(pending.sizes, tuple(map(len, payloads)))
+            self.assertEqual(pending.encoded.numel(), max(map(len, payloads)))
+            self.assertEqual(pending.wait(), values)
+            self.assertEqual(pending.wait(), values)
+            work.wait.assert_called_once()
+            self.assertEqual(decode.call_count, 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_default_communication_backend_is_hccl(self) -> None:

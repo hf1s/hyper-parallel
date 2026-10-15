@@ -23,7 +23,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 
 
-def _accelerator_module(device: torch.device) -> Any:
+def _get_device_module(device: torch.device) -> Any:
     """Return the PyTorch device module that owns streams and events."""
     module = getattr(torch, device.type, None)
     required = ("Event", "Stream", "current_stream", "stream")
@@ -126,8 +126,8 @@ class DevicePrefetchedStep:
         Returns:
             Device batch, with non-tensor metadata left untouched.
         """
-        accelerator = getattr(torch, self.device.type)
-        stream = accelerator.current_stream(self.device)
+        device_module = getattr(torch, self.device.type)
+        stream = device_module.current_stream(self.device)
         stream.wait_event(self.ready_event)
         batch = self.device_batch
         _record_stream(batch, stream)
@@ -153,7 +153,7 @@ class DeviceStepPrefetcher:
         self.device = torch.device(device)
         if self.device.type not in ("cuda", "npu"):
             raise ValueError("DeviceStepPrefetcher requires a CUDA or NPU device.")
-        self._accelerator = _accelerator_module(self.device)
+        self._device_module = _get_device_module(self.device)
         self._copy_stream = None
         self._pending_staging: list[tuple[Any, Any]] = []
 
@@ -174,18 +174,18 @@ class DeviceStepPrefetcher:
             producer thread does not wait for that event; the consumer stream
             orders itself with ``wait_event`` in ``take_batch``.
         """
-        accelerator = self._accelerator
+        device_module = self._device_module
         # The local loader may create a fresh producer thread each step; device
         # selection is thread-local even when payload exchange uses only Gloo.
-        accelerator.set_device(self.device)
+        device_module.set_device(self.device)
         if self._copy_stream is None:
-            self._copy_stream = accelerator.Stream(device=self.device)
+            self._copy_stream = device_module.Stream(device=self.device)
         self._pending_staging = [(event, batch) for event, batch in self._pending_staging if not event.query()]
         staging = _pin_memory(cpu_batch)
         try:
-            with accelerator.stream(self._copy_stream):
+            with device_module.stream(self._copy_stream):
                 device_batch = _move_to_device(staging, self.device)
-                ready_event = accelerator.Event()
+                ready_event = device_module.Event()
                 ready_event.record(self._copy_stream)
         except BaseException:
             # Earlier copies may still read pinned staging when a later
@@ -208,9 +208,9 @@ def _resolve_device(device: Any = None, *, communication_backend: str = "hccl") 
         return torch.device("cpu")
     if device is None:
         for device_type in ("npu", "cuda"):
-            accelerator = getattr(torch, device_type, None)
-            if accelerator is not None and accelerator.is_available():
-                device = torch.device(device_type, accelerator.current_device())
+            device_module = getattr(torch, device_type, None)
+            if device_module is not None and device_module.is_available():
+                device = torch.device(device_type, device_module.current_device())
                 break
         else:
             device = "cpu"

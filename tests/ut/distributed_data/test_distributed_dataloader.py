@@ -19,7 +19,7 @@ import unittest
 from contextlib import nullcontext
 from collections.abc import Callable
 from itertools import product
-from threading import current_thread
+from threading import Event, current_thread
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
 
@@ -77,7 +77,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         for explicit, broadcast_plan in product((False, True), repeat=2):
             with self.subTest(explicit=explicit, broadcast_plan=broadcast_plan):
                 loader = _native_loader(broadcast_plan=broadcast_plan)
-                gather_method = "gather_object_to_planner" if broadcast_plan else "all_gather_object"
                 events = []
 
                 def record(name: str, callback: Callable[..., Any]) -> Callable[..., Any]:
@@ -88,14 +87,21 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         return callback(*args, **kwargs)
                     return run
 
+                original_begin = loader._data_plane.begin_all_gather_object
+
+                def begin_gather(value: Any) -> Any:
+                    """Record result completion separately from the collective launch."""
+                    pending = original_begin(value)
+                    return Mock(wait=record("metadata_wait", pending.wait))
+
                 with patch.object(DataPlaneTransport, "communication_backend", new_callable=PropertyMock,
                                   return_value="hccl"), patch.object(
                         loader, "_prepare_local_metadata", side_effect=record("read", loader._prepare_local_metadata),
                 ), patch.object(
                         loader, "_build_plan_control", side_effect=record("plan", loader._build_plan_control),
                 ), patch.object(
-                        loader._data_plane, gather_method,
-                        side_effect=record("gather", getattr(loader._data_plane, gather_method)),
+                        loader._data_plane, "begin_all_gather_object",
+                        side_effect=record("gather", begin_gather),
                 ), patch.object(
                         loader._data_plane, "broadcast_from_planner",
                         side_effect=record("broadcast", loader._data_plane.broadcast_from_planner),
@@ -119,6 +125,65 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 for name, thread in events:
                     expected = "MainThread" if name in ("gather", "broadcast", "exchange") else worker.name
                     self.assertEqual(thread, expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_metadata_completion_does_not_block_prefetch_plan(self) -> None:
+        """Feature: Background metadata completion.
+        Description: Hold the gathered metadata result while the caller submits a planning phase.
+        Expectation: The hook returns before completion; repeated hooks preserve the pending phase.
+        """
+        for broadcast_plan in (False, True):
+            with self.subTest(broadcast_plan=broadcast_plan), _native_loader(broadcast_plan=broadcast_plan) as loader:
+                started, release = Event(), Event()
+                original_begin = loader._data_plane.begin_all_gather_object
+
+                def begin(value: Any) -> Any:
+                    """Return a pending result that can only complete after the caller releases it."""
+                    pending = original_begin(value)
+
+                    def wait() -> Any:
+                        """Hold completion until the foreground confirms the hook has returned."""
+                        started.set()
+                        if not release.wait(5):
+                            raise RuntimeError("metadata completion timed out")
+                        return pending.wait()
+
+                    return Mock(wait=wait)
+
+                with patch.object(DataPlaneTransport, "communication_backend", new_callable=PropertyMock,
+                                  return_value="hccl"):
+                    self.assertEqual(next(loader)[0][0]["id"], 0)
+                    try:
+                        with patch.object(loader._data_plane, "begin_all_gather_object", side_effect=begin):
+                            loader.prefetch_plan()
+                            loader.prefetch_plan()
+                            self.assertTrue(started.wait(5))
+                            self.assertEqual(loader._prefetch_phase, "plan")
+                            self.assertEqual(loader._step, 1)
+                            release.set()
+                            self.assertEqual(next(loader)[0][0]["id"], 2)
+                    finally:
+                        release.set()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_metadata_wait_error_reaches_consumer(self) -> None:
+        """Feature: Metadata completion error propagation.
+        Description: Fail a gathered metadata result in the background planning phase.
+        Expectation: The consumer receives the original exception without committing another batch.
+        """
+        with _native_loader() as loader, patch.object(
+                DataPlaneTransport, "communication_backend", new_callable=PropertyMock, return_value="hccl",
+        ):
+            next(loader)
+            failure = ValueError("metadata gather failed")
+            with patch.object(loader._data_plane, "begin_all_gather_object", return_value=Mock(
+                    wait=Mock(side_effect=failure),
+            )):
+                loader.prefetch_plan()
+                with self.assertRaises(ValueError) as caught:
+                    next(loader)
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(loader._step, 1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_non_planner_rank_builds_batches_without_plan_broadcast(self) -> None:
