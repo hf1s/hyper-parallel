@@ -79,36 +79,66 @@ def _auto_assign_ports(cases: list) -> None:
             case.master_port = allocate_port()
 
 
+def _visible_device_pool(global_num_proc: int) -> list[int]:
+    """Read the inherited NPU selection without importing a device runtime."""
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    device_type = os.environ.get("HYPER_PARALLEL_TEST_DEVICE_TYPE", "").strip().lower()
+    if device_type == "cpu" or visible is None:
+        return list(range(global_num_proc))
+    fields = visible.split(",")
+    if any(not field.isascii() or not field.isdecimal() for field in fields):
+        raise ValueError("ASCEND_RT_VISIBLE_DEVICES must contain comma-separated non-negative device IDs")
+    devices = [int(field) for field in fields]
+    if devices != sorted(set(devices)):
+        raise ValueError("ASCEND_RT_VISIBLE_DEVICES must contain unique device IDs in ascending order")
+    return devices[:global_num_proc]
+
+
+def _device_assignments(cases: list[TorchCase], global_num_proc: int) -> list[list[int]]:
+    """Validate the budget before slicing the parent's visible device IDs."""
+    if isinstance(global_num_proc, bool) or not isinstance(global_num_proc, int) or global_num_proc < 1:
+        raise ValueError("global_num_proc must be a positive integer")
+    for case in cases:
+        if isinstance(case.num_proc, bool) or not isinstance(case.num_proc, int) or case.num_proc < 1:
+            raise ValueError(f"num_proc for {case.case_name!r} must be a positive integer")
+    devices = _visible_device_pool(global_num_proc)
+    required = sum(case.num_proc for case in cases)
+    if required > len(devices):
+        raise ValueError(
+            f"Requested {required} processes, but only {len(devices)} devices are available "
+            f"within global_num_proc={global_num_proc}"
+        )
+    assignments = []
+    offset = 0
+    for case in cases:
+        assignments.append(devices[offset:offset + case.num_proc])
+        offset += case.num_proc
+    return assignments
+
+
 def parallel_run(cases: list[TorchCase], global_num_proc: int = 8) -> None:
     """Run a group of test cases in parallel, assigning disjoint device slices to each.
 
     Args:
         cases: List of TorchCase descriptors to run concurrently.
             The sum of all ``num_proc`` values must not exceed ``global_num_proc``.
-        global_num_proc: Total device budget for this group. Defaults to 8.
+        global_num_proc: Maximum device budget for this group. Defaults to 8.
+            When ASCEND_RT_VISIBLE_DEVICES is set, NPU cases receive disjoint
+            slices of those IDs, capped by this budget. Unset visibility and CPU
+            cases retain the zero-based allocation.
 
     Raises:
-        AssertionError: If the total device count exceeds ``global_num_proc``, if any
-            case times out (900 s deadline), or if any child process exits with a
-            non-zero return code.
+        ValueError: If process counts are not positive integers, the inherited
+            device selection is malformed, or the cases exceed the available budget.
+        AssertionError: If any case times out (420 s join timeout), or if any
+            child process exits with a non-zero return code.
     """
+    assignments = _device_assignments(cases, global_num_proc)
+
     # auto-assign ports before spawning children (avoids cross-process races)
     unassigned = [c for c in cases if c.master_port is None]
     if unassigned:
         _auto_assign_ports(unassigned)
-
-    # assign devices
-    sum_num_proc = 0
-    assignments = []
-
-    for case in cases:
-        num = case.num_proc
-        devices = list(range(sum_num_proc, sum_num_proc + num))
-        assignments.append(devices)
-        sum_num_proc += num
-    # assert sum num_proc
-    assert sum_num_proc <= global_num_proc, (f"sum num_proc {sum_num_proc} greater than "
-                                             f"global_num_proc {global_num_proc}")
 
     # create child process (run_case calls os.setsid to own a process group,
     # so os.killpg on timeout kills torchrun workers too)
