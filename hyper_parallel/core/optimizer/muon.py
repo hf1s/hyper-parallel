@@ -1069,9 +1069,21 @@ class Muon(BaseDistributedOptimizer):
             hsdp_assign: HSDPGroupAssignment,
     ) -> None:
         """Fused broadcast and apply for shard-group updates."""
-        lr = group["lr"]
-        weight_decay = group["weight_decay"]
         shard_sizes, local_coords, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
+        if total_shard_size == 1:
+            # No communication is needed, so preserve the computed update precision.
+            local_params = []
+            update_shards = []
+            for param in valid_params:
+                local_param = to_local_if_dtensor(param.data)
+                update = chunk_update_by_layout(
+                    my_updates[param], param, hsdp_assign.layout_spec, self._param_shard_metadata.get(param)
+                )
+                local_params.append(local_param)
+                update_shards.append(update.view(local_param.shape))
+            self._apply_local_updates(local_params, update_shards, group)
+            return
+
         device = to_local_if_dtensor(valid_params[0].data).device
 
         coord_groups: Dict[Tuple[int, ...], List[torch.nn.Parameter]] = defaultdict(list)
@@ -1134,9 +1146,20 @@ class Muon(BaseDistributedOptimizer):
                 all_local_params.append(local_param)
                 all_update_shards.append(update_to_apply.view(local_param.shape))
 
+        self._apply_local_updates(all_local_params, all_update_shards, group)
+
+    @staticmethod
+    def _apply_local_updates(
+            all_local_params: List[torch.Tensor],
+            all_update_shards: List[torch.Tensor],
+            group: Dict[str, Any],
+    ) -> None:
+        """Apply local Muon updates after layout mapping or broadcast."""
         if not all_local_params:
             return
 
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
         if weight_decay != 0.0:
             coeff = 1.0 - lr * weight_decay
             # pylint: disable=protected-access
