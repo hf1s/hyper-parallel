@@ -75,8 +75,10 @@ def get_torch_device() -> Any:
         return torch.cuda
 
 
-def get_device_id() -> int:
-    """Get current device id based on device type."""
+def get_device_id() -> Optional[int]:
+    """Return the accelerator index, or None for an unindexed CPU device."""
+    if get_device_type() == "cpu":
+        return None
     return get_torch_device().current_device()
 
 
