@@ -32,16 +32,17 @@ if IS_NPU_AVAILABLE:
 
 
 def enable_high_precision_for_bf16() -> None:
-    """
-    Set high accumulation dtype for matmul and reduction.
+    """Disable reduced-precision matmul paths supported by the active backend.
+
+    CUDA also disables reduced-precision BF16 reductions. On NPU, this helper
+    disables HF32 for FP32 matmuls; it does not change BF16 accumulation behavior.
     """
     if IS_CUDA_AVAILABLE:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
     if IS_NPU_AVAILABLE:
-        torch.npu.matmul.allow_tf32 = False
-        torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.npu.matmul.allow_hf32 = False
 
 
 def enable_full_determinism(seed: int) -> None:
