@@ -42,6 +42,33 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
 
 ---
+## JT DeepSeek V3 MF parity：CANN8.5 step302 对齐进展
+
+当前对齐入口：
+
+- 分支：[`feat/jt-muon-mf-clean-2step`](https://github.com/hf1s/hyper-parallel/tree/feat/jt-muon-mf-clean-2step)
+- 配置：`examples/training_demo/jt_deepseek_v3/mf-alignment-2step.yaml`
+- 启动：`examples/training_demo/jt_deepseek_v3/mf-alignment-2step.sh`
+- 初始状态：`/workspace/mf-weights/native-step300/global_step_300`
+- 目标环境：CANN8.5、单卡、step 301–302
+
+当前证据：
+
+| 步骤 | clean 结果 | MF 对照 |
+|---|---:|---:|
+| 301 loss | `8.14211` | `8.142112` |
+| 301 grad_norm | `10.2844` | `10.284420` |
+| 302 loss | `7.8022` | `7.802559` |
+| 302 grad_norm | `12.7487` | `12.751572` |
+
+step301 的已记录第一偏差位置是 `output_layer.weight` 的 `main_grad`：
+
+```text
+MF Frobenius: 4.408915339919721
+HP Frobenius: 4.408915519714355
+```
+
+下一次 compact dump 比较 `output-head dY → dW`，分别记录 MF 与 HP 的 shape、dtype、Frobenius 和 raw hash。step302 的 optimizer/debug 临时输出不作为分支内容。
 
 ## 使用入口
 
