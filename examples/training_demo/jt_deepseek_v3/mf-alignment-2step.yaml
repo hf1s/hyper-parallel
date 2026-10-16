@@ -179,6 +179,8 @@ training:
   micro_batch_size: 1
   backend: hccl
   seed: 42
+  loss_association: mf
+  norm_dvm: true
   enable_full_determinism: true
   close_matmul_k_shift: false
 accelerator:

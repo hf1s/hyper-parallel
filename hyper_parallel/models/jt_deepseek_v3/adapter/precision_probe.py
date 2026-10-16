@@ -16,6 +16,7 @@
 """Opt-in, independent MF precision hypotheses and first-forward observations."""
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -706,7 +707,8 @@ def configure_precision(model, factors):
     if 'head-fp32-grad' in factors:
         model.lm_head.__class__ = MFOutputHead
         model.lm_head.alignment_native_gradient = 'head-native-grad' in factors
-    model.alignment_rope_fp32 = "rope" in factors
+        if os.environ.get("JT_HEAD_TRACE"):
+            model.lm_head.alignment_head_trace_directory = os.environ["JT_HEAD_TRACE"]
     model.alignment_mtp_global = "mtp-global" in factors
     for module in model.modules():
         if "norm" in factors and type(module) is jt.DeepseekV32RMSNorm:

@@ -36,6 +36,8 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     init_device: Literal["meta", "cpu", "cuda", "npu"] = "meta"
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
+    loss_association: Literal["stack", "mf"] = "stack"
+    norm_dvm: bool = False
     seed: Optional[int] = None
     enable_full_determinism: bool = False
     # None leaves CLOSE_MATMUL_K_SHIFT untouched (default); True/False force 1/0.
