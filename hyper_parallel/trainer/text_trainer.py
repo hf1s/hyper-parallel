@@ -14,7 +14,7 @@
 # limitations under the License.
 """Text Trainer assembled from the shared BaseTrainer stages."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Dict
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -218,24 +218,19 @@ class TextTrainer:
 
     def forward_backward_step(
             self,
-            data_iterator: Any,
-            num_micro_steps: int,
+            model_inputs: dict[str, Any],
+            loss_inputs: dict[str, Any],
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Fetch and execute one forward-backward micro-step.
+        """Execute one prepared micro-step using the whole step's token counts.
 
         Args:
-            data_iterator: Iterator providing one raw FB batch per call.
-            num_micro_steps: Number of FB steps in the current optimizer step.
+            model_inputs: Prepared model inputs for this micro-step.
+            loss_inputs: Prepared supervision for this micro-step.
 
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
-        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
-        self.base.step_token_counts = {
-            name: token_count * num_micro_steps
-            for name, token_count in self.base.current_token_counts.items()
-        }
         metric_inputs = {
             **model_inputs,
             **loss_inputs,
@@ -255,6 +250,12 @@ class TextTrainer:
 
         Returns:
             Aggregated loss and gradient norm for the completed step.
+
+        Note:
+            A batch callable's ``prepare_step`` method can defer large forward-only
+            inputs until each micro-step. Wrappers must forward this capability.
+            Plain callables fall back to caching complete inputs for the step, so
+            their input memory grows with the gradient-accumulation length.
         """
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
@@ -263,6 +264,17 @@ class TextTrainer:
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
+        # Valid supervision can differ between micro-batches. All micro-steps
+        # must divide by the same optimizer-step total, independently of DP size.
+        prepare_step = getattr(self.base.get_batch, "prepare_step", None)
+        if callable(prepare_step):
+            supervision, micro_batches = prepare_step(data_iterator, num_micro_steps)
+            self.base.step_token_counts = count_loss_token(supervision)
+            del supervision
+        else:
+            prepared = deque([self.base.get_batch(data_iterator) for _ in range(num_micro_steps)])
+            self.base.step_token_counts = count_loss_token([loss_inputs for _, loss_inputs in prepared])
+            micro_batches = (prepared.popleft() for _ in range(num_micro_steps))
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
@@ -273,10 +285,7 @@ class TextTrainer:
                 num_micro_steps,
             )
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            loss, loss_dict = self.forward_backward_step(
-                data_iterator,
-                num_micro_steps,
-            )
+            loss, loss_dict = self.forward_backward_step(*next(micro_batches))
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
