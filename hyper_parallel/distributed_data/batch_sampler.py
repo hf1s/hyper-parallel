@@ -139,6 +139,15 @@ class BatchSamplerReader:
         """Return the native global cursor before this pending round."""
         return self._committed_state["consumed_samples"]
 
+    @property
+    def optimizer_step_remaining(self) -> int:
+        """Return undelivered rounds before the next native optimizer boundary."""
+        round_size = self._sampler.global_micro_batch_size
+        accumulation_steps = self._sampler.global_batch_size // round_size
+        delivered = self._window.delivered_rounds if self._window is not None else 0
+        position = self.batch_position // round_size + delivered
+        return accumulation_steps - position % accumulation_steps
+
     def prepare_next_step(self) -> None:
         """Activate the next window only after the current window is delivered."""
         if self._window is not None or self._exhausted:
@@ -278,11 +287,12 @@ class BatchSamplerReader:
             (item.key, self._window.samples[item.key]) for item in self.metadata() if item.key in selected_keys
         )
 
-    def commit(self, selected_keys: set[SampleKey]) -> None:
+    def commit(self, selected_keys: set[SampleKey], *, prefetch_window: bool = True) -> None:
         """Retire delivered occurrences and commit the cursor at the window end.
 
         Args:
             selected_keys: Source-owned occurrences delivered in this distributed round.
+            prefetch_window: Start source lookahead unless a step producer owns prefetch.
         """
         window = self._window
         remaining = {item.key for item in self.metadata()}
@@ -298,7 +308,8 @@ class BatchSamplerReader:
         if last_round:
             self._committed_state = window.sampler_state
             self._window = None
-        self._prefetch_next_window()
+        if prefetch_window:
+            self._prefetch_next_window()
 
     @property
     def window_partially_delivered(self) -> bool:

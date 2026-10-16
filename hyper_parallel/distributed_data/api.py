@@ -37,6 +37,7 @@ from hyper_parallel.distributed_data.data_constructor import (
 )
 from hyper_parallel.distributed_data.device_prefetch import _create_device_prefetcher, _resolve_device
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.optimizer_step import OptimizerStepDataLoader
 from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm
 from hyper_parallel.distributed_data.cost_model import CostModel
 from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
@@ -565,7 +566,7 @@ def build_distributed_dataloader(
         model_config: Any = None,
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
-) -> DistributedDataLoader | LocalBalancingDataLoader:
+) -> DistributedDataLoader | OptimizerStepDataLoader | LocalBalancingDataLoader:
     """Build a sample-balanced distributed DataLoader.
 
     Online mode without ``batch_sampler`` requires ``external_step_source``.
@@ -580,7 +581,9 @@ def build_distributed_dataloader(
     With ``batch_sampler``, native HP sampling owns step selection:
     ``balance_window_size`` consecutive sampler yields per DP Constructor are
     planned together, stopping at optimizer and epoch boundaries. Each iterator
-    yield still returns exactly one forward/backward round.
+    yield still returns exactly one forward/backward round. With gradient
+    accumulation, complete optimizer steps are double-buffered through input
+    broadcast and H2D, independently of the balancing window size.
     Dataset outputs stay whole by default. Online ``split_fn`` decomposes each
     selected output into independent sequences; ``pack_fn`` rebuilds the planned
     bins without changing the original sampler window's sample membership.
@@ -716,7 +719,7 @@ def _build_distributed_dataloader_impl(
         model_config: Any = None,
         cost_model: CostModel | None = None,
         balancing_algorithm: BalancingAlgorithm | None = None,
-) -> DistributedDataLoader:
+) -> DistributedDataLoader | OptimizerStepDataLoader:
     if communication_device is None:
         communication_device = _resolve_device(communication_backend=getattr(config, "communication_backend", "hccl"))
     if getattr(config, "balance_group_size", None) is not None:
@@ -754,7 +757,7 @@ def _build_distributed_dataloader_impl(
         model_device=state.communication_device,
     )
 
-    return DistributedDataLoader(
+    loader = DistributedDataLoader(
         initial_epoch=batch_sampler.epoch,
         topology=state.topology,
         dataset_reader_ranks=state.dataset_reader_ranks,
@@ -780,6 +783,14 @@ def _build_distributed_dataloader_impl(
             ),
         ),
         device_prefetch=device_prefetch if state.topology.is_constructor else None,
+    )
+    accumulation_steps = batch_sampler.global_batch_size // batch_sampler.global_micro_batch_size
+    if accumulation_steps == 1:
+        return loader
+    round_in_step = batch_sampler.consumed_samples // batch_sampler.global_micro_batch_size % accumulation_steps
+    return OptimizerStepDataLoader(
+        loader, accumulation_steps=accumulation_steps,
+        first_step_rounds=accumulation_steps - round_in_step, device=device,
     )
 
 

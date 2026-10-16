@@ -101,7 +101,7 @@ class TestNativeBatchSampler(unittest.TestCase):
     def test_fixed_membership_without_dynamic_selection(self) -> None:
         """Feature: Fixed native round membership.
         Description: Read short samples with online and offline metadata.
-        Expectation: Each batch retains the native indices and prefetch reads only the next round.
+        Expectation: Each batch retains native indices and prefetch stays within the current and next optimizer steps.
         """
         for metadata_mode in (False, True):
             with self.subTest(metadata_mode=metadata_mode):
@@ -109,10 +109,10 @@ class TestNativeBatchSampler(unittest.TestCase):
                 loader = _loader(dataset, metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
                 loader.wait_for_prefetch()
-                self.assertEqual(sorted(dataset.reads), [0, 1, 2, 3])
+                self.assertEqual(sorted(dataset.reads), list(range(8)))
                 self.assertEqual(_batch_ids(next(loader)), [2, 3])
                 loader.wait_for_prefetch()
-                self.assertEqual(sorted(dataset.reads), [0, 1, 2, 3, 4, 5])
+                self.assertEqual(sorted(dataset.reads), list(range(8)))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_native_mode_does_not_construct_dynamic_selector(self) -> None:
@@ -162,7 +162,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                         batch_sampler=_sampler(index_mapping=[3] * 10), **options,
                         device="cpu", cost_model=lambda metadata: metadata.cost,
                 ) as loader:
-                    reader = loader._planning_reader()
+                    reader = loader._source._planning_reader()
                     reader.prepare_next_step()
                     first, second = reader.metadata()
                     self.assertIsInstance(first, SampleMetadata)
@@ -171,7 +171,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                     self.assertEqual((first.key, second.key), (SampleKey(0, 3, 0), SampleKey(0, 3, 1)))
                     self.assertEqual(_batch_ids(next(loader)), [3, 3])
                     loader.wait_for_prefetch()
-                    self.assertEqual(dataset.reads, [3, 3, 3, 3])
+                    self.assertEqual(dataset.reads, [3] * 8)
                     self.assertEqual(len(set(loader.last_plan.selected_keys)), 2)
                 self.assertIsNone(shared_metadata.key)
 
@@ -187,7 +187,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                 loader = _loader(_TrackedDataset(), sampler=sampler, metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
                 loader.wait_for_prefetch()
-                self.assertEqual(sampler.consumed_samples, 4)
+                self.assertEqual(sampler.consumed_samples, 8)
                 state = loader.state_dict()
                 owner = "metadata_reader" if metadata_mode else "dataset_reader"
                 self.assertEqual(state[owner]["sampler"]["consumed_samples"], 2)
@@ -306,11 +306,11 @@ class TestNativeBatchSampler(unittest.TestCase):
             batch_sampler=_sampler(), metadata_fn=_metadata,
             device="cpu", cost_model=lambda metadata: metadata.cost,
         )
-        with patch.object(loader._dataset_reader, "_metadata_fn", side_effect=failure):
+        with loader, patch.object(loader._source._dataset_reader, "_metadata_fn", side_effect=failure):
             with self.assertRaises(ValueError) as caught:
                 next(loader)
         self.assertIs(caught.exception, failure)
-        self.assertEqual(loader._dataset_reader.state_dict()["sampler"]["consumed_samples"], 0)
+        self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_invalid_native_sampler_options_fail_at_build(self) -> None:

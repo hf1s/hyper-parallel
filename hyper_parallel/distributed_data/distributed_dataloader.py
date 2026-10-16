@@ -179,6 +179,30 @@ class DistributedDataLoader(Iterator[Any]):
         self._start_prefetch()
         return data
 
+    def prepare_batch(self) -> Any:
+        """Construct one round on the owning step producer without source lookahead.
+
+        The optimizer-step loader serializes calls on its device-bound thread.
+        Keeping all data collectives on that thread prevents training hooks
+        from racing ahead of an unfinished data transaction.
+        """
+        if self._stopped:
+            raise StopIteration
+        batch = self._prepare_next_batch()
+        if isinstance(batch, DevicePrefetchedStep):
+            batch = batch.take_batch()
+        return self._consume_batch(self._broadcast_batch(batch), prefetch_window=False)
+
+    def optimizer_step_remaining(self) -> int:
+        """Recover a legacy checkpoint boundary on the owning step producer.
+
+        Only constructors retain the native sampler cursor. Model peers need
+        the same boundary before preparing their first restored optimizer step.
+        """
+        reader = self._planning_reader()
+        remaining = reader.optimizer_step_remaining if reader is not None else None
+        return self._model_transport.broadcast(remaining)
+
     @property
     def _caller_collectives(self) -> bool:
         return self._data_plane.communication_backend in ("hccl", "nccl")
@@ -245,7 +269,7 @@ class DistributedDataLoader(Iterator[Any]):
         """Broadcast the constructed batch to model-parallel peers on the caller thread."""
         return self._model_transport.broadcast(constructed_batch)
 
-    def _consume_batch(self, received: Any) -> Any:
+    def _consume_batch(self, received: Any, *, prefetch_window: bool = True) -> Any:
         """Validate the batch, commit Reader progress, and return its training data."""
         if received is None:
             self._stopped = True
@@ -257,7 +281,7 @@ class DistributedDataLoader(Iterator[Any]):
         # have both succeeded, leaving checkpoint boundaries unambiguous.
         planning_reader = self._planning_reader()
         if planning_reader is not None:
-            planning_reader.commit(self._pending_local_keys)
+            planning_reader.commit(self._pending_local_keys, prefetch_window=prefetch_window)
         self._pending_local_keys.clear()
         if self._pending_plan is not None:
             self._last_plan = self._pending_plan

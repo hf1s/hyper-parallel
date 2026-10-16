@@ -24,6 +24,7 @@ from hyper_parallel.distributed_data.balancing_algorithm import (
 from hyper_parallel.distributed_data.cost_model import BackboneFlopsConfig, CostModel, DefaultCostModel
 from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.optimizer_step import OptimizerStepDataLoader
 from hyper_parallel.distributed_data.external_step import ExternalStepSource
 from hyper_parallel.distributed_data.indexed_text import (
     collate_indexed_text_sequences,
@@ -47,6 +48,7 @@ __all__ = [
     "CostModel",
     "DefaultCostModel",
     "DistributedDataLoader",
+    "OptimizerStepDataLoader",
     "DistributedDatasetConfig",
     "DistributedPackingPlan",
     "ExternalStepSource",

@@ -243,21 +243,26 @@ This can improve a window even when document-level repacking fails. It does not
 change attention boundaries inside a pack. Single-round windows, multiple local
 packs per rank, and non-LPT custom policies retain their existing behavior.
 
-With `balance_window_size > 1`, native Readers keep two source windows. Once
-current-window delivery starts, a dedicated CPU reader begins loading the next
-window, including splitting records and extracting metadata. A slow next-window
-read does not block delivery of the current window's remaining micro-batches.
-For accumulation three and a window of three, the next optimizer step's reads
-start before the first current micro-batch begins computing. Planning and accelerator
-transfers still follow the existing per-micro-batch hooks; the future window is
-planned when it becomes current. At a window boundary, `prefetch_plan()` can still
-wait for unfinished source reads before launching metadata communication.
-Metadata mode prefetches only indexed metadata and still fetches payloads after planning.
+With gradient accumulation greater than one, native loading uses
+`OptimizerStepDataLoader` to buffer complete optimizer steps. A persistent
+producer prepares every micro-batch in the current step before its first batch
+is returned. It then immediately prepares the entire next step: Dataset reads,
+splitting and metadata, window-level balancing, per-micro-batch A2A,
+packing/collation, H2D, and model-peer input broadcasts. Data collectives run
+in order on dedicated groups and a producer-owned device stream. A step is
+published after its completion event; consumption records the training stream
+on the returned tensor storage.
 
-At most the current window's remaining source samples and one future window are
-retained in host memory. Larger windows increase host memory and initial latency;
-`balance_window_size=1` retains ordinary one-micro-batch prefetching. `close()` drains
-the extra reader before returning, and epoch changes discard its speculative work.
+Prefetch size follows gradient accumulation, independently of
+`balance_window_size`. Accumulation ten and a three-round balancing window
+still plan `3 + 3 + 3 + 1`, while all ten device batches are prepared ahead.
+At most the remaining current-step inputs and one future step are buffered;
+the producer does not start a third step until the second becomes current.
+This increases startup latency and device input memory compared with one-round
+prefetch. The source's separate window lookahead is disabled in this path.
+Without gradient accumulation, ordinary micro-batch prefetch remains in use.
+A blocked or failed future step does not prevent delivery of current inputs;
+its error is raised when that step is requested. `close()` drains production.
 
 The Trainer retains its existing per-micro-batch loss normalization. If valid
 token counts differ between rounds, cross-round rearrangement can change token
@@ -267,9 +272,12 @@ Window-level token normalization is not enabled by this data-loading option.
 At a window boundary, checkpoints save the committed sampler cursor. Inside a
 window they additionally save the remaining plans, lightweight metadata, the
 sampler position after reading the window, and the number of delivered rounds.
-The prefetched future window is excluded, even if its read has already advanced
-the live sampler. Checkpoints use the active window's saved ending cursor rather
-than the live sampler cursor. They do not save raw sample tensors. Restore rereads
+The prefetched future step is excluded, even if production has already advanced
+the live sampler. Each buffered micro-batch carries a metadata-only checkpoint
+snapshot; the public cursor advances only when that batch is returned.
+The checkpoint also records rounds remaining before the next optimizer boundary.
+Checkpoints use the active window's saved ending cursor rather than the live
+sampler cursor. They do not save raw sample tensors. Restore rereads
 only the required source records and reuses the saved remaining plans, preserving
 the delivered prefix when the Dataset and split callback are deterministic.
 
@@ -358,9 +366,9 @@ Current boundaries of the native-sampler path:
   metadata. Shared-metadata reads also require deterministic, rank-independent
   Dataset outputs.
 - Save and restore through `loader.state_dict()` / `load_state_dict()`, not
-  through the original sampler: its live cursor may include one prefetched
-  round. Native cursor snapshots count Dataset-output occurrences, never tokens
-  or fragments, and can restore at a synchronized forward/backward boundary with
+  through the original sampler: its live cursor may include a complete prefetched
+  optimizer step. Native cursor snapshots count Dataset-output occurrences, never
+  tokens or fragments, and can restore at a synchronized forward/backward boundary with
   unchanged DP topology, global batch size, and sampler policy.
 - Whole-record loading preserves pre-collation Dataset fields. Repacking must
   preserve each independent sequence's tokens, shifted labels, attention and
@@ -541,8 +549,11 @@ run on the collated batch. Local-step loaders retain CPU inputs in
 `last_host_batch` for host metering.
 The old standalone trainer-owned device-prefetch slot has been removed.
 
-HCCL/NCCL collectives must be launched on the training thread in a consistent
-order. Both loader adapters expose the same idempotent scheduling hooks:
+HCCL/NCCL data collectives must be launched in a consistent order on their
+dedicated groups. With gradient accumulation, the native step producer completes all these
+stages independently; Trainer hooks are idempotent requests and never launch
+foreground data communication. Without accumulation, the micro-batch loader
+uses the following scheduling hooks:
 
 ```python
 batch = next(loader)
@@ -560,8 +571,8 @@ The length exchange and waiting for local metadata remain synchronous; this is
 not a fully nonblocking metadata pipeline.
 
 HP's Trainer invokes these hooks automatically before synchronizing loss.
-External training loops should invoke them at the same boundaries to overlap
-accelerator routing and final H2D. Without hooks, iteration remains correct,
+For the micro-batch path, external training loops should invoke them at the same
+boundaries to overlap accelerator routing and final H2D. Without hooks, iteration remains correct,
 but completes these stages at the next `next(loader)` call. Gloo preparation
 can run entirely in the producer thread. Overlap is not a guarantee that all
 loading time is hidden; that depends on compute time and data volume.

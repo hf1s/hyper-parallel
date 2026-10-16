@@ -25,7 +25,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, WorkloadCost
+from hyper_parallel.distributed_data import DistributedDatasetConfig, OptimizerStepDataLoader, SampleMetadata, WorkloadCost
 from hyper_parallel.distributed_data import build_distributed_dataloader
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import SampleKey
@@ -42,8 +42,9 @@ class _Mesh:
 def _loader(
         *, metadata_mode: bool = False, window: int = 3, broadcast_plan: bool = True,
         samples: object = None, accumulation: int = 10, workers: int = 0, persistent_workers: bool = True,
-        device: str = "cpu",
+        device: str = "cpu", optimizer_step: bool = False,
 ) -> object:
+    """Build the window pipeline, optionally retaining the outer step buffer."""
     if samples is None:
         samples = [{"id": index} for index in range(44)]
     sampler = build_dataset_batch_sampler(
@@ -52,7 +53,7 @@ def _loader(
     options = {"metadata": [SampleMetadata(1) for _ in range(len(samples))]} if metadata_mode else {
         "metadata_fn": lambda _: SampleMetadata(1),
     }
-    return build_distributed_dataloader(
+    loader = build_distributed_dataloader(
         samples, _Mesh(),
         DistributedDatasetConfig(
             seq_len=8, local_batch_size=2, communication_backend="gloo",
@@ -61,6 +62,7 @@ def _loader(
         ),
         batch_sampler=sampler, cost_model=lambda item: item.cost, device=device, **options,
     )
+    return loader._source if isinstance(loader, OptimizerStepDataLoader) and not optimizer_step else loader
 
 
 def _ids(batch: tuple[dict, ...]) -> list[int]:

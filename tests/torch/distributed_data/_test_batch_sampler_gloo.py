@@ -398,6 +398,7 @@ def _run_full_pack_repair(mesh: object, accumulation: int, broadcast_plan: bool)
         )
 
     delivered, window_tokens, window_positions = [], Counter(), Counter()
+    window_objective = 0
     saved = None
     with build_loader() as loader:
         for step, batch in enumerate(loader):
@@ -414,13 +415,15 @@ def _run_full_pack_repair(mesh: object, accumulation: int, broadcast_plan: bool)
             plans = _gather(loader.last_plan)
             assert plans[0] == plans[2], f"Repaired plans differ: plans={plans}"
             window_positions.update(key.global_sample_position for key in plans[0].selected_keys)
+            window_objective += max(cost.llm for cost in plans[0].rank_costs)
             if step == 0:
                 saved = loader.state_dict()
-                if dist.get_rank() == 0:
-                    decision = loader._planner.last_balance_decision
-                    assert decision["accepted"], f"Full-pack repair was not accepted: decision={decision}"
             if (step + 1) % accumulation == 0 or step == 6:
                 start = step // accumulation * accumulation
+                assert window_objective < (step + 1 - start) * 240, (
+                    f"Full-pack repair did not improve the delivered window: cost={window_objective}"
+                )
+                window_objective = 0
                 expected_positions = Counter({position: 3 for position in range(start * 2, (step + 1) * 2)})
                 expected_tokens = Counter(
                     (token, label) for position in range(start * 2, (step + 1) * 2)
