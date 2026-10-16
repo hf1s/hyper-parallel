@@ -15,6 +15,7 @@
 
 """Unit tests for the Muon optimizer."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -40,9 +41,59 @@ def _plain_ns_group(**overrides):
     return group
 
 
+@pytest.mark.parametrize("update_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("apply_lr_in_update", [False, True])
+@pytest.mark.parametrize("weight_decay", [0.0, 0.1])
+def test_single_shard_writeback_preserves_computed_updates(update_dtype, apply_lr_in_update, weight_decay):
+    """A singleton shard group must apply the supplied update without an extra cast."""
+    optimizer = object.__new__(Muon)
+    optimizer._param_shard_metadata = {}  # pylint: disable=protected-access
+    parameters = [torch.nn.Parameter(torch.tensor([[0.01, 0.02], [0.03, 0.04]])),
+                  torch.nn.Parameter(torch.tensor([[0.1, -0.2, 0.3]]))]
+    updates = [torch.tensor([[0.1234567, -0.2345678], [0.3456789, -0.456789]], dtype=update_dtype),
+               torch.tensor([[0.1234567, 0.3456789, -0.5678912]], dtype=update_dtype)]
+    originals = [update.clone() for update in updates]
+    group = _plain_ns_group(lr=1e-4, weight_decay=weight_decay, apply_lr_in_update=apply_lr_in_update)
+    alpha = 1.0 if apply_lr_in_update else -group["lr"]
+    expected = [parameter.detach().clone().mul_(1 - group["lr"] * weight_decay).add_(update, alpha=alpha)
+                for parameter, update in zip(parameters, updates)]
+
+    with patch.object(optimizer, "_get_shard_info", return_value=((1,), (0,), (None,), 1)), \
+            patch.object(optimizer, "_batched_relay_broadcast") as broadcast, torch.no_grad():
+        optimizer._fused_broadcast_and_apply(  # pylint: disable=protected-access
+            parameters, dict(zip(parameters, updates)), {parameter: (0,) for parameter in parameters},
+            group, SimpleNamespace(layout_spec=None))
+
+    broadcast.assert_not_called()
+    for actual, reference in zip(parameters, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for actual, original in zip(updates, originals):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
+
+
+def test_multi_shard_writeback_keeps_broadcast_packing():
+    """The singleton shortcut must not bypass the existing multi-shard broadcast."""
+    optimizer = object.__new__(Muon)
+    optimizer._param_shard_metadata = {}  # pylint: disable=protected-access
+    parameter = torch.nn.Parameter(torch.zeros(2, 2))
+    update = torch.tensor([[0.1234567, -0.2345678], [0.3456789, -0.456789]])
+    group = _plain_ns_group(lr=1e-4, weight_decay=0.0, apply_lr_in_update=True)
+    process_group = MagicMock()
+
+    with patch.object(optimizer, "_get_shard_info", return_value=((2,), (0,), (process_group,), 2)), \
+            patch.object(optimizer, "_batched_relay_broadcast") as broadcast, torch.no_grad():
+        optimizer._fused_broadcast_and_apply(  # pylint: disable=protected-access
+            [parameter], {parameter: update}, {parameter: (0,)}, group, SimpleNamespace(layout_spec=None))
+
+    broadcast.assert_called_once()
+    packed = broadcast.call_args.args[0][(0,)]
+    assert packed.dtype == torch.bfloat16, f"expected={torch.bfloat16}, got={packed.dtype}"
+    torch.testing.assert_close(parameter, update.bfloat16().float(), rtol=0, atol=0)
+
+
 def test_compute_batched_ns_updates_accepts_plain_parameter_without_sharding():
     """The no-shard path should support ordinary torch parameters."""
-    optimizer = Muon.__new__(Muon)
+    optimizer = object.__new__(Muon)
     optimizer.reshape_fn = None
     optimizer.ns_transform_fn = None
     optimizer.zeropower_fn = None
@@ -58,7 +109,7 @@ def test_compute_batched_ns_updates_accepts_plain_parameter_without_sharding():
 
 def test_compute_batched_ns_updates_with_transform_accepts_plain_parameter():
     """The ns_transform_fn routing path should also support plain parameters."""
-    optimizer = Muon.__new__(Muon)
+    optimizer = object.__new__(Muon)
     optimizer.reshape_fn = None
     optimizer.ns_transform_fn = lambda param_fqn, ns_input: None
     optimizer.zeropower_fn = None
