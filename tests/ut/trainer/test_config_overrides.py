@@ -89,6 +89,19 @@ class TestConfigOverrides(unittest.TestCase):
             config.model.activation, "gelu",
             msg=f"case: keyword_default_is_filled, activation={config.model.activation!r}")
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_matmul_k_shift_policy_default_and_override(self) -> None:
+        """Keep deterministic matmul defaults and resolve explicit boolean overrides."""
+        self.assertIs(self._parse().training.close_matmul_k_shift, True)
+        config = self._parse("--training.close_matmul_k_shift=false")
+        self.assertIs(config.training.close_matmul_k_shift, False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yaml_path = Path(tmpdir) / "train.yaml"
+            content = _SAMPLE_YAML.format(module=__name__) + "\ntraining:\n  close_matmul_k_shift: false\n"
+            yaml_path.write_text(content, encoding="utf-8")
+            config = parse_training_args([str(yaml_path)])
+        self.assertIs(config.training.close_matmul_k_shift, False)
+
     def test_scalar_overrides_are_coerced(self) -> None:
         """Scalar overrides are coerced against the declared annotations."""
         config = self._parse("--model.width=16", "--model.depth=3", "--model.activation=silu")
