@@ -246,6 +246,12 @@ checkpoint:
   checkpoint_dir: ./output/training_demo/deepseek_v41/checkpoints
   restore_from: null
 
+profiler:
+  enabled: false
+  trace_handler:
+    analyse_flag: true
+    async_mode: false
+
 debug:
   check_nan_inf: false
   check_dataset: null

@@ -29,6 +29,7 @@ from typing import Dict, Optional
 
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
+from tests.common.mark_utils import arg_mark
 
 
 def _sample_model(  # pylint: disable=unused-argument
@@ -58,6 +59,10 @@ model:
 optimizer:
   _target_: {module}._sample_optimizer
   learning_rate: 0.01
+profiler:
+  trace_handler:
+    analyse_flag: false
+    async_mode: true
 """
 
 
@@ -96,6 +101,48 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertEqual(
             config.model.activation, "silu",
             msg=f"case: str_coercion, activation={config.model.activation!r}")
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_profiler_analysis_flags_from_yaml_and_cli(self) -> None:
+        """Resolve analysis options from YAML and command-line overrides.
+
+        Feature: Configurable NPU trace parsing.
+        Description: Read train.yaml flags, then override both using dotted CLI arguments.
+        Expectation: Both paths produce the requested boolean values.
+        """
+        config = self._parse()
+        self.assertIs(config.profiler.trace_handler.analyse_flag, False)
+        self.assertIs(config.profiler.trace_handler.async_mode, True)
+        config = self._parse("--profiler.trace_handler.analyse_flag=true", "--profiler.trace_handler.async_mode=false")
+        self.assertIs(config.profiler.trace_handler.analyse_flag, True)
+        self.assertIs(config.profiler.trace_handler.async_mode, False)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_profiler_analysis_flags_reject_invalid_cli_values(self) -> None:
+        """Reject non-boolean CLI values for analysis flags.
+
+        Feature: Typed profiler configuration.
+        Description: Override each analysis flag with an integer or unknown string.
+        Expectation: Resolution fails at the corresponding profiler field.
+        """
+        for field in ("analyse_flag", "async_mode"):
+            for value in ("1", "invalid"):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ConfigResolutionError, rf"CLI\.profiler\.trace_handler\.{field}"):
+                        self._parse(f"--profiler.trace_handler.{field}={value}")
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_analysis_flags_require_trace_handler_scope(self) -> None:
+        """Reject ambiguous analysis flags at the collection scope.
+
+        Feature: Trace-handler configuration ownership.
+        Description: Override each analysis flag directly under profiler.
+        Expectation: The resolver reports an unknown field on ProfilingConfig.
+        """
+        for field in ("analyse_flag", "async_mode"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ConfigResolutionError, rf"unknown field '{field}' on ProfilingConfig"):
+                    self._parse(f"--profiler.{field}=true")
 
     def test_optimizer_target_argument(self) -> None:
         """``--optimizer.<arg>`` reaches the optimizer target through the shorthand."""
