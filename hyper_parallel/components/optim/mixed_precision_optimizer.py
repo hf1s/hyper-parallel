@@ -315,6 +315,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         }
         return state_dict
 
+    def state_dict_for_load(self) -> dict[str, Any]:
+        """Include main weights in the inner optimizer's compatible load skeleton."""
+        state_dict = self.optimizer.state_dict_for_load()
+        state_dict[MIXED_PRECISION_OPTIMIZER_STATE_KEY] = {
+            FP32_MAIN_PARAM_STATE_KEY: dict(self._main_param_by_fqn),
+        }
+        return state_dict
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore optimizer moments and explicit fp32 main weights.
 

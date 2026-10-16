@@ -78,6 +78,7 @@ class MuonPostUpdateContext:
 _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "ns_coefficients": None,
     "ns_epsilon": 1e-10,
+    "ns_dtype": "bfloat16",
     "zeropower_fn": None,
     "momentum_update_fn": None,
     "reshape_fn": None,
@@ -94,6 +95,7 @@ class _MuonAdvancedOptions:
 
     ns_coefficients: Optional[Sequence[Tuple[float, float, float]]]
     ns_epsilon: float
+    ns_dtype: str
     zeropower_fn: Optional[Callable[..., torch.Tensor]]
     momentum_update_fn: Optional[Callable[..., torch.Tensor]]
     reshape_fn: Optional[Callable[..., Any]]
@@ -111,6 +113,14 @@ def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOpti
     resolved = dict(_MUON_ADVANCED_DEFAULTS)
     resolved.update(options)
     return _MuonAdvancedOptions(**resolved)
+
+
+def _ns_dtype(group: Dict[str, Any]) -> torch.dtype:
+    """Resolve a checkpoint-safe NS precision setting, including legacy groups."""
+    value = group.get("ns_dtype", "bfloat16")
+    if not isinstance(value, str) or value not in ("bfloat16", "float32"):
+        raise ValueError(f"ns_dtype must be 'bfloat16' or 'float32', got {value!r}")
+    return torch.bfloat16 if value == "bfloat16" else torch.float32
 
 
 _TransformNSState = Dict[str, Any]
@@ -196,6 +206,7 @@ class Muon(BaseDistributedOptimizer):
     """
 
     ADDITIONAL_CONFIG_KEYS = set(_MUON_ADVANCED_DEFAULTS)
+    LEGACY_PARAM_GROUP_DEFAULTS = {"ns_dtype": "bfloat16"}
 
     def __init__(
             self,
@@ -223,6 +234,9 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: Newton-Schulz coefficient variant.
             ns_coefficients: Optional custom Newton-Schulz coefficients.
             ns_epsilon: Numerical stability term used during normalization.
+            ns_dtype: NS input, computation and relay dtype: ``"bfloat16"``
+                (default) or ``"float32"``. The latter uses more memory and may
+                be slower; backend matmul precision settings are unchanged.
             zeropower_fn: Optional Newton-Schulz implementation override.
             momentum_update_fn: Optional momentum update implementation override.
             reshape_fn: Optional logical-matrix reshape function.
@@ -233,6 +247,7 @@ class Muon(BaseDistributedOptimizer):
             hsdp_replica_count: Optional optimizer-state replica group size.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        _ns_dtype({"ns_dtype": advanced.ns_dtype})
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -261,6 +276,7 @@ class Muon(BaseDistributedOptimizer):
             "ns_variant": ns_variant,
             "ns_coefficients": normalized_coefficients,
             "ns_epsilon": advanced.ns_epsilon,
+            "ns_dtype": advanced.ns_dtype,
             "zero_rms_scale_mode": advanced.zero_rms_scale_mode,
             "apply_lr_in_update": advanced.apply_lr_in_update,
         }
@@ -274,6 +290,8 @@ class Muon(BaseDistributedOptimizer):
 
     def reset_optimizer_parameters(self) -> None:
         """Rebuild all parameter-identity caches from current param groups."""
+        for group in self.param_groups:
+            _ns_dtype(group)
         self._group_dtensor_by_mesh()
         self._build_param_shard_metadata()
         deduced_count = self._auto_deduce_replica_count()
@@ -285,6 +303,45 @@ class Muon(BaseDistributedOptimizer):
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Restore NS precision; checkpoints without the field retain BF16 behavior."""
+        self.validate_checkpoint_state_dict(state_dict)
+        groups = []
+        for saved_group in state_dict["param_groups"]:
+            group = dict(saved_group)
+            for key, value in self.LEGACY_PARAM_GROUP_DEFAULTS.items():
+                group.setdefault(key, value)
+            _ns_dtype(group)
+            groups.append(group)
+        restored = dict(state_dict, param_groups=groups)
+        super().load_state_dict(restored)
+
+    @staticmethod
+    def validate_checkpoint_state_dict(state_dict: Dict[str, Any]) -> None:
+        """Validate saved precision before any optimizer in a chain replaces its state.
+
+        Args:
+            state_dict: Raw or FQN-keyed state, optionally flattened and merged
+                with other optimizer families. Only explicit NS precision fields
+                are checked; absent fields retain the historical BF16 default.
+        """
+        if "param_groups" in state_dict:
+            for group in state_dict["param_groups"]:
+                _ns_dtype(group)
+        else:
+            for key, value in state_dict.items():
+                if key.startswith("param_groups.") and key.endswith(".ns_dtype"):
+                    _ns_dtype({"ns_dtype": value})
+
+    def state_dict_for_load(self) -> Dict[str, Any]:
+        """Build a DCP load skeleton with historical defaults for absent fields."""
+        state_dict = self.state_dict()
+        state_dict["param_groups"] = [
+            dict(group, **self.LEGACY_PARAM_GROUP_DEFAULTS)
+            for group in state_dict["param_groups"]
+        ]
+        return state_dict
 
     @staticmethod
     def _validate_ns_coefficients(
@@ -340,6 +397,8 @@ class Muon(BaseDistributedOptimizer):
             The closure loss when provided, otherwise ``None``.
         """
         loss = None
+        for group in self.param_groups:
+            _ns_dtype(group)
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
@@ -493,7 +552,8 @@ class Muon(BaseDistributedOptimizer):
             group: Dict[str, Any],
             params: List[torch.Tensor],
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
-        """Compute first-order momentum and return bfloat16 NS inputs."""
+        """Compute first-order momentum and return NS inputs in the group dtype."""
+        ns_dtype = _ns_dtype(group)
         momentum = group["momentum"]
         if not isinstance(momentum, (list, tuple)):
             momentum = [momentum]
@@ -526,7 +586,8 @@ class Muon(BaseDistributedOptimizer):
                     "momentum_update_fn must return one update tensor per input gradient, "
                     f"got {len(custom_updates)} updates for {len(valid_params)} gradients"
                 )
-            custom_updates = [update.to(torch.bfloat16) for update in custom_updates]
+            # NS restoration mutates its inputs; callbacks may return live grads or momentum buffers.
+            custom_updates = [update.to(ns_dtype, copy=True) for update in custom_updates]
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
@@ -543,8 +604,7 @@ class Muon(BaseDistributedOptimizer):
             torch._foreach_mul_(local_us, momentum1)
             torch._foreach_add_(local_us, grads)
 
-        if local_us[0].dtype != torch.bfloat16:
-            local_us = [update.to(torch.bfloat16) for update in local_us]
+        local_us = [update.to(ns_dtype) for update in local_us]
 
         param_updates = dict(zip(valid_params, local_us))
         return param_updates
@@ -567,7 +627,7 @@ class Muon(BaseDistributedOptimizer):
 
         shape_groups = self._group_by_shape(list(param_to_ns_input.keys()))
         for _, p_list in shape_groups.items():
-            safe_batches = self._split_into_memory_safe_batches(p_list, shard_size=1)
+            safe_batches = self._split_into_memory_safe_batches(p_list, shard_size=1, dtype=_ns_dtype(group))
 
             for sub_batch in safe_batches:
                 updates_dict = self._compute_batched_ns_updates(
@@ -624,6 +684,7 @@ class Muon(BaseDistributedOptimizer):
             valid_params,
             param_to_ns_input,
             self._param_shard_metadata,
+            dtype=_ns_dtype(group),
         )
         param_shard_metadata = [self._param_shard_metadata.get(p) for p in valid_params]
         gathered_list = fused_allgather_dtensor_params(
@@ -643,7 +704,8 @@ class Muon(BaseDistributedOptimizer):
         if my_params:
             shape_groups = self._group_by_shape(my_params)
             for _, p_list in shape_groups.items():
-                safe_batches = self._split_into_memory_safe_batches(p_list, shard_size=total_shard_size)
+                safe_batches = self._split_into_memory_safe_batches(
+                    p_list, shard_size=total_shard_size, dtype=_ns_dtype(group))
                 for sub_batch in safe_batches:
                     updates_dict = self._compute_batched_ns_updates(
                         sub_batch, gathered_inputs, group
@@ -696,7 +758,7 @@ class Muon(BaseDistributedOptimizer):
 
             if valid_params:
                 safe_batches = self._split_into_memory_safe_batches(
-                    valid_params, shard_size=total_shard_size, min_batch_size=total_shard_size
+                    valid_params, shard_size=total_shard_size, min_batch_size=total_shard_size, dtype=_ns_dtype(group)
                 )
                 for sub_batch in safe_batches:
                     my_updates, param_compute_coord = self._gather_and_compute_shard_updates(
@@ -893,14 +955,16 @@ class Muon(BaseDistributedOptimizer):
             p_list: List[torch.nn.Parameter],
             shard_size: int = 1,
             min_batch_size: int = 1,
+            dtype: torch.dtype = torch.bfloat16,
     ) -> List[List[torch.nn.Parameter]]:
         """Split parameters into memory-safe batches to prevent OOM during NS.
 
-        The per-batch element limit is scaled down by shard_size to account
-        for the memory amplification from allgather. Sharded paths prioritize
-        filling the compute-owner ranks before applying this soft limit.
+        The one-GiB input budget accounts for dtype and shard_size before
+        allgather amplification. Sharded paths prioritize filling compute-owner
+        ranks before this soft limit; a single parameter is never split.
         """
-        max_numel_per_batch = 512 * 1024 * 1024 // shard_size
+        element_size = torch.empty(0, dtype=dtype).element_size()
+        max_numel_per_batch = 1024 * 1024 * 1024 // element_size // shard_size
         min_batch_size = max(1, min_batch_size)
 
         batches = []
@@ -1082,7 +1146,8 @@ class Muon(BaseDistributedOptimizer):
         all_update_shards: List[torch.Tensor] = []
 
         alignment_bytes = 512
-        element_size = torch.empty(0, dtype=torch.bfloat16, device=device).element_size()
+        ns_dtype = _ns_dtype(group)
+        element_size = torch.empty(0, dtype=ns_dtype, device=device).element_size()
         alignment_elements = max(1, alignment_bytes // element_size)
 
         pack_buffers: Dict[Tuple[int, ...], torch.Tensor] = {}
@@ -1100,7 +1165,7 @@ class Muon(BaseDistributedOptimizer):
                 total_padded_numel += padded_numel
 
             coord_param_offsets[coord] = param_offsets
-            pack_buffer = torch.empty(total_padded_numel, dtype=torch.bfloat16, device=device)
+            pack_buffer = torch.empty(total_padded_numel, dtype=ns_dtype, device=device)
 
             if is_compute_rank:
                 for p, (offset, actual_numel, padded_numel) in zip(coord_params, param_offsets):
