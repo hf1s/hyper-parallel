@@ -72,6 +72,34 @@ The following items remain open and are not implemented by this branch:
 
 No claim is made here that these items are resolved.
 
+## MF MTP `final_layernorm` recompute localization (docs-only)
+
+A separate backward-graph item was localized on the MF side: the MTP
+`final_layernorm` backward falls inside the recompute subgraph because the whole
+`MultiTokenPredictionLayer` is `.recompute()`d, so `mtp_final_ln_dx` and
+`mtp_transformer_out_grad` are not bitwise against HP. The backbone `model.norm`
+is built outside the layer loop and never enters `LayerSetting`, so it is
+unaffected.
+
+Measured at MF step301 with `eq32 = (hp.view(uint32) == mf.view(uint32)).mean()`
+against HP 8.5 `/home/zth/tmp/mtpwalk-hp/<point>.npy`: untouched
+`mtp_final_ln_dx` eq32 `0.943068314`; the single key `final_layernorm\.norm: true`
+reaches only `0.951491642`; the two-key form (`final_layernorm\.norm` plus
+`final_layernorm\.cast`) reaches `1.000000000`; and `recompute: false` reaches
+`1.000000000` at a large memory cost. All four configurations produce the same
+step301 loss (`8.142111778259277`), so the forward is unchanged.
+
+Remaining unrelated residuals under `recompute: false`: `mtp_eh_proj_dy`
+`1.744e-3`, `mtp_hnorm_dx` `3.108e-3`, `mtp_enorm_dx` `2.863e-3`, pointing at the
+MTP `transformer_layer` backward internals.
+
+Details (problem, matrix, the four reference diffs, the
+`select_recompute_exclude` key semantics, and the archived-config caveat):
+[docs/mf-mtp-final-layernorm-recompute.md](https://github.com/hf1s/hyper-parallel/blob/mtp-final-layernorm-recompute/docs/mf-mtp-final-layernorm-recompute.md)
+in [PR #239](https://github.com/hf1s/hyper-parallel/pull/239). That PR is
+documentation-only and changes no behavior; this branch makes no bitwise claim
+beyond the numbers quoted above.
+
 ## Measurement scope lesson
 
 All numbers from the 17:41--18:05 pollution period are invalid and must not be
