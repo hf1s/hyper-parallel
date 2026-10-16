@@ -72,7 +72,7 @@ The following items remain open and are not implemented by this branch:
 
 No claim is made here that these items are resolved.
 
-## MF MTP `final_layernorm` recompute localization (docs-only)
+## MF MTP `final_layernorm` recompute fix (record + implementation PR #239)
 
 A separate backward-graph item was localized on the MF side: the MTP
 `final_layernorm` backward falls inside the recompute subgraph because the whole
@@ -80,6 +80,15 @@ A separate backward-graph item was localized on the MF side: the MTP
 `mtp_transformer_out_grad` are not bitwise against HP. The backbone `model.norm`
 is built outside the layer loop and never enters `LayerSetting`, so it is
 unaffected.
+
+The recorded fix is a two-line configuration change in
+`examples/training_demo/jt_deepseek_v3/mf_4k_1_card.yaml`:
+`recompute_config.select_recompute_exclude` gains
+`final_layernorm\.norm: true` and `final_layernorm\.cast: true`. Both keys are
+required, because a key's last segment must hit an operator attribute
+(`operator.recompute(False)`) and `FusedRMSNorm` exposes exactly the `norm` and
+`cast` primitives; a key that hits a cell is rejected as
+"will not be effective".
 
 Measured at MF step301 with `eq32 = (hp.view(uint32) == mf.view(uint32)).mean()`
 against HP 8.5 `/home/zth/tmp/mtpwalk-hp/<point>.npy`: untouched
@@ -93,12 +102,13 @@ Remaining unrelated residuals under `recompute: false`: `mtp_eh_proj_dy`
 `1.744e-3`, `mtp_hnorm_dx` `3.108e-3`, `mtp_enorm_dx` `2.863e-3`, pointing at the
 MTP `transformer_layer` backward internals.
 
-Details (problem, matrix, the four reference diffs, the
-`select_recompute_exclude` key semantics, and the archived-config caveat):
-[docs/mf-mtp-final-layernorm-recompute.md](https://github.com/hf1s/hyper-parallel/blob/mtp-final-layernorm-recompute/docs/mf-mtp-final-layernorm-recompute.md)
-in [PR #239](https://github.com/hf1s/hyper-parallel/pull/239). That PR is
-documentation-only and changes no behavior; this branch makes no bitwise claim
-beyond the numbers quoted above.
+Implementation and write-up:
+[PR #239](https://github.com/hf1s/hyper-parallel/pull/239) carries the
+implementation change (the two config keys in
+`examples/training_demo/jt_deepseek_v3/mf_4k_1_card.yaml`); the full write-up
+(problem, matrix, reference diffs, `select_recompute_exclude` key semantics, the
+memory/performance trade-off, and the archived-config caveat) lives in that PR's
+description. This branch makes no bitwise claim beyond the numbers quoted above.
 
 ## Measurement scope lesson
 
