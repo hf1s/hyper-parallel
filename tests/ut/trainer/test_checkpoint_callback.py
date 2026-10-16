@@ -16,12 +16,14 @@
 
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
+from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
 from hyper_parallel.trainer.state import TrainerState
 
 
@@ -46,6 +48,85 @@ def _checkpoint_config(restore_from: str) -> SimpleNamespace:
 
 class TestCheckpointerCallback(unittest.TestCase):
     """Tests for checkpoint restore policy and trainer state handling."""
+
+    @staticmethod
+    def _meter_trainer(directory: str, per_rank: bool) -> SimpleNamespace:
+        """Build a CPU trainer with the production checkpoint and meter callbacks."""
+        config = _checkpoint_config(directory)
+        config.save_ckpt = True
+        config.save_steps = 1
+        config.save_train_state = True
+        config.save_extra_state_per_rank = per_rank
+        config.restore_train_state = True
+        trainer = SimpleNamespace(
+            config=SimpleNamespace(checkpoint=config, model_init_dtype="float32"),
+            mesh=SimpleNamespace(dp_cp_mesh=None, cp_size=1),
+            model=torch.nn.Linear(4, 4),
+            optimizer=None,
+            lr_scheduler=None,
+            train_dataloader=[object()] * 10,
+            train_steps=10,
+            state=TrainerState(),
+        )
+        trainer.environ_meter_callback = EnvironMeterCallback(trainer)
+        return trainer
+
+    @staticmethod
+    def _meter_step(trainer: SimpleNamespace, tokens: int) -> None:
+        """Consume one batch through the real meter lifecycle."""
+        meter = trainer.environ_meter_callback
+        meter.on_step_begin(trainer.state)
+        meter.on_micro_step_begin(trainer.state, {
+            "input_ids": torch.zeros(1, tokens, dtype=torch.long), "token_count": torch.tensor(tokens),
+        })
+        trainer.state.global_step += 1
+        meter.on_step_end(trainer.state, loss=1.0, loss_dict={}, grad_norm=0.5)
+
+    @patch("hyper_parallel.trainer.callbacks.environ_meter_callback.get_device_type", return_value="cpu")
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.get_device_rng_state", return_value=None)
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.set_device_rng_state")
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.empty_cache")
+    @patch("hyper_parallel.components.checkpoint.dcp_checkpointer._empty_cache")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
+    @patch.dict("hyper_parallel.core.distributed_checkpoint.standard_planner.StandardSavePlanner.cached_save_result",
+                {}, clear=True)
+    def test_cumulative_metrics_resume_from_both_checkpoint_layouts(self, *_mocks: MagicMock) -> None:
+        """Real CPU checkpoint round trips preserve counters and weights-only starts fresh."""
+        for per_rank in (False, True):
+            with self.subTest(per_rank=per_rank), tempfile.TemporaryDirectory() as directory:
+                source = self._meter_trainer(directory, per_rank)
+                self._meter_step(source, 3)
+                self._meter_step(source, 5)
+                writer = CheckpointerCallback(source)
+                writer.on_step_end(source.state)
+                for restore_train_state in (True, False):
+                    with self.subTest(restore_train_state=restore_train_state):
+                        restored = self._meter_trainer(directory, per_rank)
+                        restored.config.checkpoint.restore_from = str(Path(directory) / "global_step_2")
+                        restored.config.checkpoint.restore_train_state = restore_train_state
+                        reader = CheckpointerCallback(restored)
+                        reader.on_train_begin(restored.state)
+                        self._meter_step(restored, 7)
+                        metrics = restored.step_env_metrics
+                        expected_tokens, expected_samples = (15.0, 3.0) if restore_train_state else (7.0, 1.0)
+                        self.assertEqual(metrics["data/consumed_tokens"], expected_tokens)
+                        self.assertEqual(metrics["data/consumed_samples"], expected_samples)
+                        self.assertEqual(metrics["data/step_tokens"], 7.0)
+                        self.assertEqual(metrics["data/step_samples"], 1.0)
+
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.set_device_rng_state")
+    def test_legacy_training_state_without_metrics_keeps_fresh_counters(self, _mock_rng: MagicMock) -> None:
+        """Old checkpoints cannot recover historical token counts from the global step."""
+        trainer = self._meter_trainer("unused", False)
+        callback = CheckpointerCallback.__new__(CheckpointerCallback)
+        callback.trainer = trainer
+        callback._apply_extra_state({"global_step": 2, "epoch": 0})
+        self.assertEqual(trainer.state.global_step, 2)
+        self.assertEqual(trainer.environ_meter_callback.state_dict(), {
+            "consumed_tokens": 0, "consumed_samples": 0,
+        })
 
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.empty_cache")
     @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.validate_model_init_dtype")
