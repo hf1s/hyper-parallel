@@ -261,6 +261,7 @@ class TextTrainer:
 
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
+        self.base.begin_precision_capture_step(self.base.state.global_step + 1, num_micro_steps)
         synchronize()
 
         total_loss = 0.0

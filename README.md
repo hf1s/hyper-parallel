@@ -42,33 +42,50 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
 
 ---
-## JT DeepSeek V3 MF parity：CANN8.5 step302 对齐进展
+## JT DeepSeek V3 MF parity：CANN8.5 step301–302 复现状态
 
 当前对齐入口：
 
 - 分支：[`feat/jt-muon-mf-clean-2step`](https://github.com/hf1s/hyper-parallel/tree/feat/jt-muon-mf-clean-2step)
 - 配置：`examples/training_demo/jt_deepseek_v3/mf-alignment-2step.yaml`
-- 启动：`examples/training_demo/jt_deepseek_v3/mf-alignment-2step.sh`
-- 初始状态：`/workspace/mf-weights/native-step300/global_step_300`
-- 目标环境：CANN8.5、单卡、step 301–302
+- 常规启动：`examples/training_demo/jt_deepseek_v3/mf-alignment-2step.sh`，加载 `/workspace/env-850.sh`
+- 本次抓取与比较：同目录 `alignment_capture/`，包含实际使用的两步观测器、启动器、原始张量写入器、MF 既有数据导入器和分块比较工具
+- 初始状态：MF step300 转换后的 HP native checkpoint，恢复模型、优化器和数据游标
+- 环境：Huawei-129，`hp-910b-arrow`，CANN 8.5.0，单卡 NPU 6；只执行 HP step301、302，不运行 MF
 
-当前证据：
+2026-10-16 实跑结果（`EXIT_CODE=0`，完整完成两步）：
 
-| 步骤 | clean 结果 | MF 对照 |
+| 步骤 | HP loss | HP grad_norm |
 |---|---:|---:|
-| 301 loss | `8.14211` | `8.142112` |
-| 301 grad_norm | `10.2844` | `10.284420` |
-| 302 loss | `7.8022` | `7.802559` |
-| 302 grad_norm | `12.7487` | `12.751572` |
+| 301 | `8.142111778259277` | `10.284406661987305` |
+| 302 | `7.802202224731445` | `12.748677253723145` |
 
-step301 的已记录第一偏差位置是 `output_layer.weight` 的 `main_grad`：
+第301步与**未应用 #239 的既有 MF 全梯度抓取**比较：
+
+- 总 loss 两侧均为 `8.142111778259277`，原始 FP32 逐位一致。
+- HP 的 `lm=6.284317970275879`、`mtp=1.8574793338775635`、`aux=0.00031406228663399816` 与 #190 已记录 anchor 一致；这三项没有放入本次 MF 原始张量 manifest，不能把比较器的 `unpaired_hp` 当作额外逐位验证。
+- 裁剪前梯度：46 项全部完成配对，**8 项逐位一致、38 项不同**。不能声称反向已对齐。
+- 配套 MF 原始 `global_norm=10.28442096710205`，HP 差 `-1.430511474609375e-5`。该原始抓取值与 #190 曾引用的 `10.284420013427734` 相差1 ULP，不能混用。
+- 比较工具直接逐元素比较原始 FP32 张量及位模式，不计算文件或梯度哈希；没有单独验证或重跑 Muon。
+
+参考来源：`/dev/shm/mfcap/mfgd/grad/g_float32_34.npy` 至 `g_float32_79.npy`，
+按保留的 `MFInstrumentedStep/artifacts/param_order.json` 的 `grad_dump_order` 配对。
+运行与结果在容器：
 
 ```text
-MF Frobenius: 4.408915339919721
-HP Frobenius: 4.408915519714355
+/workspace/zth-jt-precision-scripts/alignment/jt-muon-mf-clean-2step/20261016-hp301-302-patched-r2/
+  command.txt
+  launcher.log
+  hp-observation/metrics.jsonl
+  hp-observation/environment-hp-initialized.json
+  hp-observation/records.jsonl
+  comparison-mf301/summary.json
+  comparison-mf301/comparisons.jsonl
 ```
 
-下一次 compact dump 比较 `output-head dY → dW`，分别记录 MF 与 HP 的 shape、dtype、Frobenius 和 raw hash。step302 的 optimizer/debug 临时输出不作为分支内容。
+完整复现命令与边界记录在 [issue #190](https://github.com/hf1s/hyper-parallel/issues/190)。
+#239 修改的是 **MF** 的重算配置，只作为局部差异的定位实验；本轮没有运行该配置。
+后续目标是 **HP 对齐原 MF**，不通过修改 MF 参考消除差异。
 
 ## 使用入口
 

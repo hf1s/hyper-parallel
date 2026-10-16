@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /workspace/env.sh
+source /workspace/env-850.sh
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE_ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"

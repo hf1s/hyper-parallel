@@ -46,6 +46,26 @@ from hyper_parallel.tools.model_integration.integration_validator import (
     validate_final_model,
     validate_state_invariants,
 )
+import hashlib
+import torch
+
+_MF_BOUNDARY_NAMES = (
+    "model.layers.1.mlp.gate.weight",
+    "mtp.layers.0.eh_proj.weight",
+    "mtp.layers.0.router.weight",
+    "model.embed_tokens.weight",
+    "model.layers.0.input_layernorm.weight",
+)
+
+def _mf_raw_digest(value: Any) -> dict[str, Any]:
+    local = getattr(value, "to_local", lambda: value)().detach().contiguous()
+    raw = local.cpu().numpy().tobytes()
+    return {
+        "sha256_raw": hashlib.sha256(raw).hexdigest(),
+        "dtype": str(local.dtype),
+        "shape": [int(x) for x in local.shape],
+        "fro": float(torch.linalg.vector_norm(local.float()).item()),
+    }
 from hyper_parallel.trainer.runtime.memory import peak_device_memory, reset_peak_device_memory
 
 
@@ -508,6 +528,7 @@ class TrainerModelIntegrationSession:
 
     def after_optimizer(self) -> None:
         """Capture main/model updates and optimizer moment layouts."""
+        self._capture_mf_boundary()
         if not self.runtime_enabled:
             return
         if self.parameter_probes is None:
@@ -515,7 +536,31 @@ class TrainerModelIntegrationSession:
         self.parameter_probes.capture("main_after_optimizer")
         self.parameter_probes.capture("model_after_copy_back")
         self.parameter_probes.capture("optimizer_state")
+        self._capture_mf_boundary()
 
+    def _capture_mf_boundary(self) -> None:
+        """Optionally capture raw post-writeback tensors for MF step alignment."""
+        if os.environ.get("MF_BOUNDARY_TAP") != "1" or self.global_rank != 0:
+            return
+        named = dict(self.model.named_parameters())
+        records = {}
+        for name in _MF_BOUNDARY_NAMES:
+            parameter = named.get(name)
+            if parameter is None:
+                continue
+            record = {"parameter": _mf_raw_digest(parameter)}
+            if self.optimizer is not None:
+                state = self.optimizer.state.get(parameter, {})
+                for key in ("exp_avg", "momentum_buffer", "exp_avg_sq"):
+                    value = state.get(key)
+                    if value is not None:
+                        record[f"state_{key}"] = _mf_raw_digest(value)
+            records[name] = record
+        if records:
+            self.evidence_store.write_json(
+                f"check/mf_boundary_step{self._current_step}.json",
+                {"step": self._current_step, "post_optimizer_writeback": True, "records": records},
+            )
     def end_step(self, metrics: Mapping[str, Any]) -> None:
         """Persist structured scalar and global input identity evidence."""
         if not self.runtime_enabled:

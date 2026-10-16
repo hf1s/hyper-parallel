@@ -30,9 +30,10 @@ Features:
 
 from __future__ import annotations
 
+from abc import ABC
 import json
 import logging
-from abc import ABC
+import os
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
@@ -246,6 +247,7 @@ class BaseTrainer(Stateful, ABC):
     def _setup(self):
         """Initialize logging, distributed state, and the local device."""
         # log args
+        self.precision_capture = None
         setup_logging()
 
         # Initialize distributed process group
@@ -602,8 +604,30 @@ class BaseTrainer(Stateful, ABC):
             self.step_token_counts,
             device_mesh=self.mesh,
         )
-        loss = torch.stack(list(loss_dict.values())).sum()
+        if self.config.training.loss_association == "mf":
+            values = []
+            for token in ("lm", "aux", "mtp"):
+                matches = [value for name, value in loss_dict.items() if token in name]
+                if len(matches) != 1:
+                    raise ValueError(f"MF loss association expected one {token} loss, got {len(matches)}")
+                values.append(matches[0])
+            loss = (values[0] + values[1]) + values[2]
+        else:
+            loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
+
+    def begin_precision_capture_step(self, step: int, num_micro_steps: int) -> None:
+        """Start opt-in paired capture using the caller's actual logical step."""
+        if self.precision_capture is None:
+            root = os.environ.get("JT_STEP302_CAPTURE_DIR")
+            if not root:
+                return
+            # This external diagnostic tool is optional and is not a runtime dependency.
+            from capture_hp import HPPairedCapture
+
+            self.precision_capture = HPPairedCapture(self, root)
+        self.precision_capture.begin_step(step, num_micro_steps)
+
 
     def forward_backward_step(
             self,
@@ -652,6 +676,9 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
             self.model_integration.record_batch(micro_batch, loss_inputs)
+            capture = self.precision_capture
+            if capture is not None:
+                capture.begin_forward(micro_batch, loss_inputs)
 
             model_fwd_context = (
                 self.model_fwd_context()
@@ -660,6 +687,8 @@ class BaseTrainer(Stateful, ABC):
             )
             with model_fwd_context:
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            if capture is not None:
+                capture.end_forward()
 
             # with use_parallel_state("base"):
             loss, loss_dict = self.postforward(outputs, labels)
@@ -667,13 +696,17 @@ class BaseTrainer(Stateful, ABC):
             # the model output here avoids retaining large vocabulary logits
             # until the whole backward pass finishes.
             del outputs
+            if capture is not None:
+                capture.record_loss(loss, loss_dict)
+                if capture.observe_only:
+                    del micro_batch
+                    return loss, loss_dict
             if self.config.training.empty_cache_before_backward:
                 empty_cache()
 
             # Backward pass
             with self.model_bwd_context:
                 loss.backward()
-
             del micro_batch
             return loss, loss_dict
 
@@ -725,25 +758,30 @@ class BaseTrainer(Stateful, ABC):
         """Run pre-optimizer diagnostics and clipping in their required order."""
         self.model_integration.after_backward_before_clip()
         self.validate_fsdp_runtime_before_optimizer()
+        capture = self.precision_capture
+        if capture is not None:
+            capture.gradients("post_backward")
         max_grad_norm = self.config.training.max_grad_norm
         grad_norm: Any = 0.0
         post_clip_norm = None
         if max_grad_norm > 0:
-            grad_norm = clip_grad_norm_(self.model, max_grad_norm)
+            if self.config.training.norm_dvm:
+                from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.mf_dvm_clip import (
+                    clip_grad_norm_dvm,
+                )
+                observer = capture.record_clip if capture is not None and capture.updating else None
+                grad_norm = clip_grad_norm_dvm(self.model, max_grad_norm, observer=observer)
+            else:
+                grad_norm = clip_grad_norm_(self.model, max_grad_norm)
             if self.model_integration.runtime_enabled:
-                grad_norm_value = (
-                    float(grad_norm.item())
-                    if isinstance(grad_norm, torch.Tensor)
-                    else float(grad_norm)
-                )
-                clip_coefficient = min(
-                    float(max_grad_norm) / (grad_norm_value + 1.0e-6),
-                    1.0,
-                )
+                grad_norm_value = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+                clip_coefficient = min(float(max_grad_norm) / (grad_norm_value + 1.0e-6), 1.0)
                 post_clip_norm = grad_norm_value * clip_coefficient
         elif self.model_integration.runtime_enabled:
             grad_norm = clip_grad_norm_(self.model, float("inf"))
             post_clip_norm = grad_norm
+        if capture is not None:
+            capture.gradients("post_clip")
         self.model_integration.after_clip(post_clip_norm)
         return grad_norm
 
@@ -763,6 +801,8 @@ class BaseTrainer(Stateful, ABC):
         )
         for scheduler in schedulers:
             scheduler.step()
+        if self.precision_capture is not None:
+            self.precision_capture.capture_state("post_update")
 
     def _end_model_integration_step(self, metrics: Dict[str, Any]) -> None:
         """Persist structured step metrics and global input identity."""
@@ -809,6 +849,7 @@ class BaseTrainer(Stateful, ABC):
 
         self.on_step_begin(micro_batches=micro_batches)
         self.model_integration.begin_step(self.state.global_step)
+        self.begin_precision_capture_step(self.state.global_step, len(micro_batches))
 
         # Forward and backward for each micro batch
         synchronize()
