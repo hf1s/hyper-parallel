@@ -135,6 +135,8 @@ recompute_config:
   select_recompute_exclude:
     self_attention\.core_attention\.flash_attention: true
     transformer_layer\.self_attention\.core_attention\.flash_attention: true
+    final_layernorm\.norm: true
+    final_layernorm\.cast: true
 model:
   model_config:
     model_type: deepseek_v3
