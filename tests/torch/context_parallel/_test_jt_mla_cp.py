@@ -53,7 +53,7 @@ def _optimizer(model, recipe):
     return Float16OptimizerWithFloat16Params(builder.get_optimizer(), model)
 
 
-def _build_pair(tp, sp, strategy):
+def _build_pair(tp, sp, strategy, chunk_size=0):
     world = dist.get_world_size()
     cp = world // tp
     # The JT builder uses EP for fused expert tensors, which cannot be plain TP row shards.
@@ -71,6 +71,9 @@ def _build_pair(tp, sp, strategy):
     recipe = jt_test_config()
     torch.manual_seed(112)
     base = JTDeepseekV3ForCausalLM(JTDeepseekV3Config(**dict(recipe.model.config))).float()
+    base.enable_chunk_loss = chunk_size > 0
+    if chunk_size:
+        base.chunk_loss_size = chunk_size
     replacements = entries_to_module_replacements(recipe.plan_overrides)
     apply_module_replacements(base, compile_module_replacements(base, replacements), weights_mapping=[])
     models = []
@@ -107,14 +110,22 @@ def _build_pair(tp, sp, strategy):
 def _backward(model, optimizer, mesh, inputs, labels, sequence_ends=None):
     optimizer.zero_grad()
     loss_context = loss_parallel(mesh=mesh.device_mesh["tp"]) if mesh.loss_parallel else nullcontext()
-    with SkipDTensorDispatch(), loss_context:
-        output = model(input_ids=inputs, shift_labels=labels, actual_seq_len=sequence_ends)
-        assert all(loss.dtype == torch.float32 for loss in output.loss.values())
-        count = labels.ge(0).sum()
-        if mesh.sequence_parallel:
-            count = count / mesh.tp_size
-        losses = mean_global_loss(output.loss, {"foundation_tokens": count}, {"foundation_tokens": count}, mesh)
-        sum(losses.values()).backward()
+    head_lengths = []
+    handle = model.lm_head.register_forward_pre_hook(
+        lambda _module, args: head_lengths.append(args[0].shape[1]))
+    try:
+        with SkipDTensorDispatch(), loss_context:
+            output = model(input_ids=inputs, shift_labels=labels, actual_seq_len=sequence_ends)
+            assert all(loss.dtype == torch.float32 for loss in output.loss.values())
+            count = labels.ge(0).sum()
+            if mesh.sequence_parallel:
+                count = count / mesh.tp_size
+            losses = mean_global_loss(output.loss, {"foundation_tokens": count}, {"foundation_tokens": count}, mesh)
+            sum(losses.values()).backward()
+    finally:
+        handle.remove()
+    if model.enable_chunk_loss:
+        assert head_lengths and max(head_lengths) <= model.chunk_loss_size, head_lengths
     return losses
 
 
@@ -147,8 +158,8 @@ def _compare_parameters(reference, candidate):
         assert relative < 0.025, f"{name} main parameter relative L2: {relative.item()}"
 
 
-def _training_case(tp, sp, strategy):
-    models, mesh = _build_pair(tp, sp, strategy)
+def _training_case(tp, sp, strategy, chunk_size=0):
+    models, mesh = _build_pair(tp, sp, strategy, chunk_size)
     rank = mesh.cp_mesh.get_local_rank()
     torch.manual_seed(913)
     for _step in range(2):
@@ -167,7 +178,8 @@ def _training_case(tp, sp, strategy):
         actual = _backward(*models[1], inputs.chunk(mesh.cp_size, 1)[rank].contiguous(),
                            labels.chunk(mesh.cp_size, 1)[rank].contiguous(), sequence_ends)
         if dist.get_rank() == 0:
-            print({"strategy": strategy, "tp": tp, "cp": mesh.cp_size, "sp": sp, "step": _step + 1,
+            print({"strategy": strategy, "tp": tp, "cp": mesh.cp_size, "sp": sp,
+                   "chunk_size": chunk_size, "step": _step + 1,
                    "reference": {key: value.item() for key, value in expected.items()},
                    "candidate": {key: value.item() for key, value in actual.items()}}, flush=True)
         for name, value in expected.items():
@@ -220,5 +232,7 @@ def test_jt_mla_cp_training():
         for strategy in ("expanded_ulysses", "latent_kv_head"):
             for tp, sp in ((1, False), (2, False), (2, True)):
                 _training_case(tp, sp, strategy)
+        for tp, sp in ((1, False), (2, True)):
+            _training_case(tp, sp, "expanded_ulysses", chunk_size=48)
     finally:
         dist.destroy_process_group()
