@@ -26,6 +26,7 @@ import torch
 from torch.nn import functional as F
 
 from hyper_parallel.distributed.mesh import DistributedSetup
+from hyper_parallel.models import build_options
 from hyper_parallel.models.jt_deepseek_v3.adapter import jt_builder
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
@@ -73,7 +74,8 @@ class TestJTBuilder(unittest.TestCase):
         warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
         self.addCleanup(torch.use_deterministic_algorithms, deterministic, warn_only=warn_only)
         self.enterContext(patch.object(jt_builder.torch_npu.npu, "set_compile_mode"))
-        self.enterContext(patch.object(jt_builder, "get_device_id", return_value=0))
+        self.enterContext(patch.object(build_options, "IS_CUDA_AVAILABLE", False))
+        self.enterContext(patch.object(build_options, "IS_NPU_AVAILABLE", False))
         self.enterContext(patch.object(jt_builder, "instantiate_infrastructure", return_value=(None, None)))
 
     def build(self, seed: int = 42, **options: Any) -> JTDeepseekV3ForCausalLM:
