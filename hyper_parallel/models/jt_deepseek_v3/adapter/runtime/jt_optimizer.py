@@ -31,6 +31,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3MLAAttention,
     JTDeepseekV3MoE,
 )
+from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.muon_layout import build_fused_matrix_transform
 
 
 def _value_copies(parameter: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -134,12 +135,16 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
                     tp_group=module.sequence_partition_group, dp_group=model.expert_load_group)
 
 
-def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
+def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float,
+                    split_fused_matrices: bool = True, **kwargs: Any) -> Muon:
     """Build the Muon/AdamW optimizer and register the JT post-step hook.
 
     Args:
         model: Model whose final FSDP parameter layouts are already prepared.
         qk_clip_threshold: Positive clipping threshold for QK projections.
+        split_fused_matrices: Preserve separate Q/KV and expert gate/up logical
+            matrices. Set False to resume the historical fused-matrix recipe
+            or provide an explicit custom Muon matrix transform.
         **kwargs: Muon builder options from the training recipe.
 
     Returns:
@@ -150,7 +155,14 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     """
     if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
         raise ValueError("qk_clip_threshold must be finite and positive")
+    if not isinstance(split_fused_matrices, bool):
+        raise ValueError('split_fused_matrices must be a boolean')
     muon_config = dict(kwargs["muon_config"])
+    if split_fused_matrices:
+        if any(muon_config.get(name) is not None for name in ('reshape_fn', 'ns_transform_fn')):
+            raise ValueError('Set split_fused_matrices=False when supplying a custom Muon matrix transform')
+        muon_config['ns_transform_fn'] = build_fused_matrix_transform(
+            model.config.q_lora_rank, model.config.kv_lora_rank + model.config.qk_rope_head_dim)
     builder = Muon(model=model, muon_config=muon_config, **{
         name: value for name, value in kwargs.items() if name != "muon_config"
     })
