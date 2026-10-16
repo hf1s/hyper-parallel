@@ -202,6 +202,16 @@ def _get_checkpoint_wrapped_module(module: nn.Module) -> Optional[nn.Module]:
     return None
 
 
+def _is_hf_checkpointing_layer(module: nn.Module) -> bool:
+    """Recognize HF leaf blocks without requiring a particular container path."""
+    try:
+        # Transformers is optional; older releases may not expose this base class.
+        from transformers.modeling_layers import GradientCheckpointingLayer  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return False
+    return isinstance(module, GradientCheckpointingLayer)
+
+
 def _find_transformer_block_modules(
     model: nn.Module,
 ) -> tuple[list[_TransformerBlockInfo], set[int]]:
@@ -211,7 +221,9 @@ def _find_transformer_block_modules(
     that own a repeated block container.  The marker is the structural
     contract; no model class name or conventional ``layers`` path is needed.
     Each direct child of a marked repeated container is returned with its
-    registered name so callers can safely replace it in-place.
+    registered name so callers can safely replace it in-place. An HF
+    ``GradientCheckpointingLayer`` outside such a container is itself a block,
+    rather than an owner whose attention or MLP children should be scanned.
 
     Args:
         model: Model whose transformer blocks should be located.
@@ -228,13 +240,25 @@ def _find_transformer_block_modules(
         # owner has itself been selected as a block, do not scan inside it.
         if id(owner) in discovered_block_ids:
             continue
-        if not hasattr(owner, "gradient_checkpointing"):
+        if any(owner_fqn.startswith(f"{block.fqn}.") for block in block_infos):
+            continue
+        wrapped_owner = _get_checkpoint_wrapped_module(owner)
+        checkpoint_owner = owner if wrapped_owner is None else wrapped_owner
+        if not hasattr(checkpoint_owner, "gradient_checkpointing"):
+            continue
+        if owner_fqn and _is_hf_checkpointing_layer(checkpoint_owner):
+            parent_fqn, _, child_name = owner_fqn.rpartition(".")
+            parent = model.get_submodule(parent_fqn) if parent_fqn else model
+            discovered_block_ids.add(id(owner))
+            discovered_block_ids.add(id(checkpoint_owner))
+            block_infos.append(_TransformerBlockInfo(
+                fqn=owner_fqn, module=owner, parent=parent,
+                child_name=child_name, container_fqn=parent_fqn,
+            ))
             continue
 
         for container_name, container in owner.named_children():
             children = list(container.named_children())
-            if not children:
-                continue
             container_fqn = (
                 f"{owner_fqn}.{container_name}" if owner_fqn else container_name
             )
@@ -486,15 +510,8 @@ def _should_use_hf_native_gradient_checkpointing(
     ):
         return False
 
-    try:
-        # Guarded import: transformers is optional and older versions may not
-        # expose GradientCheckpointingLayer.
-        from transformers.modeling_layers import GradientCheckpointingLayer  # pylint: disable=import-outside-toplevel
-    except ImportError:
-        return False
-
     return (
-        all(isinstance(layer, GradientCheckpointingLayer) for layer in layers)
+        all(_is_hf_checkpointing_layer(layer) for layer in layers)
         and getattr(model, "supports_gradient_checkpointing", False)
         and hasattr(model, "gradient_checkpointing_enable")
     )

@@ -641,6 +641,9 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     """JT DeepSeek-V3 causal LM whose forward returns the LM, MTP and router auxiliary losses."""
 
     config_class = JTDeepseekV3Config
+    # Router auxiliary losses leave the decoder through side state. HF's reentrant
+    # checkpoint path detaches that objective; use HP's non-reentrant wrappers.
+    supports_gradient_checkpointing = False
 
     def __init__(self, config: Any) -> None:
         """Build the base model, LM head and multi-token-prediction depths.

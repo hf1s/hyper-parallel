@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
@@ -34,6 +35,9 @@ from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
 from hyper_parallel.core.activation_memory import checkpoint_wrapper
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.distributed.activation_checkpoint import (
+    _apply_activation_checkpointing, _find_transformer_block_modules,
+)
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
@@ -59,8 +63,22 @@ def small_config() -> JTDeepseekV3Config:
     return config
 
 
+def _cpu_grouped_swiglu(inputs, gate_up_weight, down_weight, counts):
+    """Differentiate the expert arithmetic on CPU without the NPU-only fused kernel."""
+    outputs = []
+    for index, tokens in enumerate(inputs.split(counts.tolist())):
+        gate, up = F.linear(tokens, gate_up_weight[index]).chunk(2, dim=-1)
+        outputs.append(F.linear(F.silu(gate) * up, down_weight[index]))
+    return torch.cat(outputs)
+
+
 class TestCompleteModel(unittest.TestCase):
     """Exercise model semantics without a builder, EP adapter or replacement pass."""
+
+    def setUp(self) -> None:
+        """Keep CPU checkpoint replay independent of the installed accelerator backend."""
+        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
+        DefaultDeviceType.set_device_type("cpu")
 
     def test_auxiliary_loss_pop_preserves_router_and_input_gradients(self):
         """Consuming the loss clears its owner but preserves the differentiable objective."""
@@ -85,15 +103,7 @@ class TestCompleteModel(unittest.TestCase):
     @patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu")
     def test_checkpoint_auxiliary_loss_consumption_matches_eager_gradients(self, grouped_swiglu):
         """Trunk and MTP replay preserve accumulated gradients without leaving loss references."""
-        # Use differentiable CPU experts to exercise graph lifetime without the NPU-only kernel.
-        def cpu_experts(inputs, gate_up_weight, down_weight, counts):
-            outputs = []
-            for index, tokens in enumerate(inputs.split(counts.tolist())):
-                gate, up = F.linear(tokens, gate_up_weight[index]).chunk(2, dim=-1)
-                outputs.append(F.linear(F.silu(gate) * up, down_weight[index]))
-            return torch.cat(outputs)
-
-        grouped_swiglu.side_effect = cpu_experts
+        grouped_swiglu.side_effect = _cpu_grouped_swiglu
         torch.manual_seed(19)
         reference = JTDeepseekV3ForCausalLM(small_config())
         candidate = copy.deepcopy(reference)
@@ -126,6 +136,50 @@ class TestCompleteModel(unittest.TestCase):
                         self.assertIsNotNone(replayed.grad)
                         torch.testing.assert_close(replayed.grad, original.grad, rtol=1e-5, atol=1e-7)
                 self.assertGreater(candidate.model.embed_tokens.weight.grad.abs().sum().item(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    @patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
+           side_effect=_cpu_grouped_swiglu)
+    def test_public_recompute_covers_mtp_and_preserves_aux_gradients(self, _grouped_swiglu) -> None:
+        """Exercise complete MTP recomputation through the normal activation-checkpoint entry point.
+
+        Feature: JT full and selective recomputation coverage.
+        Description: Apply the public construction path and compare loss, gradients and MoE replay counts.
+        Expectation: Trunk and MTP decoders replay once, all gradients agree and no auxiliary graph remains.
+        """
+        torch.manual_seed(23)
+        reference = JTDeepseekV3ForCausalLM(small_config())
+        blocks, _ = _find_transformer_block_modules(reference)
+        names = [block.fqn for block in blocks]
+        expected_names = ["model.layers.0", "model.layers.1", "mtp.layers.0.transformer_layer"]
+        self.assertEqual(names, expected_names, f"expected={expected_names}, got={names}")
+        inputs = torch.arange(8).unsqueeze(0)
+        expected = reference(inputs, inputs + 1).loss
+        sum(expected.values()).backward()
+        for mode in ("full", "selective"):
+            with self.subTest(mode=mode):
+                candidate = copy.deepcopy(reference)
+                candidate.zero_grad(set_to_none=True)
+                _apply_activation_checkpointing(candidate, mode)
+                owners = [module for module in candidate.modules() if isinstance(module, JTDeepseekV3MoE)]
+                calls = [0] * len(owners)
+
+                def count_call(_module: torch.nn.Module, _args: tuple, index: int) -> None:
+                    """Record which complete MoE regions execute during backward replay."""
+                    calls[index] += 1
+
+                for index, module in enumerate(owners):
+                    module.register_forward_pre_hook(lambda module, args, index=index: count_call(module, args, index))
+                actual = candidate(inputs, inputs + 1).loss
+                for name, value in expected.items():
+                    torch.testing.assert_close(actual[name], value, rtol=0, atol=0)
+                sum(actual.values()).backward()
+                self.assertEqual(calls, [2, 2], f"expected trunk/MTP calls=[2, 2], got={calls}")
+                for original, replayed in zip(reference.parameters(), candidate.parameters(), strict=True):
+                    torch.testing.assert_close(replayed.grad, original.grad, rtol=1e-5, atol=1e-7)
+                for module in owners:
+                    self.assertIsNone(module.auxiliary_loss,
+                                      f"expected cleared auxiliary loss, got={module.auxiliary_loss}")
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_standalone_forward_backward(self):
