@@ -46,7 +46,8 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_single
-from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
+from hyper_parallel.core.activation_memory import checkpoint, get_recompute_state, is_recomputing
+from hyper_parallel.core.activation_memory.api import is_compiling
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
@@ -58,6 +59,16 @@ class JTDeepseekV3Config(DeepseekV32Config):
 
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
+
+
+def _get_attention_head_chunk_size(config: Any) -> int:
+    """Validate the opt-in configuration at both model and MLA replacement boundaries."""
+    size = getattr(config, "attention_head_chunk_size", 0)
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= config.num_attention_heads:
+        raise ValueError("attention_head_chunk_size must be an integer between zero and num_attention_heads")
+    if size and config.attention_dropout:
+        raise ValueError("Head-chunked MLA requires attention_dropout=0")
+    return size
 
 
 @dataclass
@@ -135,7 +146,8 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
 
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
                               value: torch.Tensor, attention_mask: Any, dropout: float = 0.0,
-                              scaling: float | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
+                              scaling: float | None = None, head_range: tuple[int, int] | None = None,
+                              **kwargs: Any) -> tuple[torch.Tensor, None]:
     """Run NPU fused attention and record per-head maxima of the attention logits.
 
     Inputs are prepared like the framework's ``npu_fusion_attention_forward``; the
@@ -150,6 +162,7 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         attention_mask: Optional attention mask.
         dropout: Attention dropout probability.
         scaling: Attention score scale; ``head_dim ** -0.5`` when ``None``.
+        head_range: Optional head interval whose QK maxima this call updates.
         **kwargs: Packed sequence lengths and attention window options.
 
     Returns:
@@ -174,11 +187,32 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         # TND kernels otherwise return statistics in NTD order.
         maximum = result[1].amax(dim=(0, 2) if layout == "TND" else (0, 2, 3))
         if module.max_logits_val is None:
-            module.max_logits_val = torch.zeros_like(maximum)
-        module.max_logits_val.copy_(torch.maximum(module.max_logits_val, maximum))
+            module.max_logits_val = maximum.new_zeros(module.num_heads) if head_range else torch.zeros_like(maximum)
+        previous = module.max_logits_val if head_range is None else module.max_logits_val[slice(*head_range)]
+        previous.copy_(torch.maximum(previous, maximum))
     if query_lengths is not None:
         return result[0].reshape(batch_size, query_length, *result[0].shape[1:]), None
     return result[0].transpose(1, 2), None
+
+
+class _HeadSliceLinear(nn.Linear):
+    """Slice projection rows inside the module call, preserving parameter hooks and state keys."""
+
+    def __init__(self, source: nn.Linear) -> None:
+        """Reuse the source projection's parameters without initializing replacement weights."""
+        nn.Module.__init__(self)
+        if type(source) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
+            raise ValueError("Head-chunked MLA requires plain Linear projections")
+        self.in_features, self.out_features = source.in_features, source.out_features
+        self.weight, self.bias = source.weight, source.bias
+        self.train(source.training)
+
+    def forward(self, inputs: torch.Tensor, rows: slice | None = None) -> torch.Tensor:
+        """Project all rows or one head block after the module's materialization hooks."""
+        if rows is None:
+            return super().forward(inputs)
+        bias = None if self.bias is None else self.bias[rows]
+        return F.linear(inputs, self.weight[rows], bias)
 
 
 @module_replacement
@@ -186,7 +220,12 @@ class JTDeepseekV3MLAAttention(MLAAttention):
     """MLA attention on the framework module with JT's rotary embedding and QK-clip statistics.
 
     Replaces :class:`JTDeepseekV3Attention`; ``q_a_proj`` and ``kv_a_proj_with_mqa``
-    are fused into ``linear_qkv``.
+    are fused into ``linear_qkv``. ``attention_head_chunk_size`` partitions projection
+    and attention by head; zero keeps the ordinary path. Inside a Hyper checkpoint,
+    each block is also checkpointed to bound backward activation memory. Outside
+    checkpointing, blocks use ordinary autograd. Head chunking supports eager DP/FSDP,
+    no TP/CP or dropout;
+    BF16 gradient accumulation need not be bitwise identical to the ordinary path.
     """
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "", context: Any = None) -> None:
@@ -206,6 +245,10 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         self.key_rope_gather = nn.Identity()
         self.register_buffer("max_logits_val", None, persistent=False)
         self.attention_interface = observed_fusion_attention
+        self.head_chunk_size = _get_attention_head_chunk_size(self.config)
+        if self.head_chunk_size:
+            self.q_b_proj = _HeadSliceLinear(self.q_b_proj)
+            self.kv_b_proj = _HeadSliceLinear(self.kv_b_proj)
 
     def project_latent_inputs(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return normalized Q/KV latents and the shared key at their existing SP boundaries.
@@ -261,6 +304,62 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         # Preserve the BNSD interface with token-major storage for packed attention.
         return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
 
+    def _attend_head_chunk(self, query_latent: torch.Tensor, kv_latent: torch.Tensor, key_rope: torch.Tensor,
+                           cos: torch.Tensor, sin: torch.Tensor, *, begin: int, end: int,
+                           attention_mask: Any, options: dict[str, Any]) -> torch.Tensor:
+        """Expand and attend one head block inside its recomputation boundary."""
+        batch, sequence = query_latent.shape[:2]
+        heads = end - begin
+        query = self.q_b_proj(query_latent, rows=slice(begin * self.qk_head_dim, end * self.qk_head_dim))
+        query = query.reshape(batch, sequence, heads, self.qk_head_dim).transpose(1, 2)
+        query_pass, query_rope = query.split((self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
+        query = torch.cat((query_pass, self.explicit_rotary(query_rope, cos, sin)), dim=-1)
+        del query_pass, query_rope
+        query = query.transpose(1, 2).contiguous().transpose(1, 2)
+        width = self.qk_nope_head_dim + self.v_head_dim
+        kv_states = self.kv_b_proj(kv_latent, rows=slice(begin * width, end * width))
+        kv_states = kv_states.reshape(batch, sequence, heads, width).transpose(1, 2)
+        key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
+        key = torch.cat((key_pass, key_rope.expand(-1, heads, -1, -1)), dim=-1)
+        del key_pass, kv_states
+        key = key.transpose(1, 2).contiguous().transpose(1, 2)
+        value = value.transpose(1, 2).contiguous().transpose(1, 2)
+        output, _ = self.attention_interface(
+            self, query, key, value, attention_mask, dropout=0.0, scaling=self.scaling,
+            sliding_window=self.sliding_window, head_range=(begin, end), **options)
+        return output
+
+    def _forward_head_chunks(self, hidden_states: torch.Tensor, position_embeddings: Any,
+                             attention_mask: Any, past_key_values: Any, options: dict[str, Any]) -> tuple:
+        """Partition heads, following the enclosing Hyper checkpoint's activation policy."""
+        if is_compiling():
+            raise ValueError("Head-chunked MLA requires eager execution and HyperParallel checkpoint wrappers")
+        if past_key_values is not None or position_embeddings is None:
+            raise ValueError("JT MLA attention requires position embeddings and no KV cache")
+        if self.num_heads != self.config.num_attention_heads:
+            raise ValueError("Head-chunked MLA requires tp_size=1")
+        query_latent, kv_latent, key_rope = self.project_latent_inputs(hidden_states)
+        cos, sin = position_embeddings
+        key_rope = self.explicit_rotary(key_rope.unsqueeze(1), cos, sin)
+        outputs = []
+        recompute_chunks = torch.is_grad_enabled() and get_recompute_state() is not None
+        for begin in range(0, self.num_heads, self.head_chunk_size):
+            operation = partial(self._attend_head_chunk, begin=begin,
+                                end=min(begin + self.head_chunk_size, self.num_heads),
+                                attention_mask=attention_mask, options=options)
+            if recompute_chunks:
+                # Keep this boundary during outer replay: ordinary autograd there
+                # would retain expanded Q/K/V from every block until backward.
+                output = checkpoint(operation, query_latent, kv_latent, key_rope, cos, sin,
+                                    preserve_rng_state=False)
+            else:
+                output = operation(query_latent, kv_latent, key_rope, cos, sin)
+            outputs.append(output)
+        # Keep one full output GEMM instead of summing separately rounded head projections.
+        output = torch.cat(outputs, dim=2).reshape(*hidden_states.shape[:2], -1)
+        del outputs
+        return self.o_proj(output), None
+
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
                 attention_mask: Any = None, past_key_values: Any = None,
                 actual_seq_len: Any = None, **kwargs: Any) -> tuple[torch.Tensor, Any]:
@@ -277,6 +376,9 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         Returns:
             The attention output and ``None`` attention weights.
         """
+        if self.head_chunk_size:
+            return self._forward_head_chunks(hidden_states, position_embeddings, attention_mask, past_key_values,
+                                             dict(kwargs, actual_seq_len=actual_seq_len))
         query, key, value = self._project_attention_inputs(hidden_states, position_embeddings, past_key_values)
         # Replace each owning reference before FA so old projection storage can be released.
         query = query.transpose(1, 2).contiguous().transpose(1, 2)
@@ -338,6 +440,8 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         Raises:
             ValueError: If ``position_embeddings`` is missing or a cache is given.
         """
+        if getattr(self.config, "attention_head_chunk_size", 0):
+            raise ValueError("attention_head_chunk_size requires a JTDeepseekV3MLAAttention replacement")
         if past_key_values is not None or position_embeddings is None:
             raise ValueError("JT attention requires position embeddings and no KV cache")
         batch, sequence = hidden_states.shape[:2]
@@ -653,6 +757,10 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                 group or RoPE type.
         """
         DeepseekV32PreTrainedModel.__init__(self, config)
+        if _get_attention_head_chunk_size(config):
+            # The Trainer must use Hyper wrappers, whose context also selects
+            # the inner chunk checkpoints, instead of HF reentrant checkpointing.
+            self.supports_gradient_checkpointing = False
         if config.hidden_act != "silu":
             raise ValueError("JT fused experts require hidden_act='silu'")
         if config.n_group != 1 or config.topk_group != 1:
