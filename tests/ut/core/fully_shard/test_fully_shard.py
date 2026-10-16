@@ -699,7 +699,7 @@ class TestHSDPParamV2(unittest.TestCase):
         """Verify no-sync paths still move local grad into accumulated buffer even without dtype conversion."""
         param_v2 = object.__new__(HSDPParamV2)
         grad = torch.ones(2, 2, dtype=torch.float32)
-        param_v2._unsharded_param = MagicMock()
+        param_v2._unsharded_param = torch.nn.Parameter(torch.empty_like(grad))
         param_v2._unsharded_param.grad = grad
         param_v2.reduce_dtype = None
         param_v2.unsharded_accumulated_grad = None
