@@ -177,3 +177,55 @@ class TestJTBuilder(unittest.TestCase):
                     np.savez(Path(directory) / "model.npz", **invalid)
                     with self.assertRaisesRegex(ValueError, message):
                         self.build(reference_weights=directory)
+
+    def test_fa_layer_selection_survives_replacement(self) -> None:
+        """Feature: Per-layer FA preservation.
+
+        Description: Build prefix and explicit selections with native and replacement attention.
+        Expectation: Only selected trunk instances retain FA state; all trunk layers keep checkpoint wrappers.
+        """
+        base_config = dict(self.config)
+        cases = (
+            ({}, [False, False], False),
+            ({"preserve_fa": True}, [True, True], True),
+            ({"preserve_fa": True, "preserve_fa_layer_count": 0}, [False, False], False),
+            ({"preserve_fa": True, "preserve_fa_layer_count": 1}, [True, False], False),
+            ({"preserve_fa": True, "preserve_fa_layer_count": 2}, [True, True], False),
+            ({"preserve_fa": True, "preserve_fa_layer_indices": [1]}, [False, True], False),
+        )
+        for replacements in ((), entries_to_module_replacements(jt_test_config().plan_overrides)):
+            self.setup.module_replacements = replacements
+            for options, expected, mtp_expected in cases:
+                with self.subTest(replaced=bool(replacements), options=options):
+                    self.config = {**base_config, **options}
+                    model = self.build(activation_checkpoint="full")
+                    attention = [layer.self_attn for layer in model.model.layers]
+                    self.assertEqual([module.preserve_fa for module in attention], expected)
+                    for layer in model.model.layers:
+                        self.assertIsInstance(layer, jt_builder.CheckpointWrapper)
+                    self.assertIs(attention[0].config, attention[1].config)
+                    self.assertEqual(model.config.preserve_fa, options.get("preserve_fa", False))
+                    self.assertEqual(model.mtp.layers[0].transformer_layer.self_attn.preserve_fa, mtp_expected)
+                    restored = JTDeepseekV3Config.from_dict(model.config.to_dict())
+                    self.assertEqual([restored.preserve_fa_for_layer(index) for index in range(2)], expected)
+
+    def test_invalid_fa_layer_selection_fails_before_build(self) -> None:
+        """Feature: FA selection configuration validation.
+
+        Description: Reject conflicting, disabled, malformed and out-of-range selectors before infrastructure setup.
+        Expectation: Invalid inputs fail clearly instead of silently selecting the wrong layers.
+        """
+        cases = [
+            {"preserve_fa": "true"},
+            {"preserve_fa": False, "preserve_fa_layer_count": 1},
+            {"preserve_fa_layer_count": 1, "preserve_fa_layer_indices": [1]},
+        ]
+        cases.extend({"preserve_fa_layer_count": value} for value in (-1, 3, True, 1.5))
+        cases.extend({"preserve_fa_layer_indices": value} for value in ([], [2], [-1], [True], [0.5], [1, 1], "1"))
+        base_config = dict(self.config)
+        with patch.object(jt_builder, "instantiate_infrastructure", side_effect=AssertionError("Unexpected build")):
+            for options in cases:
+                with self.subTest(options=options):
+                    self.config = {**base_config, "preserve_fa": True, **options}
+                    with self.assertRaises(ValueError):
+                        self.build(activation_checkpoint="full")

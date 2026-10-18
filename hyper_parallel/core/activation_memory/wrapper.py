@@ -538,6 +538,8 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         if state.is_recomputing:
             entry = cache.pop(id(self))
             _checkpoint_exclude._materialize_recompute_inputs(entry, args, kwargs)
+            if entry.rng_state is not None:
+                entry.rng_state.restore()
             output = (
                 entry.output
                 if self.save_output
@@ -559,6 +561,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
                 output = wrapped_module(*args, **kwargs)
         finally:
             _checkpoint_exclude._restore_recompute_inputs(previous_handles)
+        rng_state = _checkpoint_exclude._RNGState.capture(args, kwargs) if state.preserve_rng_state else None
         needs_recompute_boundary = _checkpoint_exclude._has_used_input(input_bindings)
         tensor_leaf_count = None if self.save_output else [0]
         finalized_output = _checkpoint_exclude._finalize_save_outputs(
@@ -571,7 +574,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         output_tensor_count = 1 if tensor_leaf_count is None else tensor_leaf_count[0]
         cache.save(
             id(self),
-            _checkpoint_exclude._ExcludeCacheEntry(replay_output, input_bindings, output_tensor_count),
+            _checkpoint_exclude._ExcludeCacheEntry(replay_output, input_bindings, output_tensor_count, rng_state),
         )
         return finalized_output
 
@@ -597,6 +600,8 @@ def checkpoint_exclude_wrapper(
     Note:
         This feature requires eager mode and a surrounding HyperParallel
         checkpoint configured with ``use_reentrant=False``. Nested checkpoint
-        exclusion wrappers are not supported.
+        exclusion wrappers are not supported. Default CPU and input-device RNG
+        states follow the surrounding checkpoint's ``preserve_rng_state`` setting;
+        explicit generators and external RNG trackers require caller-managed state.
     """
     return CheckpointExcludeWrapper(module, save_output=save_output)

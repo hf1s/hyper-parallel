@@ -134,6 +134,7 @@ def _observed_attention(module: JTDeepseekV3MLAAttention, runtime: MLAContextPar
     output, _ = module.attention_interface(
         observer, query, key, value, None,
         dropout=0.0, scaling=module.scaling, actual_seq_len=sequence_ends,
+        preserve_fa=module.preserve_fa,
     )
     with torch.no_grad():
         maximum = observer.max_logits_val
