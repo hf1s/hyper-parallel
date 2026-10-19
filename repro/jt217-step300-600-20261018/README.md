@@ -17,6 +17,7 @@
 - source profile: `mf-r180-cann85-910b3-v1`;
 - no P12 experimental factors;
 - no audit/checksum callbacks.
+The YAML selects the archive entry point; it is not the whole implementation. The full 19-file source composition is documented in [`SOURCE_COMPOSITION.md`](SOURCE_COMPOSITION.md).
 
 ## Inputs
 
