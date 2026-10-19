@@ -118,3 +118,6 @@
 #     torch.nn.utils.stateless, torch.distributed.device_mesh). These have no
 #     public API, so the raw imports stay.
 "hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"
+
+# Native DataLoader construction requires PyTorch Dataset and generator APIs.
+"hyper-parallel/hyper_parallel/data/batching/build_dataloader.py"           "forbidden-backend-import"

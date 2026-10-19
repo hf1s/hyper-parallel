@@ -135,6 +135,8 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
             context=_build_replacement_context(distributed_setup, None),
         )
     model.to_empty(device="cpu")
+    # Rotary buffers are nonpersistent and are not restored by the weight archive.
+    model.model.rotary_emb = type(model.model.rotary_emb)(config)
     with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
         arrays = {name: archive[name] for name in archive.files}
     _load_reference_state(model, arrays)

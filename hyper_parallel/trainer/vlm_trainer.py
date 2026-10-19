@@ -15,10 +15,12 @@
 """VLM Trainer assembled from the shared BaseTrainer stages."""
 
 from collections import defaultdict
+from itertools import count
 from typing import Any, Dict
 
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.omni import OmniDataTransform
+from hyper_parallel.data.omni.metadata import vlm_sample_metadata
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
@@ -35,7 +37,7 @@ class VLMTrainer:
     base: BaseTrainer
 
     def __init__(self, config: TrainerConfig) -> None:
-        """Build the VLM Trainer in the same explicit order as VeOmni."""
+        """Build the VLM Trainer in the same explicit order as the base stages."""
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.config = config
 
@@ -50,7 +52,7 @@ class VLMTrainer:
 
         # dataloader
         self._build_collate_fn()
-        self.base._build_dataloader()
+        self.base._build_dataloader(metadata_fn=vlm_sample_metadata)
 
         # get_batch
         self._build_get_batch()
@@ -153,7 +155,11 @@ class VLMTrainer:
         self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches: Any = None) -> None:
-        """Dispatch the step-begin lifecycle hook."""
+        """Dispatch the step-begin lifecycle hook.
+
+        Args:
+            micro_batches: Prepared model inputs for the optimizer step.
+        """
         self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(
@@ -162,48 +168,63 @@ class VLMTrainer:
             loss_dict: Any = None,
             grad_norm: Any = None,
     ) -> None:
-        """Dispatch the step-end lifecycle hook."""
+        """Dispatch the step-end lifecycle hook.
+
+        Args:
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm before the optimizer update.
+        """
         self.base.on_step_end(
             loss=loss,
             loss_dict=loss_dict,
             grad_norm=grad_norm,
         )
 
-    def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one VLM training step."""
-        first_training_batch = self.base.get_batch(data_iterator)
-        num_micro_steps = self.base.num_micro_batches
-        training_batches = [first_training_batch]
-        for _ in range(1, num_micro_steps):
-            training_batches.append(self.base.get_batch(data_iterator))
+    def forward_backward_step(self, data_iterator: Any, num_micro_steps: int) -> tuple[Any, Dict[str, Any]]:
+        """Fetch and execute one micro-batch without retaining earlier device inputs.
 
-        self.on_step_begin(
-            micro_batches=[model_inputs for model_inputs, _ in training_batches]
-        )
+        Args:
+            data_iterator: Iterator supplying one prepared micro-batch.
+            num_micro_steps: Accumulation count for the optimizer step.
+        """
+        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+        self.base.current_token_counts = count_loss_token(loss_inputs)
+        self.base.step_token_counts = {
+            name: token_count * num_micro_steps
+            for name, token_count in self.base.current_token_counts.items()
+        }
+        metric_inputs = {
+            **model_inputs,
+            **loss_inputs,
+            "token_count": self.base.current_token_counts["foundation_tokens"],
+        }
+        self.base.on_micro_step_begin(metric_inputs)
+        del metric_inputs
+        return self.base.forward_backward_step(model_inputs, loss_inputs)
+
+    def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        """Execute one VLM training step.
+
+        Args:
+            data_iterator: Iterator supplying the step's accumulation batches.
+        """
+        num_micro_steps = self.base.num_micro_batches
+        self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step, batch in enumerate(training_batches):
-            model_inputs, loss_inputs = batch
+        for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base.configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            self.base.current_token_counts = count_loss_token(loss_inputs)
-            self.base.step_token_counts = {
-                name: token_count * num_micro_steps
-                for name, token_count in self.base.current_token_counts.items()
-            }
-            loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
-
-            # Release each device batch as soon as its backward pass completes;
-            # prefetching all micro-batches must not pin them until step end.
-            training_batches[micro_step] = None
+            loss, loss_dict = self.forward_backward_step(data_iterator, num_micro_steps)
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
@@ -230,9 +251,30 @@ class VLMTrainer:
         }
         return step_metrics
 
+    def _train_epoch(self, epoch: int, collective_source: bool) -> bool:
+        """Run complete optimizer steps and report actual Dataset exhaustion."""
+        train_dataloader = self.base.train_dataloader
+        data_iterator = iter(train_dataloader) if train_dataloader is not None else None
+        start_step = self.base.state.global_step - epoch * self.base.train_steps
+        train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+        if collective_source:
+            start_step = 0
+            train_steps = self.base.train_iters - self.base.state.global_step
+        for _ in range(start_step, train_steps):
+            try:
+                self.train_step(data_iterator)
+            except StopIteration:
+                optimizers = self.base.optimizer
+                for optimizer in optimizers if isinstance(optimizers, list) else [optimizers]:
+                    optimizer.zero_grad()
+                logger.info(
+                    "epoch:%s Dataloader finished with drop_last %s", epoch, self.base.config.dataloader.drop_last
+                )
+                return True
+        return False
+
     def train(self) -> None:
         """Run the VLM training loop."""
-        config = self.base.config
         self.on_train_begin()
         logger.info(
             "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
@@ -243,33 +285,38 @@ class VLMTrainer:
             self.base.train_epochs,
         )
 
-        # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
-        for epoch in range(self.base.state.epoch, self.base.train_epochs):
-            train_dataloader = self.base.train_dataloader
-
-            if hasattr(train_dataloader, "set_epoch"):
+        train_dataloader = self.base.train_dataloader
+        collective_source = bool(getattr(train_dataloader, "collective_source", False))
+        start_epoch = self.base.state.epoch
+        epochs = count(start_epoch) if collective_source else range(start_epoch, self.base.train_epochs)
+        for epoch in epochs:
+            if self.base.state.global_step >= self.base.train_iters:
+                break
+            # Do not erase the cursor restored by on_train_begin on the first epoch.
+            if hasattr(train_dataloader, "set_epoch") and (not collective_source or epoch != start_epoch):
                 train_dataloader.set_epoch(epoch)
 
+            self.base.state.epoch = epoch
             self.on_epoch_begin()
-            data_iterator = iter(train_dataloader) if train_dataloader is not None else None
-
-            start_step = self.base.state.global_step - epoch * self.base.train_steps
-            train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
-            for _ in range(start_step, train_steps):
-                try:
-                    self.train_step(data_iterator)
-                except StopIteration:
-                    logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
-                    break
+            epoch_start_step = self.base.state.global_step
+            epoch_exhausted = self._train_epoch(epoch, collective_source)
+            if collective_source and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
+                raise ValueError("VLM Dataset epoch cannot provide one complete optimizer step")
 
             self.on_epoch_end()
-            self.base.state.epoch = epoch + 1
+            self.base.state.epoch = epoch + 1 if not collective_source or epoch_exhausted else epoch
             print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
             if self.base.state.global_step >= self.base.train_iters:
                 break
 
         self.on_train_end()
+
+        if collective_source:
+            try:
+                train_dataloader.wait_for_prefetch()
+            finally:
+                train_dataloader.close()
 
         synchronize()
         self.base.destroy_distributed()
