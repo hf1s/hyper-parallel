@@ -119,8 +119,11 @@ class TestArchivedReductions(unittest.TestCase):
             tiled_square_sum(torch.ones(0), 64, 16)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_weighted_sum_follows_80_row_half_tree_then_64_lane_adjacent_tree(self):
-        """Hidden position r * 64 + l is row r of lane l: rows meet by halves, lanes by neighbours."""
+    def test_weighted_sum_follows_80_row_half_tree_then_native_64_lane_sum(self):
+        """Hidden position r * 64 + l is row r of lane l: rows meet by halves (locked, archived order);
+        lanes sum natively (issue #252 arm R10 found the archived adjacent-pair lane tree numerically
+        inert for this layout). Native torch sum isn't naive left-to-right accumulation either, so this
+        same two-EPS-before-the-1 construction still survives across lanes, not just across rows."""
         rows = torch.zeros(1, 5120, dtype=torch.bfloat16)
         rows[0, [0, 64, 192]] = torch.tensor([1.0, EPS, EPS], dtype=torch.bfloat16)  # lane 0, rows 0, 1, 3
         self.assertEqual(weighted_sum(rows).item(), ONE_PLUS_TWO_EPS)

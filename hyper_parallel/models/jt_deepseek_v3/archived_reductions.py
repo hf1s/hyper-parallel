@@ -105,11 +105,20 @@ def gradient_square_sum(value: torch.Tensor) -> np.float32:
 
 
 def weighted_sum(product: torch.Tensor) -> torch.Tensor:
-    """Sum a BF16 weighted derivative with FP32 80-row/64-lane arithmetic."""
+    """Sum a BF16 weighted derivative: FP32 80-row half tree, then a native 64-lane sum.
+
+    issue #252's NPU single-factor ablation (arm R10: 200 steps from a shared checkpoint,
+    same recipe otherwise) found the archived 64-lane adjacent-pair tree bit-identical to a
+    native FP32 sum over the same axis on that backend -- swapping just the lane reduction
+    left the training trajectory unchanged (first_diff: none vs. the unmodified recipe).
+    The 80-row half tree is not interchangeable the same way: swapping it alone (arm R9,
+    same setup) left a late, weak divergence (first difference at step 479 of a 301-500
+    window, 1 of 200 steps over the 5e-3 threshold), so it stays archived here.
+    """
     if product.shape[-1] != 5120 or product.dtype != torch.bfloat16:
         raise ValueError("The archived weighted reduction requires BF16 hidden width 5120")
     rows = product.float().reshape(-1, 80, 64).transpose(-1, -2)
-    return adjacent_tree(half_tree(rows)).reshape(*product.shape[:-1], 1)
+    return half_tree(rows).sum(dim=-1).reshape(*product.shape[:-1], 1)
 
 
 __all__ = [
