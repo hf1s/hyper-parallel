@@ -356,7 +356,11 @@ class IndexedDatasetSplitBuilder:
         if (
             config.data_lazy_load
             and self.dataloader_context.distributed_enabled
-            and not (self.dataloader_context.data_index_cache or self.dataloader_context.build_on_rank())
+            and not (
+                self.dataloader_context.collective_source
+                or self.dataloader_context.data_index_cache
+                or self.dataloader_context.build_on_rank()
+            )
         ):
             return cast(DatasetSplits, (None, None, None))
 

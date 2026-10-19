@@ -18,13 +18,14 @@ from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch.nn import functional as F
 
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP
 from hyper_parallel.components.losses import calculate_mtp_loss
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.jt_deepseek_v3.adapter.data.dataset import JTSequenceRuntime
 from hyper_parallel.data.batching.runtime_input import RuntimeInputContext
 from hyper_parallel.distributed._builder.forward_rewriter import _commit_forward_rewrite
@@ -37,6 +38,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Attention, observed_fusion_attention,
 )
 from hyper_parallel.models.jt_deepseek_v3.adapter.runtime import jt_optimizer
+from tests.common.mark_utils import arg_mark
 
 
 class TestJTContextParallel(unittest.TestCase):
@@ -85,20 +87,30 @@ class TestJTContextParallel(unittest.TestCase):
                 value = torch.cat((value[:, 1:], torch.full_like(value[:, :1], pad_value)), 1)
                 torch.testing.assert_close(torch.cat(results, 1), value)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_fa_observation_requests_tnd_statistics(self):
-        """Per-head maxima follow explicit TND or BNSD statistics layout."""
+        """Feature: Per-head QK statistics.
+        Description: Observe Tensor and DTensor kernel statistics in packed and unpacked layouts.
+        Expectation: Both layouts preserve each local head's maximum and request the matching kernel layout.
+        """
         query = torch.zeros(1, 2, 3, 4)
         maxima = torch.tensor([2.0, 7.0])
         for packed in (True, False):
             stats = maxima.view(1, 2, 1).expand(3, 2, 8).clone() if packed else (
                 maxima.view(1, 2, 1, 1).expand(1, 2, 3, 8).clone())
             output = torch.zeros(3, 2, 4) if packed else torch.zeros_like(query)
-            observer = SimpleNamespace(max_logits_val=None, is_causal=True)
-            with patch("torch_npu.npu_fusion_attention", return_value=(output, stats)) as kernel:
-                observed_fusion_attention(observer, query, query, query, None,
-                                          actual_seq_len=(3,) if packed else None)
-            self.assertEqual(kernel.call_args.kwargs["softmax_layout"], "TND" if packed else "")
-            torch.testing.assert_close(observer.max_logits_val, maxima)
+            for distributed_stats in (False, True):
+                result_stats = Mock(spec=DTensor) if distributed_stats else stats
+                if distributed_stats:
+                    result_stats.to_local.return_value = stats
+                observer = SimpleNamespace(max_logits_val=None, is_causal=True)
+                with self.subTest(packed=packed, distributed_stats=distributed_stats), patch(
+                        "torch_npu.npu_fusion_attention", return_value=(output, result_stats),
+                ) as kernel:
+                    observed_fusion_attention(observer, query, query, query, None,
+                                              actual_seq_len=(3,) if packed else None)
+                    self.assertEqual(kernel.call_args.kwargs["softmax_layout"], "TND" if packed else "")
+                    torch.testing.assert_close(observer.max_logits_val, maxima)
 
     def test_mtp_loss_uses_global_target_denominator(self):
         """Local MTP sums use global target counts before the model-level CP sum."""
