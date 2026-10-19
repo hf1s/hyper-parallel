@@ -327,6 +327,17 @@ class TestArchivedMoE(unittest.TestCase):
                                    torch.stack((ranked % tokens, ranked // tokens)), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_expert_order_breaks_ties_by_the_original_top_k_major_position(self):
+        """Equal expert ids keep their top-k-major relative order now that both sorts are stable (#252 R6)."""
+        # token-major (token, slot) -> expert id: tokens 0 and 2 route (1, 0), token 1 routes (0, 1).
+        indices = torch.tensor([[1, 0], [0, 1], [1, 0]])
+        order = _expert_order(indices)
+        # Expert 0 sits at top-k-major positions 1, 3, 5 (token 1 slot 0, token 0 slot 1, token 2 slot 1);
+        # expert 1 sits at 0, 2, 4. A stable tie-break keeps each group in that top-k-major order.
+        torch.testing.assert_close(order, torch.tensor([2, 1, 5, 0, 4, 3]), rtol=0, atol=0)
+        torch.testing.assert_close(indices.reshape(-1)[order], torch.tensor([0, 0, 0, 1, 1, 1]), rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_expert_order_rejects_2_24_entries(self):
         """2**24 entries exceed the archive's exact FP32 sorting range and raise."""
         too_many = torch.zeros(1, 1, dtype=torch.long).expand(2 ** 23, 2)  # 2**24 entries, nothing allocated

@@ -201,12 +201,22 @@ class _WeightedProduct(torch.autograd.Function):
 def _expert_order(indices: torch.Tensor) -> torch.Tensor:
     """Return the archive's expert-major order of the token-major positions ``t * top_k + k``.
 
-    As in the archive, the expert ids are flattened top-k-major (slot ``k`` of every token before
-    slot ``k + 1``), cast to FP32 and argsorted twice with the default ``torch.sort``, which need not
-    be stable. The result is always grouped by ascending expert id; the order inside one expert is
-    whatever the backend sort returns, exactly as in the archive. On CPU it already differs from the
-    stable top-k-major order at a few dozen entries, and whether the NPU sort matches the stable order
-    is unverified. The code stays operation-identical to the archive so that NPU replays its order.
+    The expert ids are flattened top-k-major (slot ``k`` of every token before slot ``k + 1``),
+    cast to FP32 and argsorted twice with ``torch.sort(..., stable=True)``. The result is always
+    grouped by ascending expert id; ties within one expert keep the original top-k-major order.
+
+    Both sorts were previously left unstable, matching the archive's compiled graph but leaving the
+    within-expert order backend-defined: on CPU, forcing stability changes 8192 of 8208 positions for
+    a realistic 4104-token/top-2 batch. A single-factor NPU ablation against the training trajectory
+    (issue #252, arm R6: 200 steps from a shared checkpoint, same metrics and bitwise-equal loss curve
+    with and without ``stable=True``) found it numerically inert on that backend and configuration.
+    This is not a backend coincidence for ``num_experts_per_tok == 2``: every token then contributes
+    exactly two terms to the later ``index_add_`` join, and IEEE 754 addition of two operands is
+    exactly commutative regardless of which one is added first, so no within-expert tie-break order
+    can change that sum. Stabilizing removes a dependency on backend sort behavior that could change
+    silently across torch/torch_npu versions, at no measured numerical cost. The commutativity
+    argument does not extend to ``num_experts_per_tok >= 3``, where three-or-more-term sums are
+    order-sensitive; re-run the ablation before relying on this for other top-k values.
 
     Raises:
         ValueError: If ``indices`` holds ``2 ** 24`` or more entries, the archive's limit for exact FP32 sorting.
@@ -215,8 +225,8 @@ def _expert_order(indices: torch.Tensor) -> torch.Tensor:
     if indices.numel() >= 2 ** 24:
         raise ValueError("Archived FP32 expert sorting requires exactly representable integer indices")
     ids = indices.transpose(0, 1).reshape(1, -1).float()
-    sorted_ids, first = torch.sort(ids, dim=1)
-    second = torch.sort(sorted_ids, dim=1)[1]
+    sorted_ids, first = torch.sort(ids, dim=1, stable=True)
+    second = torch.sort(sorted_ids, dim=1, stable=True)[1]
     combined = first.gather(1, second).reshape(-1)
     return (combined % token_count) * top_k + combined // token_count
 
