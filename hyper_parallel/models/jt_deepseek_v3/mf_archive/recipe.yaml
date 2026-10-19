@@ -1,5 +1,5 @@
 model:
-  _target_: hyper_parallel.models.jt_deepseek_v3.mf_archive.model.build_archived_model
+  _target_: hyper_parallel.models.jt_deepseek_v3.archived_model.build_archived_model
   archive_profile: mf-r180-cann85-910b3-v1
   config:
     architectures:
@@ -62,7 +62,7 @@ plan_overrides:
   module_type: hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.JTDeepseekV3Attention
   exact_type: true
   replace_module:
-    _target_: hyper_parallel.models.jt_deepseek_v3.mf_archive.layers.ArchivedMLAAttention
+    _target_: hyper_parallel.models.jt_deepseek_v3.archived_layers.ArchivedMLAAttention
 - match: '*.self_attn'
   params:
     linear_qkv.weight:
@@ -193,7 +193,7 @@ dataloader:
   drop_last: true
   num_workers: 0
 optimizer:
-  _target_: hyper_parallel.models.jt_deepseek_v3.mf_archive.optimizer.ArchivedOptimizerBuilder
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.archived_optimizer.ArchivedOptimizerBuilder
   fp32_main_params: true
   muon_config:
     lr: 0.0001

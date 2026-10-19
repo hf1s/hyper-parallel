@@ -1,0 +1,308 @@
+[
+  {
+    "name": "embedding.word_embeddings.weight",
+    "shape": [
+      152064,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.0.self_attention.linear_proj.weight",
+    "shape": [
+      5120,
+      16384
+    ]
+  },
+  {
+    "name": "decoder.layers.0.self_attention.linear_q_down_proj.weight",
+    "shape": [
+      1536,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.0.self_attention.linear_q_up_proj.weight",
+    "shape": [
+      24576,
+      1536
+    ]
+  },
+  {
+    "name": "decoder.layers.0.self_attention.linear_kv_down_proj.weight",
+    "shape": [
+      576,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.0.self_attention.linear_kv_up_proj.weight",
+    "shape": [
+      32768,
+      512
+    ]
+  },
+  {
+    "name": "decoder.layers.0.mlp.linear_fc1.weight",
+    "shape": [
+      24576,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.0.mlp.linear_fc2.weight",
+    "shape": [
+      5120,
+      12288
+    ]
+  },
+  {
+    "name": "decoder.layers.1.self_attention.linear_proj.weight",
+    "shape": [
+      5120,
+      16384
+    ]
+  },
+  {
+    "name": "decoder.layers.1.self_attention.linear_q_down_proj.weight",
+    "shape": [
+      1536,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.1.self_attention.linear_q_up_proj.weight",
+    "shape": [
+      24576,
+      1536
+    ]
+  },
+  {
+    "name": "decoder.layers.1.self_attention.linear_kv_down_proj.weight",
+    "shape": [
+      576,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.1.self_attention.linear_kv_up_proj.weight",
+    "shape": [
+      32768,
+      512
+    ]
+  },
+  {
+    "name": "decoder.layers.1.mlp.router.weight",
+    "shape": [
+      8,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.1.mlp.experts.weight1",
+    "shape": [
+      40960,
+      3072
+    ]
+  },
+  {
+    "name": "decoder.layers.1.mlp.experts.weight2",
+    "shape": [
+      12288,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.1.mlp.shared_experts.linear_fc1.weight",
+    "shape": [
+      6144,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.1.mlp.shared_experts.linear_fc2.weight",
+    "shape": [
+      5120,
+      3072
+    ]
+  },
+  {
+    "name": "mtp.layers.0.eh_proj.weight",
+    "shape": [
+      5120,
+      10240
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.self_attention.linear_proj.weight",
+    "shape": [
+      5120,
+      16384
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.self_attention.linear_q_down_proj.weight",
+    "shape": [
+      1536,
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.self_attention.linear_q_up_proj.weight",
+    "shape": [
+      24576,
+      1536
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.self_attention.linear_kv_down_proj.weight",
+    "shape": [
+      576,
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.self_attention.linear_kv_up_proj.weight",
+    "shape": [
+      32768,
+      512
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.mlp.router.weight",
+    "shape": [
+      8,
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.mlp.experts.weight1",
+    "shape": [
+      40960,
+      3072
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.mlp.experts.weight2",
+    "shape": [
+      12288,
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc1.weight",
+    "shape": [
+      6144,
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc2.weight",
+    "shape": [
+      5120,
+      3072
+    ]
+  },
+  {
+    "name": "output_layer.weight",
+    "shape": [
+      152064,
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.0.input_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.0.self_attention.q_layernorm.weight",
+    "shape": [
+      1536
+    ]
+  },
+  {
+    "name": "decoder.layers.0.self_attention.kv_layernorm.weight",
+    "shape": [
+      512
+    ]
+  },
+  {
+    "name": "decoder.layers.0.pre_mlp_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.1.input_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "decoder.layers.1.self_attention.q_layernorm.weight",
+    "shape": [
+      1536
+    ]
+  },
+  {
+    "name": "decoder.layers.1.self_attention.kv_layernorm.weight",
+    "shape": [
+      512
+    ]
+  },
+  {
+    "name": "decoder.layers.1.pre_mlp_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "decoder.final_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.enorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.hnorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.input_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight",
+    "shape": [
+      1536
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.self_attention.kv_layernorm.weight",
+    "shape": [
+      512
+    ]
+  },
+  {
+    "name": "mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  },
+  {
+    "name": "mtp.layers.0.final_layernorm.weight",
+    "shape": [
+      5120
+    ]
+  }
+]

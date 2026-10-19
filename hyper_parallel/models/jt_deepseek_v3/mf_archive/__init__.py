@@ -13,8 +13,8 @@
 # limitations under the License.
 # ============================================================================
 
-"""Opt-in reproduction of the fixed MF r1.8.0/CANN 8.5 single-card archive.
+"""Compatibility namespace for the fixed MF r1.8.0/CANN 8.5 archive.
 
-This package intentionally includes legacy recipe choices that are not generic
-correctness fixes. See README.md for boundaries and the independent native path.
+The implementation lives in the standard JT model, loss, optimizer, and
+trainer modules. This namespace remains only for documented legacy imports.
 """

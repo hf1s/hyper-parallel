@@ -6,7 +6,7 @@ from pathlib import Path
 
 from hyper_parallel.trainer.callbacks.base import Callback
 from hyper_parallel.trainer.config.parser import parse_training_args
-from hyper_parallel.models.jt_deepseek_v3.mf_archive.training import create_archived_trainer
+from hyper_parallel.trainer.archived import create_archived_trainer
 
 
 class Metrics(Callback):

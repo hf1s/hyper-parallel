@@ -24,12 +24,12 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from hyper_parallel.models.jt_deepseek_v3.mf_archive import model as archive_model
-from hyper_parallel.models.jt_deepseek_v3.mf_archive.layers import (
+from hyper_parallel.models.jt_deepseek_v3 import archived_model as archive_model
+from hyper_parallel.models.jt_deepseek_v3.archived_layers import (
     RoutingNormalization, ArithmeticSigmoid, SharedKeyHalfTree,
 )
-from hyper_parallel.models.jt_deepseek_v3.mf_archive.optimizer import ArchivedMuon, archived_adamw
-from hyper_parallel.models.jt_deepseek_v3.mf_archive.reductions import (
+from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.archived_optimizer import ArchivedMuon, archived_adamw
+from hyper_parallel.models.jt_deepseek_v3.archived_reductions import (
     half_tree, adjacent_tree, tiled_square_sum, normalize_ns,
 )
 from hyper_parallel.trainer.base import BaseTrainer

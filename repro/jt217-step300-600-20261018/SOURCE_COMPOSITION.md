@@ -29,7 +29,22 @@ These are the product-side Muon write-back and fused/logical matrix contracts re
 
 ### Explicit MF archive recipe
 
+The compatibility implementation is now placed in the standard JT module
+families. `mf_archive/` retains only documentation, the original recipe, and
+thin legacy import markers; the active YAML targets do not import those
+markers.
+
 ```text
+hyper_parallel/components/losses/mf_archive.py
+hyper_parallel/models/jt_deepseek_v3/archived_gradient_layout.json
+hyper_parallel/models/jt_deepseek_v3/archived_layers.py
+hyper_parallel/models/jt_deepseek_v3/archived_model.py
+hyper_parallel/models/jt_deepseek_v3/archived_reductions.py
+hyper_parallel/models/jt_deepseek_v3/archived_run.py
+hyper_parallel/models/jt_deepseek_v3/legacy_gemm.py
+hyper_parallel/models/jt_deepseek_v3/adapter/runtime/archived_optimizer.py
+hyper_parallel/trainer/archived.py
+hyper_parallel/trainer/text_trainer.py
 hyper_parallel/models/jt_deepseek_v3/mf_archive/README.md
 hyper_parallel/models/jt_deepseek_v3/mf_archive/__init__.py
 hyper_parallel/models/jt_deepseek_v3/mf_archive/gradient_layout.json
@@ -42,11 +57,12 @@ hyper_parallel/models/jt_deepseek_v3/mf_archive/recipe.yaml
 hyper_parallel/models/jt_deepseek_v3/mf_archive/reductions.py
 hyper_parallel/models/jt_deepseek_v3/mf_archive/run.py
 hyper_parallel/models/jt_deepseek_v3/mf_archive/training.py
-hyper_parallel/trainer/text_trainer.py
 tests/ut/model_integration/test_jt_mf_archive.py
 ```
 
-These files implement the fixed compatibility recipe selected by `hp-archive200-r2.yaml`. They are not the default product path and do not imply that the old MF behavior is generally correct.
+These files implement the fixed compatibility recipe selected by
+`hp-archive200-r2.yaml`. They are not the default product path and do not imply
+that the old MF behavior is generally correct.
 
 ## Not included
 

@@ -1,8 +1,9 @@
 # 固定 MF 归档的显式续训兼容配方
 
-本包用于从固定 MF r1.8.0 归档生成的检查点复现单卡续训。它不是新的 JT 默认实现，
+本目录只保留固定 MF r1.8.0 归档的兼容说明和旧导入路径；实际实现已按产品模块边界放回
+`models/jt_deepseek_v3`、`components/losses`、`trainer` 和 `adapter/runtime`。它不是新的 JT 默认实现，
 也不把“loss 更接近旧 MF”当作数学正确性的证明。当前 JT 模型、Muon、AdamW 和 Trainer
-默认入口不启用本包。总问题及逐项实验证据见 [#217](https://github.com/hf1s/hyper-parallel/issues/217)。
+默认入口不启用本配方。总问题及逐项实验证据见 [#217](https://github.com/hf1s/hyper-parallel/issues/217)。
 
 ## 适用范围
 
@@ -13,7 +14,7 @@
 - 固定形状的归约调度仅在上述范围实测。模型工厂会拒绝未验证的设备、并行度及关键形状。
   不据此承诺其它硬件、CANN 版本或形状的逐位结果及性能。
 
-本包没有参考 loss、未来梯度、逐步修正值、训练步号或元素坐标分支；`gradient_layout.json`
+本配方没有参考 loss、未来梯度、逐步修正值、训练步号或元素坐标分支；`archived_gradient_layout.json`
 只有参数名称、形状和归约顺序。所有计算输入来自本次训练。没有运行时改写源代码、
 全局替换框架函数、改写对象 `__class__` 或加载旧实验脚本。
 
@@ -23,13 +24,13 @@
 
 ```yaml
 model:
-  _target_: hyper_parallel.models.jt_deepseek_v3.mf_archive.model.build_archived_model
+  _target_: hyper_parallel.models.jt_deepseek_v3.archived_model.build_archived_model
   archive_profile: mf-r180-cann85-910b3-v1
   reference_weights: /your/converted-mf-step200
   # config: 完整网络配置，见上述范围；不由本包替换训练数据或标签。
 
 optimizer:
-  _target_: hyper_parallel.models.jt_deepseek_v3.mf_archive.optimizer.ArchivedOptimizerBuilder
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.archived_optimizer.ArchivedOptimizerBuilder
   # muon_config / adamw_config / qk_clip_threshold: 保留原实验值。
 
 dataloader:
@@ -48,7 +49,7 @@ training:
 ```
 
 原 `plan_overrides` 中将 `JTDeepseekV3Attention` 替换为 MLA 的那一项，目标改为
-`hyper_parallel.models.jt_deepseek_v3.mf_archive.layers.ArchivedMLAAttention`，
+`hyper_parallel.models.jt_deepseek_v3.archived_layers.ArchivedMLAAttention`，
 其余配置保持。以上是覆盖项说明，不是可单独运行的完整 YAML。
 
 ```bash
@@ -57,8 +58,7 @@ source /usr/local/Ascend/cann/set_env.sh
 export CLOSE_MATMUL_K_SHIFT=0
 export ASCEND_RT_VISIBLE_DEVICES=0
 python -m torch.distributed.run --nproc_per_node=1 --master_port=31821 \
-  -m hyper_parallel.models.jt_deepseek_v3.mf_archive.run your_complete_recipe.yaml
-```
+  -m hyper_parallel.models.jt_deepseek_v3.archived_run your_complete_recipe.yaml
 
 完整配置模板为本目录 [recipe.yaml](recipe.yaml)，先替换数据、转换权重和原生续训检查点路径。
 正式验收还应记录源码提交/哈希、实际导入路径、CANN 版本、有效配置、恢复状态及每步输入。
@@ -72,13 +72,13 @@ python -m torch.distributed.run --nproc_per_node=1 --master_port=31821 \
 |---|---|
 | Q/latent-KV、expert gate/up 存储融合后的逻辑矩阵边界 | 原生产品问题 [#242 / PR #243](https://github.com/hf1s/hyper-parallel/pull/243)。独立参数与融合存储的更新应等价。归档配方另外按旧 MF schema 拆 Q/KV/RoPE、Q-up/KV-up，不能把这部分都归给存储融合缺陷。 |
 | 单分片 FP32 更新写回 | 产品问题 [#215 / PR #213](https://github.com/hf1s/hyper-parallel/pull/213)。归档配方依赖该修复保留 FP32 更新，不能借本包掩盖公共优化器缺陷。 |
-| `model.py` 的 packed MTP 跨文档 shift | 明确的旧目标兼容。当前文档内 shift 对独立 packed 文档语义正确；旧归档跨文档行为不应成为默认。本包仅为了比较原检查点保留它，attention 仍按文档隔离。 |
-| `model.py` 的绝对 RoPE 位置 | 旧配方选择；绝对位置与文档重置位置须在输入审计中明确，不能暗改后再称同配置。 |
-| `optimizer.py` 的 Q-up 共用末分片 shape scale | 旧归档行为。现代逐矩阵算法应使用各自逻辑形状；共用末片缩放不推荐用于新训练，只在显式归档配方保留。 |
-| `layers.py` 的 FP32 norm/router/embedding/head、残差和分支梯度合并 | 可选混合精度配方。较晚舍入保留更多信息，但不能仅以接近 MF 证明另一种 dtype 配置是代码错误。 |
-| `losses.py`、`reductions.py` 的归约顺序、epsilon 字面量转换 | 旧编译图的数值兼容。FP32 加法不满足结合律，BF16 舍入边界可放大微小差异；固定 tile/core 不是通用正确性规则。 |
+| `archived_model.py` 的 packed MTP 跨文档 shift | 明确的旧目标兼容。当前文档内 shift 对独立 packed 文档语义正确；旧归档跨文档行为不应成为默认。本配方仅为了比较原检查点保留它，attention 仍按文档隔离。 |
+| `archived_model.py` 的绝对 RoPE 位置 | 旧配方选择；绝对位置与文档重置位置须在输入审计中明确，不能暗改后再称同配置。 |
+| `archived_optimizer.py` 的 Q-up 共用末分片 shape scale | 旧归档行为。现代逐矩阵算法应使用各自逻辑形状；共用末片缩放不推荐用于新训练，只在显式归档配方保留。 |
+| `archived_layers.py` 的 FP32 norm/router/embedding/head、残差和分支梯度合并 | 可选混合精度配方。较晚舍入保留更多信息，但不能仅以接近 MF 证明另一种 dtype 配置是代码错误。 |
+| `mf_archive.py`、`archived_reductions.py` 的归约顺序、epsilon 字面量转换 | 旧编译图的数值兼容。FP32 加法不满足结合律，BF16 舍入边界可放大微小差异；固定 tile/core 不是通用正确性规则。 |
 | `legacy_gemm.py` 的输出头权重梯度 MatMulV2/NZ | 旧 GEMM 累加路线兼容。结果的数学表达式仍为 `dy.T @ x`；仅改变此导数的内核路线，作用域内设置并恢复编译及格式开关。 |
-| `optimizer.py` 的 sum-form 动量、NS 标量和 AdamW 运算顺序 | 归档优化配方/舍入兼容；完整恢复已有 moment 是前提。不能将零状态重启包装成恢复成功。 |
+| `archived_optimizer.py` 的 sum-form 动量、NS 标量和 AdamW 运算顺序 | 归档优化配方/舍入兼容；完整恢复已有 moment 是前提。不能将零状态重启包装成恢复成功。 |
 
 最新 MF PyNative、Megatron 和归档实现是三个不同参考，不应互相替代：
 
