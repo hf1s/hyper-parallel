@@ -6,14 +6,16 @@ The reproduction does **not** consist of a YAML file alone.
 
 ```text
 base: a1e6c222eab097c9609d6e744a3c5f98aeed6bdc
-head: fe16c866cba6f40e5fea432e8147e7446fbf1e7f
+canonical_head: fe16c866cba6f40e5fea432e8147e7446fbf1e7f
+refactor_branch: repro/jt217-auditable-archive-20261018
 ```
 
-The exact source tree is the branch root in the Git worktree. The Huawei runtime bundle copies that same tree into its sibling `source/` directory.
+The exact canonical source tree is the branch root in the Git worktree. The
+Huawei runtime bundle copies that same tree into its sibling `source/`
+directory. The refactor branch preserves that calculation tree and relocates
+the archive implementation into standard JT module families.
 
-## Tree delta from base
-
-`git diff --name-status a1e6c222 fe16c866` contains 19 files:
+The canonical source delta from base contains 19 files:
 
 ### Muon storage/update compatibility
 

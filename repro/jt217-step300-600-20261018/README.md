@@ -10,14 +10,29 @@
 
 ## Frozen source/config
 
-- source head: `fe16c866cba6f40e5fea432e8147e7446fbf1e7f`
+- canonical source head: `fe16c866cba6f40e5fea432e8147e7446fbf1e7f`;
+- refactor source: branch `repro/jt217-auditable-archive-20261018`;
 - source is the parent repository on the Git branch;
 - in the Huawei runtime bundle, the same source is at the sibling `source/` directory;
 - config: `config/hp-archive200-r2.yaml`;
 - source profile: `mf-r180-cann85-910b3-v1`;
 - no P12 experimental factors;
 - no audit/checksum callbacks.
-The YAML selects the archive entry point; it is not the whole implementation. The full 19-file source composition is documented in [`SOURCE_COMPOSITION.md`](SOURCE_COMPOSITION.md).
+The YAML selects the archive entry point; it is not the whole implementation. The full source composition is documented in [`SOURCE_COMPOSITION.md`](SOURCE_COMPOSITION.md).
+
+## Refactor rerun on Huawei-129
+
+| 核查项 | 原 canonical archive | auditable archive branch | 结论 |
+|---|---|---|---|
+| 活动实现位置 | `models/jt_deepseek_v3/mf_archive/*` | JT model、loss、optimizer、trainer 标准模块 | 实现已移出 `mf_archive`；旧目录只保留说明和兼容标记 |
+| 配置 target | `mf_archive.model/layers/optimizer` | `archived_model`、`archived_layers`、`adapter.runtime.archived_optimizer` | 活动配置不再导入旧实现路径 |
+| 模型、数据、恢复状态 | 相同 `paths.env` | 相同 `paths.env` | 使用同一 step300 锚点和数据集 |
+| HP continuation | step301–600 | step301–600 | 两次均成功完成 300 steps |
+| metrics 对齐 | 300 行 | 300 行 | step、component keys 全部一致 |
+| 数值逐值比较 | 旧 HP metrics | 新 HP metrics | 1500/1500 数值完全相等；最大绝对/相对差均为 0 |
+| MF 重跑 | 未运行 | 未运行 | 本次只验证 HP 侧 |
+
+新 bundle 输出：`/workspace/zth-jt-precision-scripts/repro/jt217-auditable-archive-20261018-overlay/output/hp/`。
 
 ## Inputs
 
