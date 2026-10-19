@@ -47,7 +47,7 @@ from hyper_parallel.core.distributed_checkpoint import (
     load as dcp_load,
     save as dcp_save,
 )
-from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
+from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict, set_element
 from hyper_parallel.core.optimizer.adamw import AdamW as HyperAdamW
 from hyper_parallel.core.optimizer.muon import Muon as HyperMuon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
@@ -153,6 +153,26 @@ def _prepare_main_param_state_for_dcp_load(
             )
 
 
+def _prepare_muon_batching_for_dcp_load(
+        state_dict: Dict[str, Any],
+        available_keys: set[str],
+) -> None:
+    """Use legacy batching when an optimizer checkpoint predates the policy flag."""
+    optimizer_state = state_dict.get("optimizer")
+    is_list = isinstance(optimizer_state, list)
+    optimizer_states = optimizer_state if is_list else [optimizer_state]
+    for index, optimizer_state in enumerate(optimizer_states):
+        if not isinstance(optimizer_state, dict):
+            continue
+        prefix = f"optimizer.{index}" if is_list else "optimizer"
+        flattened_state, paths = flatten_state_dict(optimizer_state)
+        for key in flattened_state:
+            if not key.startswith("param_groups.") or not key.endswith(".ns_batch_across_params"):
+                continue
+            if f"{prefix}.{key}" not in available_keys:
+                set_element(optimizer_state, paths[key], True)
+
+
 class _ModelStrictLoadPlanner(StandardLoadPlanner):
     """Allow partial optimizer state while still requiring a complete model.
 
@@ -186,6 +206,7 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
             state_dict,
             set(metadata.state_dict_metadata),
         )
+        _prepare_muon_batching_for_dcp_load(state_dict, set(metadata.state_dict_metadata))
         super().configure_planner(state_dict, metadata, **kwargs)
 
     def build_local_plan(self) -> Any:
