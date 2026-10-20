@@ -66,10 +66,6 @@ class TestArchivedReductions(unittest.TestCase):
         """Lane 2k meets lane 2k + 1; non-power-of-two widths are padded with zeros."""
         self.assertEqual(adjacent_tree(lanes(1.0, EPS, 0.0, EPS)).item(), 1.0)
         self.assertEqual(adjacent_tree(lanes(EPS, EPS, 1.0)).item(), ONE_PLUS_TWO_EPS)
-        with self.assertRaisesRegex(ValueError, "at least one lane"):
-            adjacent_tree(torch.zeros(2, 0))
-        with self.assertRaisesRegex(ValueError, "nonempty final dimension"):
-            half_tree(torch.zeros(2, 0))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_host_sums_round_after_every_addition_in_core_order(self):
@@ -79,8 +75,6 @@ class TestArchivedReductions(unittest.TestCase):
         # Tile i accumulates on core i % cores: core 0 holds 1 + 0, core 1 holds EPS + EPS.
         self.assertEqual(core_sum(partials, cores=2), np.float32(ONE_PLUS_TWO_EPS))
         self.assertEqual(core_sum(partials, cores=1), np.float32(1.0))
-        with self.assertRaisesRegex(ValueError, "core count must be positive"):
-            core_sum(partials, cores=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_square_sum_tile_reduces_rows_by_halves_then_lanes_natively(self):
@@ -113,10 +107,6 @@ class TestArchivedReductions(unittest.TestCase):
             expected = value.double().square().sum().item()
             actual = float(gradient_square_sum(value))
             self.assertLess(abs(actual - expected), bound * expected, f"count={count}")
-        with self.assertRaisesRegex(ValueError, "Expected FP32 values"):
-            gradient_square_sum(torch.ones(64, dtype=torch.float64))
-        with self.assertRaisesRegex(ValueError, "empty tensor"):
-            tiled_square_sum(torch.ones(0), 64, 16)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_weighted_sum_follows_80_row_half_tree_then_native_64_lane_sum(self):
@@ -144,9 +134,6 @@ class TestArchivedReductions(unittest.TestCase):
         torch.testing.assert_close(actual.double(), product.double().sum(-1, keepdim=True), rtol=0, atol=bound)
         torch.testing.assert_close(weighted_sum(torch.eye(5120, dtype=torch.bfloat16)), torch.ones(5120, 1),
                                    rtol=0, atol=0)
-        for invalid in (product.float(), product[:, :4096]):
-            with self.assertRaisesRegex(ValueError, "BF16 hidden width 5120"):
-                weighted_sum(invalid)
 
 
 if __name__ == "__main__":

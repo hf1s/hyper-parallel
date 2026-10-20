@@ -31,8 +31,6 @@ import torch
 
 def half_tree(values: torch.Tensor) -> torch.Tensor:
     """Reduce the last axis by halves, folding an odd tail into the first lane."""
-    if values.ndim == 0 or values.shape[-1] == 0:
-        raise ValueError("A reduction requires a nonempty final dimension")
     work = values
     while work.shape[-1] > 1:
         size = work.shape[-1]
@@ -47,8 +45,6 @@ def half_tree(values: torch.Tensor) -> torch.Tensor:
 def adjacent_tree(values: torch.Tensor) -> torch.Tensor:
     """Reduce adjacent pairs, padding the final axis to a power of two."""
     width = values.shape[-1]
-    if width <= 0:
-        raise ValueError("A reduction requires at least one lane")
     padded_width = 1 << (width - 1).bit_length()
     if padded_width != width:
         padded = values.new_zeros((*values.shape[:-1], padded_width))
@@ -69,8 +65,6 @@ def sequential_sum(values: np.ndarray) -> np.float32:
 
 def core_sum(partials: np.ndarray, cores: int = 40) -> np.float32:
     """Accumulate tiles on strided vector cores, then accumulate cores in order."""
-    if cores <= 0:
-        raise ValueError("The core count must be positive")
     accumulators = np.zeros(cores, dtype=np.float32)
     for index, partial in enumerate(partials):
         core = index % cores
@@ -80,11 +74,7 @@ def core_sum(partials: np.ndarray, cores: int = 40) -> np.float32:
 
 def tiled_square_sum(value: torch.Tensor, tile: int, width: int) -> np.float32:
     """Square FP32 values and execute a bounded-memory row/lane/core schedule."""
-    if value.dtype != torch.float32 or tile <= 0 or width <= 0 or tile % width:
-        raise ValueError("Expected FP32 values and a positive tile divisible by its SIMD width")
     flat = value.reshape(-1)
-    if not flat.numel():
-        raise ValueError("Cannot reduce an empty tensor")
     partials = []
     for start in range(0, flat.numel(), tile * 512):
         piece = flat[start:start + tile * 512]
@@ -115,8 +105,6 @@ def weighted_sum(product: torch.Tensor) -> torch.Tensor:
     same setup) left a late, weak divergence (first difference at step 479 of a 301-500
     window, 1 of 200 steps over the 5e-3 threshold), so it stays archived here.
     """
-    if product.shape[-1] != 5120 or product.dtype != torch.bfloat16:
-        raise ValueError("The archived weighted reduction requires BF16 hidden width 5120")
     rows = product.float().reshape(-1, 80, 64).transpose(-1, -2)
     return half_tree(rows).sum(dim=-1).reshape(*product.shape[:-1], 1)
 
