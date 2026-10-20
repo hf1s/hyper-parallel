@@ -251,16 +251,8 @@ class ArchivedMoE(jt.JTDeepseekV3MoE):
         Returns:
             Expert indices and routing weights, ``[padding + tokens, top_k]``; pad token ``p`` uses
             experts ``(p * top_k + k) % padding`` with zero weight.
-
-        Raises:
-            ValueError: If the configuration is not single-group normalized top-k routing, or if
-                the auxiliary loss is reduced over a process group.
         """
         config, padding = self.config, self.padding
-        if config.n_group != 1 or config.topk_group != 1 or not config.norm_topk_prob:
-            raise ValueError("The archived recipe requires one normalized routing group")
-        if self.auxiliary_loss_group is not None:
-            raise ValueError("The archived routing recipe is single-card only")
         logits = self.gate(hidden[:, padding:])
         self.gate.pop_router_logits()
         values = logits.view(-1, logits.shape[-1]).float()

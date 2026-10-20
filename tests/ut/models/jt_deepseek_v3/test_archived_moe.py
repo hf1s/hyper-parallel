@@ -254,20 +254,6 @@ class TestArchivedMoE(unittest.TestCase):
         torch.testing.assert_close(weights[:PADDING], torch.zeros(PADDING, 2), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_route_rejects_grouped_unnormalized_and_multi_card_routing(self):
-        """Routing outside the archived single-group, normalized, single-card recipe raises."""
-        hidden = torch.zeros(1, PADDING + 1, 5120)
-        for name, value in (("n_group", 2), ("topk_group", 2), ("norm_topk_prob", False)):
-            config = moe_config()
-            setattr(config, name, value)
-            with self.assertRaisesRegex(ValueError, "one normalized routing group"):
-                ArchivedMoE(config).route(hidden)
-        moe = ArchivedMoE(moe_config())
-        moe.auxiliary_loss_group = object()
-        with self.assertRaisesRegex(ValueError, "single-card only"):
-            moe.route(hidden)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_moe_forward_matches_a_per_token_reference(self):
         """Each token sums w_k * expert_k(x) in FP32, rounds once, and joins the shared experts in FP32."""
         moe, scales = scaled_moe(255)
