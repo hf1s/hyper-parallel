@@ -89,7 +89,12 @@ def _filter_optimizer_config(
         optimizer_class: Any,
         configured_values: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Normalize prefixed YAML keys and remove unsupported constructor args."""
+    """Normalize prefixed YAML keys and reject unsupported constructor args.
+
+    A YAML key this optimizer cannot consume means the run would silently train
+    with a different recipe than the one written down, which is indistinguishable
+    from a real numerical regression. Reject it instead of dropping it.
+    """
     prefix = f"{optimizer_name}_"
     normalized_config = {
         key[len(prefix):] if key.startswith(prefix) else key: value
@@ -107,10 +112,10 @@ def _filter_optimizer_config(
     }
     excluded_keys = normalized_config.keys() - allowed_keys
     if excluded_keys:
-        logger.info_rank0(
-            "Excluded %s config: %s",
-            optimizer_name,
-            list(excluded_keys),
+        raise ValueError(
+            f"{optimizer_name} config has unsupported key(s) "
+            f"{sorted(excluded_keys)}; supported keys are {sorted(allowed_keys)}. "
+            f"Refusing to continue because these values would be silently ignored."
         )
     return filtered_config
 
