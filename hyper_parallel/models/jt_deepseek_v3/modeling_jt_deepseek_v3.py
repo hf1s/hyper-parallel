@@ -696,7 +696,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             input_ids: Token IDs, ``[1, sequence]``.
             shift_labels: Targets already shifted by one token; negative targets are ignored.
             labels: Unused; ``shift_labels`` carries the supervision.
-            position_ids: Sequence positions for RoPE.
+            position_ids: Ignored; RoPE always uses absolute positions (MF archive replay).
             attention_mask: Must be ``None``; cumulative lengths define independent causal documents.
             use_cache: Must be ``False``.
             actual_seq_len: Global cumulative document ends, without a leading zero.
@@ -768,7 +768,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             input_ids: Token IDs, ``[1, sequence]``.
             labels: Targets already shifted by one token.
             loss_mask: Mask of the supervised targets.
-            position_ids: Optional sequence positions for RoPE.
+            position_ids: Ignored; the MF archive always uses absolute positions.
             actual_seq_len: Global cumulative ends of independent documents.
             sequence_start: Global offset of the local input interval.
 
@@ -789,22 +789,14 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                 or sequence_start < 0 or sequence_start + sequence_length > ends[-1]):
             raise ValueError("JT cumulative document ends must increase and cover the local token interval")
         indices = torch.arange(sequence_start, sequence_start + sequence_length, device=input_ids.device)
+        # MF archive replay: no per-document MTP tail mask, so the MTP shift crosses packed documents.
         sequence_end_mask = None
-        if len(ends) > 1:
-            boundaries = indices.new_tensor((0, *ends))
-            documents = torch.bucketize(indices, boundaries[1:], right=True)
-            sequence_end_mask = (indices + 1 == boundaries[documents + 1]).unsqueeze(0)
-            default_positions = indices - boundaries[documents]
-        else:
-            default_positions = indices
         # NumPy FP32 inverse frequencies match MindFormers bitwise; torch.pow rounds some entries differently.
         dim = cfg.qk_rope_head_dim
         inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         inverse = torch.from_numpy(inverse.astype(np.float32)).to(input_ids.device)
-        if position_ids is None:
-            position_ids = default_positions.unsqueeze(0)
-        if position_ids.shape != input_ids.shape:
-            raise ValueError("JT position_ids must match input_ids")
+        # MF archive replay (reset_position_ids: false): absolute RoPE positions of the local interval.
+        position_ids = indices.unsqueeze(0)
         frequency = position_ids.to(device=input_ids.device, dtype=torch.float32).unsqueeze(-1) * inverse
         frequency = torch.cat((frequency, frequency), dim=-1)
         hidden = self.model.embed_tokens(input_ids)

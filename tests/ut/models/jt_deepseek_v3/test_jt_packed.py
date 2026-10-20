@@ -32,6 +32,43 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeeps
 from tests.ut.models.jt_deepseek_v3.test_modeling_jt_deepseek_v3 import small_config
 
 
+class _RopeTablesCaptured(Exception):
+    """Stop a forward once the first decoder layer has received its RoPE tables."""
+
+
+class TestJTAbsolutePositions(unittest.TestCase):
+    """MF archive replay: RoPE positions stay absolute across packed-document boundaries."""
+
+    def test_forces_absolute_positions_across_document_boundaries(self) -> None:
+        """Feature: Absolute RoPE positions of the local token interval.
+
+        Description: Give the local interval [10, 16) of documents ending at 12 and 16 per-document position_ids.
+        Expectation: The decoder receives the tables of global positions 10..15, bit-identical to one unpacked
+            document; the supplied position_ids are ignored.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        tables = []
+
+        def capture(_module: torch.nn.Module, _args: Any, kwargs: dict[str, Any]) -> None:
+            """Keep the RoPE tables; attention over a CP-local interval would need the other ranks."""
+            tables.append(kwargs["position_embeddings"])
+            raise _RopeTablesCaptured
+
+        handle = model.model.layers[0].register_forward_pre_hook(capture, with_kwargs=True)
+        self.addCleanup(handle.remove)
+        tokens = torch.arange(10, 16).unsqueeze(0)
+        for position_ids, actual_seq_len in ((torch.tensor([[10, 11, 0, 1, 2, 3]]), (12, 16)), (None, (16,))):
+            with self.assertRaises(_RopeTablesCaptured):
+                model(tokens, tokens, position_ids=position_ids, actual_seq_len=actual_seq_len, sequence_start=10)
+        self.assertEqual(len(tables), 2)
+        self.assertTrue(all(torch.equal(packed, unpacked) for packed, unpacked in zip(*tables)))
+        cos, sin = tables[0]
+        # The first inverse frequency is exactly one, so its angles are the global positions themselves.
+        positions = torch.arange(10, 16, dtype=torch.float32)
+        torch.testing.assert_close(cos[0, :, 0], positions.cos())
+        torch.testing.assert_close(sin[0, :, 0], positions.sin())
+
+
 def reference_grouped_swiglu(inputs: torch.Tensor, gate_up: torch.Tensor,
                             down: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
     """Use differentiable CPU expert math to test loss policy independently of NPU kernels."""
@@ -53,8 +90,8 @@ class TestJTPacked(unittest.TestCase):
             "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
             side_effect=reference_grouped_swiglu))
 
-    def test_packed_lm_mtp_equal_independent_documents(self) -> None:
-        """Packed losses and gradients equal token-weighted independent document runs."""
+    def test_packed_lm_equals_independent_documents_while_mtp_crosses_them(self) -> None:
+        """Packed LM equals token-weighted independent documents; the MTP shift crosses into the next document."""
         torch.manual_seed(8)
         config = small_config()
         config.moe_aux_loss_coeff = 0.0
@@ -63,18 +100,34 @@ class TestJTPacked(unittest.TestCase):
         separate = copy.deepcopy(packed)
         tokens = torch.arange(1, 9).unsqueeze(0)
         labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, -100]])
+        embedded, targets = [], []
+        handle = packed.model.embed_tokens.register_forward_pre_hook(
+            lambda _module, args: embedded.append(args[0].clone()))
+        self.addCleanup(handle.remove)
+        token_loss = packed._mtp_token_loss
+
+        def capture(**kwargs: Any) -> torch.Tensor:
+            """Record each depth's targets and keep the model's own MTP objective."""
+            targets.append(kwargs["shift_labels"].clone())
+            return token_loss(**kwargs)
+
+        packed._mtp_token_loss = capture
         output = packed(tokens, labels, actual_seq_len=(4, 8)).loss
         left = separate(tokens[:, :4], labels[:, :4]).loss
         right = separate(tokens[:, 4:], labels[:, 4:]).loss
-        keys = ("foundation_loss/lm", "foundation_loss/mtp")
-        expected = {key: (left[key] + right[key]) / 2 for key in keys}
-        for key in keys:
-            torch.testing.assert_close(output[key], expected[key], rtol=2e-5, atol=2e-6)
-        sum(output[key] for key in keys).backward()
-        sum(expected.values()).backward()
+        key = "foundation_loss/lm"
+        expected = (left[key] + right[key]) / 2
+        torch.testing.assert_close(output[key], expected, rtol=2e-5, atol=2e-6)
+        output[key].backward()
+        expected.backward()
         torch.testing.assert_close(
             {name: parameter.grad for name, parameter in packed.named_parameters()},
             {name: parameter.grad for name, parameter in separate.named_parameters()}, rtol=3e-4, atol=2e-6)
+        # Trunk input first; then both MTP depths shift across the boundary after token 4.
+        torch.testing.assert_close(embedded[1:], [torch.tensor([[2, 3, 4, 5, 6, 7, 8, 0]]),
+                                                  torch.tensor([[3, 4, 5, 6, 7, 8, 0, 0]])])
+        torch.testing.assert_close(targets, [torch.tensor([[3, 4, -100, 6, 7, 8, -100, -100]]),
+                                             torch.tensor([[4, -100, 6, 7, 8, -100, -100, -100]])])
 
     def test_chunked_lm_mtp_preserves_packed_losses_and_gradients(self) -> None:
         """Feature: Chunk loss for packed LM and MTP objectives.
