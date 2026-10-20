@@ -458,7 +458,9 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
         counts = flat_indices.new_zeros(config.n_routed_experts, dtype=torch.float32).scatter_add_(
             0, flat_indices, flat_indices.new_ones(flat_indices.shape, dtype=torch.float32))
-        self.tokens_per_expert = counts if self.tokens_per_expert is None else self.tokens_per_expert + counts
+        accumulated_counts = counts if self.tokens_per_expert is None else self.tokens_per_expert + counts
+        if not is_recomputing():
+            self.tokens_per_expert = accumulated_counts
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
