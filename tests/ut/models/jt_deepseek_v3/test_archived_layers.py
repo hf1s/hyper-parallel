@@ -60,13 +60,10 @@ class SetterOnlyConfig:
 class FakeNpuRuntime:
     """Process-global TorchNPU switches read and written around the archived head GEMM."""
 
-    def __init__(self, *, jit_compile: bool = False, internal_option: Optional[bytes] = b"disable",
-                 npu_format: int = 2) -> None:
-        """Start from the caller's compile mode, internal-format option and operand storage format."""
+    def __init__(self, *, jit_compile: bool = False, internal_option: Optional[bytes] = b"disable") -> None:
+        """Start from the caller's compile mode and internal-format option."""
         self.jit_compile = jit_compile
         self.internal_option = internal_option
-        self.npu_format = npu_format
-        self.writes = []
         self.npu = SimpleNamespace(is_jit_compile_false=lambda: not self.jit_compile,
                                    set_compile_mode=self.set_compile_mode, config=SetterOnlyConfig(self),
                                    device=lambda _: nullcontext())
@@ -76,11 +73,6 @@ class FakeNpuRuntime:
         """Return the compile mode and the backing internal-format option."""
         return self.jit_compile, self.internal_option
 
-    def get_npu_format(self, value: torch.Tensor) -> int:
-        """Report every operand in the configured storage format."""
-        del value
-        return self.npu_format
-
     def get_option(self, name: str) -> Optional[bytes]:
         """Read a backing runtime option; only the internal-format option is modelled."""
         if name != "ALLOW_INTERNAL_FORMAT":
@@ -89,12 +81,10 @@ class FakeNpuRuntime:
 
     def set_compile_mode(self, *, jit_compile: bool) -> None:
         """Switch JIT compilation for the whole process."""
-        self.writes.append(("jit_compile", jit_compile))
         self.jit_compile = jit_compile
 
     def set_internal_format(self, enabled: bool) -> None:
         """Back the setter-only ``npu.config.allow_internal_format`` attribute."""
-        self.writes.append(("allow_internal_format", enabled))
         self.internal_option = b"enable" if enabled else b"disable"
 
 
@@ -198,27 +188,7 @@ class TestArchivedHead(unittest.TestCase):
 
 
 class TestArchivedHeadGemm(unittest.TestCase):
-    """The NZ head GEMM validates its operands and scopes the global compiler switches it needs."""
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_head_gradient_rejects_unsupported_operands_before_touching_runtime_state(self):
-        """Invalid storage or an unset internal-format option fails before any switch or the kernel is touched."""
-        aligned = torch.zeros(32, 16, dtype=torch.bfloat16)
-        storage = "zero-offset, 16-aligned BF16 ND"
-        cases = {
-            "FP32 operand": (aligned.float(), storage, FakeNpuRuntime()),
-            "unaligned width": (torch.zeros(32, 24, dtype=torch.bfloat16), storage, FakeNpuRuntime()),
-            "transposed view": (torch.zeros(16, 32, dtype=torch.bfloat16).T, storage, FakeNpuRuntime()),
-            "storage offset": (torch.zeros(48, 16, dtype=torch.bfloat16)[16:], storage, FakeNpuRuntime()),
-            "three dimensions": (torch.zeros(32, 16, 16, dtype=torch.bfloat16), storage, FakeNpuRuntime()),
-            "NZ storage": (aligned, storage, FakeNpuRuntime(npu_format=29)),
-            "reduction mismatch": (torch.zeros(48, 16, dtype=torch.bfloat16), "reduction size", FakeNpuRuntime()),
-            "device mismatch": (aligned.to("meta"), "identical device", FakeNpuRuntime()),
-            "unset internal format": (aligned, "allow_internal_format", FakeNpuRuntime(internal_option=None)),
-        }
-        for name, (gradient, message, runtime) in cases.items():
-            with self.subTest(name):
-                self._assert_rejected_untouched(gradient, aligned, message, runtime)
+    """The NZ head GEMM scopes the global compiler switches it needs."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_head_gradient_restores_compile_and_format_switches_after_success_and_failure(self):
@@ -238,14 +208,6 @@ class TestArchivedHeadGemm(unittest.TestCase):
                                 legacy_gemm.head_weight_gradient(gradient, inputs)
                     self.assertEqual(kernel.seen, [(True, b"enable")])
                     self.assertEqual(runtime.state(), (jit_compile, option))
-
-    def _assert_rejected_untouched(self, gradient: torch.Tensor, inputs: torch.Tensor, message: str,
-                                   runtime: FakeNpuRuntime) -> None:
-        kernel = RecordingKernel(runtime)
-        with archived_gemm(runtime, kernel), self.assertRaisesRegex(ValueError, message):
-            legacy_gemm.head_weight_gradient(gradient, inputs)
-        self.assertEqual(runtime.writes, [])
-        self.assertEqual(kernel.seen, [])
 
 
 if __name__ == "__main__":

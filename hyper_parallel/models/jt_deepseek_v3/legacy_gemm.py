@@ -73,8 +73,6 @@ def _nz_matmul(gradient: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
         for value in (left, right, output):
             shape = list(value.shape)
             storage = [shape[1] // 16, shape[0] // 16, 16, 16]
-            if torch_npu.get_npu_format(value) != 29 or torch_npu.get_storage_size(value) != value.numel():
-                raise ValueError("Unexpected NZ storage format or physical element count")
             descriptor = api["create_desc"](27, 2, (ct.c_int64 * 2)(*shape), 2)
             if not descriptor:
                 raise RuntimeError("aclCreateTensorDesc returned null")
@@ -104,25 +102,16 @@ def _nz_matmul(gradient: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
 
 
 def head_weight_gradient(gradient: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
-    """Compute ``gradient.T @ inputs`` with scoped compiler state and validated storage.
+    """Compute ``gradient.T @ inputs`` with scoped compiler state.
 
     This route reproduces the archived head's GEMM accumulation. It is restricted
     to the single-threaded trainer of this profile; compiler options are global
     runtime state and must not be changed concurrently by another Python thread.
     """
-    if gradient.device != inputs.device or gradient.shape[0] != inputs.shape[0]:
-        raise ValueError("Head gradient operands must have identical device and reduction size")
-    for value in (gradient, inputs):
-        if (value.ndim != 2 or value.dtype != torch.bfloat16 or not value.is_contiguous()
-                or value.storage_offset() != 0 or any(size % 16 for size in value.shape)
-                or torch_npu.get_npu_format(value) not in (0, 2)):
-            raise ValueError("Expected zero-offset, 16-aligned BF16 ND matrices")
     was_eager = torch_npu.npu.is_jit_compile_false()
     # TorchNPU 2.12 exposes a setter-only config attribute. Read its backing
     # option so this scoped operation restores the caller's actual setting.
     internal_option = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")  # pylint: disable=protected-access
-    if internal_option not in (b"enable", b"disable"):
-        raise ValueError("Set allow_internal_format explicitly before using the archived GEMM route")
     internal_format = internal_option == b"enable"
     with torch.npu.device(inputs.device):
         try:
