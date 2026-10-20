@@ -29,6 +29,7 @@ from hyper_parallel.components.losses.chunked_cross_entropy import projected_cro
 from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import _JTTrainingContext
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3ForCausalLM, JTDeepseekV3MoE
+from tests.common.jt_config import cpu_npu_kernels
 from tests.ut.models.jt_deepseek_v3.test_modeling_jt_deepseek_v3 import small_config
 
 
@@ -49,6 +50,7 @@ class TestJTPacked(unittest.TestCase):
         """Keep CPU checkpoint recomputation independent of installed accelerators."""
         self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
         DefaultDeviceType.set_device_type("cpu")
+        self.enterContext(cpu_npu_kernels())
         self.enterContext(patch(
             "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
             side_effect=reference_grouped_swiglu))
@@ -60,6 +62,8 @@ class TestJTPacked(unittest.TestCase):
         config.moe_aux_loss_coeff = 0.0
         config.num_nextn_predict_layers = 2
         packed = JTDeepseekV3ForCausalLM(config)
+        # FP32 head input: a BF16 head use rounds its weight derivative per use, so per-document runs would differ.
+        packed.model.norm.output_dtype = None
         separate = copy.deepcopy(packed)
         tokens = torch.arange(1, 9).unsqueeze(0)
         labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, -100]])
@@ -86,6 +90,8 @@ class TestJTPacked(unittest.TestCase):
         config = small_config()
         config.num_nextn_predict_layers = 2
         eager = JTDeepseekV3ForCausalLM(config)
+        # FP32 head input: a BF16 head use rounds its weight derivative per use, so chunked runs would differ.
+        eager.model.norm.output_dtype = None
         chunked = copy.deepcopy(eager)
         inputs = torch.arange(12).unsqueeze(0)
         targets = torch.tensor([[1, 2, 3, -100, 5, -100, 7, -100, -100, 10, 11, -100]])
@@ -153,6 +159,8 @@ class TestJTPacked(unittest.TestCase):
         torch.manual_seed(19)
         config = small_config()
         reference = JTDeepseekV3ForCausalLM(config)
+        # FP32 head input: a BF16 head use rounds its weight derivative per use, so chunked runs would differ.
+        reference.model.norm.output_dtype = None
         self.assertFalse(reference.enable_chunk_loss)
         tokens = torch.arange(9).unsqueeze(0)
         targets = torch.tensor([[-100, -100, 3, 4, -100, 6, 7, 8, -100]])
@@ -165,6 +173,7 @@ class TestJTPacked(unittest.TestCase):
                 chunk_config.enable_chunk_loss = enabled
                 model = JTDeepseekV3ForCausalLM(chunk_config)
                 model.load_state_dict(reference.state_dict())
+                model.model.norm.output_dtype = None
                 self.assertEqual(model.enable_chunk_loss, enabled)
                 model = _apply_activation_checkpointing(model, mode)
                 head_calls = []

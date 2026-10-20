@@ -33,7 +33,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3MLAAttention,
 )
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from tests.common.jt_config import jt_test_config
+from tests.common.jt_config import cpu_npu_kernels, jt_test_config
 from tests.common.mark_utils import arg_mark
 
 
@@ -113,9 +113,10 @@ class TestJTBuilder(unittest.TestCase):
     def test_random_model_trains(self) -> None:
         """Feature: Training from scratch.
 
-        Description: Run forward, backward and an optimizer step with only the NPU grouped kernel replaced on CPU.
+        Description: Run forward, backward and an optimizer step with the NPU-only kernels replaced by CPU stand-ins.
         Expectation: All three losses and gradients are finite and the embedding changes.
         """
+        self.enterContext(cpu_npu_kernels())
         model = self.build()
         tokens = torch.arange(8).unsqueeze(0)
         with patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
