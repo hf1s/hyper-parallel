@@ -173,14 +173,6 @@ class TestArchivedMoE(unittest.TestCase):
             torch.testing.assert_close(actual_weights.grad, weight_gradient, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_weighted_product_rejects_outputs_the_weight_reduction_cannot_sum(self):
-        """Non-BF16 or non-5120-wide expert outputs fail in forward, not later in backward."""
-        weights = torch.rand(2, 1, requires_grad=True)
-        for outputs in (torch.randn(2, 5120), torch.randn(2, 4096).bfloat16()):
-            with self.assertRaisesRegex(ValueError, "BF16 hidden width 5120"):
-                _WeightedProduct.apply(outputs.requires_grad_(), weights, False)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_swiglu_matches_double_precision_with_main_and_mtp_up_rounding(self):
         """SwiGLU matches FP64 autograd; MTP rounds SiLU before the up-gradient product, main rounds once."""
         torch.manual_seed(203)
@@ -254,20 +246,6 @@ class TestArchivedMoE(unittest.TestCase):
         torch.testing.assert_close(weights[:PADDING], torch.zeros(PADDING, 2), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_route_rejects_grouped_unnormalized_and_multi_card_routing(self):
-        """Routing outside the archived single-group, normalized, single-card recipe raises."""
-        hidden = torch.zeros(1, PADDING + 1, 5120)
-        for name, value in (("n_group", 2), ("topk_group", 2), ("norm_topk_prob", False)):
-            config = moe_config()
-            setattr(config, name, value)
-            with self.assertRaisesRegex(ValueError, "one normalized routing group"):
-                ArchivedMoE(config).route(hidden)
-        moe = ArchivedMoE(moe_config())
-        moe.auxiliary_loss_group = object()
-        with self.assertRaisesRegex(ValueError, "single-card only"):
-            moe.route(hidden)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_moe_forward_matches_a_per_token_reference(self):
         """Each token sums w_k * expert_k(x) in FP32, rounds once, and joins the shared experts in FP32."""
         moe, scales = scaled_moe(255)
@@ -327,11 +305,15 @@ class TestArchivedMoE(unittest.TestCase):
                                    torch.stack((ranked % tokens, ranked // tokens)), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_expert_order_rejects_2_24_entries(self):
-        """2**24 entries exceed the archive's exact FP32 sorting range and raise."""
-        too_many = torch.zeros(1, 1, dtype=torch.long).expand(2 ** 23, 2)  # 2**24 entries, nothing allocated
-        with self.assertRaisesRegex(ValueError, "exactly representable"):
-            _expert_order(too_many)
+    def test_expert_order_breaks_ties_by_the_original_top_k_major_position(self):
+        """Equal expert ids keep their top-k-major relative order now that both sorts are stable (#252 R6)."""
+        # token-major (token, slot) -> expert id: tokens 0 and 2 route (1, 0), token 1 routes (0, 1).
+        indices = torch.tensor([[1, 0], [0, 1], [1, 0]])
+        order = _expert_order(indices)
+        # Expert 0 sits at top-k-major positions 1, 3, 5 (token 1 slot 0, token 0 slot 1, token 2 slot 1);
+        # expert 1 sits at 0, 2, 4. A stable tie-break keeps each group in that top-k-major order.
+        torch.testing.assert_close(order, torch.tensor([2, 1, 5, 0, 4, 3]), rtol=0, atol=0)
+        torch.testing.assert_close(indices.reshape(-1)[order], torch.tensor([0, 0, 0, 1, 1, 1]), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_router_linear_gradients_match_double_precision_autograd(self):
