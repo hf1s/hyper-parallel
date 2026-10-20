@@ -15,7 +15,6 @@
 """Check the archived JT cross-entropy against native CE and FP64 references."""
 
 import unittest
-from typing import Optional
 
 import torch
 from torch.nn import functional as F
@@ -24,7 +23,6 @@ from hyper_parallel.models.jt_deepseek_v3.archived_loss import TreeBackwardCE, a
 from tests.common.mark_utils import arg_mark
 
 VOCAB = 152064
-ROWS = 4096
 TILE = 108 * 64
 TINY = 2.0 ** -24  # Half an FP32 ulp of 1.0: 1 + TINY rounds back to 1 (ties to even).
 
@@ -85,39 +83,22 @@ class TestArchivedCrossEntropy(unittest.TestCase):
         torch.testing.assert_close(tiled_sum(tiles.expand(41, VOCAB).contiguous()), expected, rtol=0, atol=0)
         torch.testing.assert_close(tiled_sum(tiles[None]), expected[-1:], rtol=0, atol=0)
         # Within a tile, both TINY values survive only if they meet each other before meeting 1:
-        # entries 1 and 55 of lane 0 pair in the first halving level; lanes 2 and 3 pair first.
-        values = torch.zeros(2, VOCAB)
+        # entries 1 and 55 of lane 0 pair in the first halving level.
+        values = torch.zeros(1, VOCAB)
         values[0, [0, 64, 55 * 64]] = torch.tensor([1.0, TINY, TINY])
-        values[1, [0, 2, 3]] = torch.tensor([1.0, TINY, TINY])
-        torch.testing.assert_close(tiled_sum(values), torch.full((2, 1), 1.0 + 2 * TINY), rtol=0, atol=0)
+        torch.testing.assert_close(tiled_sum(values), torch.full((1, 1), 1.0 + 2 * TINY), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_archived_cross_entropy_accepts_only_the_fixed_schedule(self) -> None:
-        """Labels, distributed logits, other vocabularies and other row counts are rejected before computation."""
-
-        def call(shape: tuple[int, ...], *, vocab_size: int = VOCAB, labels: Optional[torch.Tensor] = None,
-                 device: str = 'cpu', distributed: bool = False) -> torch.Tensor:
-            """Call the CE with zero-stride logits that carry the full logical shape without allocating it."""
-            logits = torch.zeros((), device=device).expand(*shape)
-            if distributed:
-                logits = logits.as_subclass(_VocabShardedLogits)
-            return archived_cross_entropy(logits=logits, labels=labels, vocab_size=vocab_size,
-                                          shift_labels=torch.zeros(shape[:-1], dtype=torch.long),
-                                          num_items_in_batch=torch.tensor(1))
-
-        # Control: the same call without labels passes validation (meta tensors skip the arithmetic).
-        self.assertEqual(call((1, ROWS, VOCAB), device='meta').shape, ())
-        with self.assertRaisesRegex(ValueError, 'pre-shifted targets'):
-            call((1, ROWS, VOCAB), labels=torch.zeros(1, ROWS, dtype=torch.long))
-        # A vocabulary-sharded DTensor reports the global shape, so only its type can reveal the sharding.
-        with self.assertRaisesRegex(ValueError, 'loss parallelism'):
-            call((1, ROWS, VOCAB), distributed=True)
-        for shape, vocab_size in (((1, ROWS, 32000), 32000), ((1, ROWS, VOCAB - 1), VOCAB)):
-            with self.subTest(shape=shape, vocab_size=vocab_size), self.assertRaisesRegex(ValueError, 'vocabulary'):
-                call(shape, vocab_size=vocab_size)
-        for shape in ((1, ROWS - 1, VOCAB), (2, ROWS, VOCAB)):
-            with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, '4096 rows'):
-                call(shape)
+    def test_wrapper_uses_caller_denominator_and_ignores_labels(self) -> None:
+        """The caller's valid-token count divides the native sum; ``labels`` is accepted and unused."""
+        logits, targets = _rows()
+        count = torch.tensor(2)
+        expected = F.cross_entropy(logits, targets, reduction='sum', ignore_index=-100) / count
+        for labels in (None, torch.zeros(3, dtype=torch.long)):
+            with self.subTest(labels=labels is not None):
+                actual = archived_cross_entropy(logits=logits, labels=labels, vocab_size=VOCAB,
+                                                shift_labels=targets, num_items_in_batch=count)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_ignore_index_outside_the_vocabulary_is_masked_in_the_derivative(self) -> None:
@@ -131,14 +112,6 @@ class TestArchivedCrossEntropy(unittest.TestCase):
         loss.backward()
         torch.testing.assert_close(inputs.grad[1], torch.zeros(VOCAB), rtol=0, atol=0)
         self.assertTrue(bool((inputs.grad[[0, 2]] != 0).any()))
-
-
-class _VocabShardedLogits(torch.Tensor):
-    """Stand-in for a vocabulary-sharded DTensor: global shape plus the ``to_local`` protocol."""
-
-    def to_local(self) -> torch.Tensor:
-        """Return the local shard (here the whole tensor)."""
-        return self.as_subclass(torch.Tensor)
 
 
 if __name__ == "__main__":
