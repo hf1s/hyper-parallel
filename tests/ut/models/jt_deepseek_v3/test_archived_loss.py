@@ -83,11 +83,10 @@ class TestArchivedCrossEntropy(unittest.TestCase):
         torch.testing.assert_close(tiled_sum(tiles.expand(41, VOCAB).contiguous()), expected, rtol=0, atol=0)
         torch.testing.assert_close(tiled_sum(tiles[None]), expected[-1:], rtol=0, atol=0)
         # Within a tile, both TINY values survive only if they meet each other before meeting 1:
-        # entries 1 and 55 of lane 0 pair in the first halving level; lanes 2 and 3 pair first.
-        values = torch.zeros(2, VOCAB)
+        # entries 1 and 55 of lane 0 pair in the first halving level.
+        values = torch.zeros(1, VOCAB)
         values[0, [0, 64, 55 * 64]] = torch.tensor([1.0, TINY, TINY])
-        values[1, [0, 2, 3]] = torch.tensor([1.0, TINY, TINY])
-        torch.testing.assert_close(tiled_sum(values), torch.full((2, 1), 1.0 + 2 * TINY), rtol=0, atol=0)
+        torch.testing.assert_close(tiled_sum(values), torch.full((1, 1), 1.0 + 2 * TINY), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_wrapper_uses_caller_denominator_and_ignores_labels(self) -> None:

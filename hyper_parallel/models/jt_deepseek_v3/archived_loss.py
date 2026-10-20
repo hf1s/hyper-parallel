@@ -25,7 +25,7 @@ caller's valid-token count, as in the default path. Only the derivative
 differs: softmax is recomputed from the saved FP32 logits with the archived
 compiled graph's FP32 accumulation order over the vocabulary. That order is a
 reproducibility rule, not a more accurate reduction, and it is defined only
-for vocabulary 152064 and 4096 rows.
+for vocabulary 152064.
 """
 
 # This explicitly selected recipe is Torch/NPU-only.
@@ -117,6 +117,7 @@ def archived_cross_entropy(*, logits: torch.Tensor, labels: Any, vocab_size: int
     Returns:
         FP32 CE sum divided by ``num_items_in_batch``.
     """
+    del labels
     inputs = logits.float().reshape(-1, vocab_size)
     targets = shift_labels.reshape(-1).to(inputs.device)
     return TreeBackwardCE.apply(inputs, targets, ignore_index) / num_items_in_batch
