@@ -19,7 +19,7 @@ placements) rather than any specific parallelism strategy, so a single
 implementation covers FSDP, HSDP, TP+FSDP, and other DTensor-expressed
 parallelisms.
 
-Collective safety aligned with FSDP1; numerical precision aligned with
+Collective safety aligned with FSDP1; reduction structure aligned with
 FSDP2's ``_NormPartial`` norm computation path:
 
 * Gradient norms from sharded parameters are all-reduced across the
@@ -28,9 +28,14 @@ FSDP2's ``_NormPartial`` norm computation path:
 * **All ranks participate in the same collectives** regardless of local
   gradient availability, preventing collective-misalignment deadlocks.
 
-The finite p-norm is bit-exact with upstream only for the pure-FSDP,
-single-dtype case; mixed sharded + replicated is mathematically correct
-but intentionally diverges (see ``_total_norm_fsdp2_aligned``).
+The L2 norm reproduces the archived MF FP32 reduction order instead of
+upstream's: every local gradient's sum of squares follows the CANN 8.5
+SumX schedule (:func:`gradient_square_sum`), and the per-tensor sums
+accumulate in parameter order with one FP32 rounding per addition
+(:func:`sequential_sum`).  Other finite p-norms are bit-exact with
+upstream only for the pure-FSDP, single-dtype case; mixed sharded +
+replicated is mathematically correct but intentionally diverges (see
+``_total_norm_fsdp2_aligned``).
 
 Note: PP does not use DTensor layout for gradients today.  Cross-stage
 norm aggregation will require an additional manual all-reduce and is
@@ -42,6 +47,7 @@ import warnings
 from collections import defaultdict, namedtuple
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -368,6 +374,65 @@ def _compute_local_norm(  # pylint: disable=R0911
 
 
 # ---------------------------------------------------------------------------
+# Archived MF L2 reduction schedule
+# ---------------------------------------------------------------------------
+# The CANN 8.5 FP32 reduction schedules of the archived MF run. They are
+# reproducibility operations, not more accurate replacements for native
+# reductions; only small partial sums cross the device/host boundary.
+
+def half_tree(values: torch.Tensor) -> torch.Tensor:
+    """Reduce the last axis by halves, folding an odd tail into the first lane."""
+    work = values
+    while work.shape[-1] > 1:
+        size = work.shape[-1]
+        half = size // 2
+        reduced = work[..., :half] + work[..., half:2 * half]
+        if size % 2:
+            reduced[..., 0] = reduced[..., 0] + work[..., -1]
+        work = reduced
+    return work[..., 0]
+
+
+def sequential_sum(values: np.ndarray) -> np.float32:
+    """Preserve one FP32 rounding after each scalar accumulation."""
+    total = np.float32(0)
+    for value in values:
+        total = np.float32(total + value)
+    return total
+
+
+def core_sum(partials: np.ndarray, cores: int = 40) -> np.float32:
+    """Accumulate tiles on strided vector cores, then accumulate cores in order."""
+    accumulators = np.zeros(cores, dtype=np.float32)
+    for index, partial in enumerate(partials):
+        core = index % cores
+        accumulators[core] = np.float32(accumulators[core] + partial)
+    return sequential_sum(accumulators)
+
+
+def tiled_square_sum(value: torch.Tensor, tile: int, width: int) -> np.float32:
+    """Square FP32 values and execute a bounded-memory row/lane/core schedule."""
+    flat = value.reshape(-1)
+    partials = []
+    for start in range(0, flat.numel(), tile * 512):
+        piece = flat[start:start + tile * 512]
+        tile_count = (piece.numel() + tile - 1) // tile
+        padded = piece.new_zeros(tile_count * tile)
+        padded[:piece.numel()] = piece * piece
+        lanes = half_tree(padded.reshape(tile_count, tile // width, width).transpose(-1, -2))
+        partials.append(lanes.sum(dim=-1).cpu().numpy())
+    parts = np.concatenate(partials)
+    return parts[0] if len(parts) == 1 else core_sum(parts)
+
+
+def gradient_square_sum(value: torch.Tensor) -> np.float32:
+    """Select the archived SumX tiling from the current tensor's element count."""
+    count = value.numel()
+    tile, width = (count, 64) if count <= 5120 else ((1024, 64) if count == 40960 else (8144, 16))
+    return tiled_square_sum(value, tile, width)
+
+
+# ---------------------------------------------------------------------------
 # Total norm aggregation with collectives
 # ---------------------------------------------------------------------------
 
@@ -406,6 +471,9 @@ def _get_total_norm(
         grad_groups, norm_type, mesh_cache, device,
         norm_grads, key_per_grad,
     )
+    # The archived L2 norm takes an explicit sqrt; pow(x, 0.5) need not round like sqrt on every device.
+    if norm_type == 2.0:
+        return total_p.sqrt()
     return total_p ** (1.0 / norm_type)
 
 
@@ -495,9 +563,13 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
     Grads are bucketed by the *process group* they reduce over (see
     :func:`_reduction_signature`); ``norm_grads`` supplies, in global
     parameter order, the Partial-reduced (already-global) view for Partial
-    grads and the raw local grad otherwise.  Each bucket does ONE ``stack``
-    → ONE ``vector_norm`` → ``^p`` → ONE ``all_reduce SUM`` per shard dim,
-    and the buckets are summed locally.
+    grads and the raw local grad otherwise.  Each bucket computes its local
+    sum of p-th powers, then ONE ``all_reduce SUM`` per shard dim, and the
+    buckets are summed locally.  For ``p == 2`` the local sum follows the
+    archived MF schedule: :func:`gradient_square_sum` of every grad, then
+    :func:`sequential_sum` of those sums in parameter order on the host,
+    rounding to FP32 after each addition.  Other ``p`` do ONE ``stack`` →
+    ONE ``vector_norm`` → ``^p``.
 
     Reduction rules:
 
@@ -513,7 +585,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
     Empty-but-present buckets still issue their all_reduce (identity ``0``
     for SUM) so all ranks run the same collectives.
 
-    Bit-exact with upstream ``torch.nn.utils.clip_grad_norm_`` only for the
+    For ``p != 2``, bit-exact with upstream ``torch.nn.utils.clip_grad_norm_`` only for the
     pure-FSDP, single-bucket, single-dtype case.  Mixed shard + replicate is
     mathematically correct but intentionally diverges (upstream folds the
     replicate norm into one ``_NormPartial`` reduce and over-counts it);
@@ -534,7 +606,10 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
     total_p = torch.tensor(0.0, device=device, dtype=torch.float32)
     for sig in sig_order:
         grads = sig_grads[sig]
-        if grads:
+        if grads and norm_type == 2.0:
+            sums = np.asarray([gradient_square_sum(grad.float()) for grad in grads], dtype=np.float32)
+            local_p = torch.tensor(sequential_sum(sums), dtype=torch.float32, device=device)
+        elif grads:
             norms = _per_tensor_norms(grads, norm_type, device)
             local_p = torch.linalg.vector_norm(
                 torch.stack(norms).to(torch.float32), norm_type,
