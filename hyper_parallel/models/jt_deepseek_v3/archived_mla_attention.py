@@ -95,8 +95,9 @@ class ArchivedMLAAttention(jt.JTDeepseekV3MLAAttention):
         self, hidden_states: torch.Tensor, position_embeddings: Any, past_key_values: Any
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project as the product MLA does, but reduce the shared rope key's head gradients in FP32."""
-        if past_key_values is not None or position_embeddings is None:
-            raise ValueError("Archived MLA requires RoPE tables and no KV cache")
+        del past_key_values
+        if position_embeddings is None:
+            raise ValueError("Archived MLA requires RoPE tables")
         query_latent, kv_latent, key_rope = self.project_latent_inputs(hidden_states)
         batch, sequence = query_latent.shape[:2]
         query = self.q_b_proj(query_latent).reshape(batch, sequence, self.num_heads, self.qk_head_dim)
