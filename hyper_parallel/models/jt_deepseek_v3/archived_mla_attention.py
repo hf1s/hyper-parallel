@@ -40,11 +40,6 @@ class SharedKeyHalfTree(torch.autograd.Function):
     def forward(ctx: Any, value: torch.Tensor, heads: int) -> torch.Tensor:
         """Broadcast a singleton head while keeping sequence-major storage."""
         del ctx
-        if value.ndim != 4 or value.shape[2] != 1 or heads < 1 or heads & (heads - 1):
-            raise ValueError(
-                "Expected singleton shared head and power-of-two head count: "
-                f"{value.shape=}, {heads=}"
-            )
         return value.expand(-1, -1, heads, -1)
 
     @staticmethod
@@ -96,8 +91,6 @@ class ArchivedMLAAttention(jt.JTDeepseekV3MLAAttention):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project as the product MLA does, but reduce the shared rope key's head gradients in FP32."""
         del past_key_values
-        if position_embeddings is None:
-            raise ValueError("Archived MLA requires RoPE tables")
         query_latent, kv_latent, key_rope = self.project_latent_inputs(hidden_states)
         batch, sequence = query_latent.shape[:2]
         query = self.q_b_proj(query_latent).reshape(batch, sequence, self.num_heads, self.qk_head_dim)

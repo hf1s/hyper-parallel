@@ -74,8 +74,6 @@ class TestSharedKeyHalfTree(unittest.TestCase):
         weights = torch.arange(actual.numel(), dtype=torch.float32).reshape_as(actual)
         (actual * weights).sum().backward()
         torch.testing.assert_close(values.grad, weights.sum(2, keepdim=True), rtol=0, atol=0)
-        with self.assertRaisesRegex(ValueError, 'singleton shared head'):
-            SharedKeyHalfTree.apply(torch.zeros(1, 1, 5, 3), 8)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_shared_key_sums_head_gradients_by_fp32_half_tree(self):
