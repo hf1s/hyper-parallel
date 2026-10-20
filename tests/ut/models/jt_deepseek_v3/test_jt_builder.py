@@ -35,6 +35,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from tests.common.jt_config import jt_test_config
 from tests.common.mark_utils import arg_mark
+from tests.ut.models.jt_deepseek_v3.test_modeling_jt_deepseek_v3 import cpu_swiglu, native_weighted_sum
 
 
 def _cpu_grouped_swiglu(inputs: torch.Tensor, gate_up_weight: torch.Tensor,
@@ -113,11 +114,15 @@ class TestJTBuilder(unittest.TestCase):
     def test_random_model_trains(self) -> None:
         """Feature: Training from scratch.
 
-        Description: Run forward, backward and an optimizer step with only the NPU grouped kernel replaced on CPU.
+        Description: Run forward, backward and an optimizer step with the NPU-only kernels replaced by CPU stand-ins.
         Expectation: All three losses and gradients are finite and the embedding changes.
         """
         model = self.build()
         tokens = torch.arange(8).unsqueeze(0)
+        self.enterContext(patch(
+            "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.torch_npu.npu_swiglu", new=cpu_swiglu))
+        self.enterContext(patch(
+            "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.weighted_sum", new=native_weighted_sum))
         with patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
                    side_effect=_cpu_grouped_swiglu):
             output = model(tokens, (tokens + 1) % self.config["vocab_size"])
