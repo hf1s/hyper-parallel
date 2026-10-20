@@ -28,7 +28,9 @@ from torch.utils.checkpoint import DefaultDeviceType
 from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
 from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import _JTTrainingContext
-from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3ForCausalLM, JTDeepseekV3MoE
+from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
+    JTDeepseekV3ForCausalLM, JTDeepseekV3MoE, _packed_positions_and_mask,
+)
 from tests.ut.models.jt_deepseek_v3.test_modeling_jt_deepseek_v3 import small_config
 
 
@@ -52,6 +54,20 @@ class TestJTPacked(unittest.TestCase):
         self.enterContext(patch(
             "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
             side_effect=reference_grouped_swiglu))
+
+    def test_archive_absolute_positions_ignore_document_boundaries(self) -> None:
+        """Archive mode keeps absolute RoPE positions and leaves MTP shifts unmasked."""
+        config = small_config()
+        indices = torch.arange(8)
+        config.archive_absolute_positions = True
+        positions, mask = _packed_positions_and_mask(config, indices, (3, 8), None)
+        self.assertEqual(positions.tolist(), [list(range(8))])
+        self.assertIsNone(mask)
+
+        config.archive_absolute_positions = False
+        positions, mask = _packed_positions_and_mask(config, indices, (3, 8), None)
+        self.assertEqual(positions.tolist(), [[0, 1, 2, 0, 1, 2, 3, 4]])
+        self.assertEqual(mask.tolist(), [[False, False, True, False, False, False, False, True]])
 
     def test_packed_lm_mtp_equal_independent_documents(self) -> None:
         """Packed losses and gradients equal token-weighted independent document runs."""
