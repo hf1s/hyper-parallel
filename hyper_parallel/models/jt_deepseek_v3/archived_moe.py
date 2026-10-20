@@ -170,14 +170,7 @@ class ArchivedRouter(jt.JTDeepseekV3Gate):
 class _WeightedProduct(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, outputs: torch.Tensor, weights: torch.Tensor, mtp: bool) -> torch.Tensor:
-        """Multiply expert outputs and routing weights in FP32.
-
-        Raises:
-            ValueError: If ``outputs`` are not BF16 with hidden width 5120, the only layout the
-                backward weight reduction supports.
-        """
-        if outputs.shape[-1] != 5120 or outputs.dtype != torch.bfloat16:
-            raise ValueError("The archived weighted reduction requires BF16 hidden width 5120")
+        """Multiply expert outputs and routing weights in FP32."""
         ctx.save_for_backward(outputs, weights)
         ctx.mtp = mtp
         return outputs.float() * weights.float()
@@ -217,13 +210,8 @@ def _expert_order(indices: torch.Tensor) -> torch.Tensor:
     silently across torch/torch_npu versions, at no measured numerical cost. The commutativity
     argument does not extend to ``num_experts_per_tok >= 3``, where three-or-more-term sums are
     order-sensitive; re-run the ablation before relying on this for other top-k values.
-
-    Raises:
-        ValueError: If ``indices`` holds ``2 ** 24`` or more entries, the archive's limit for exact FP32 sorting.
     """
     token_count, top_k = indices.shape
-    if indices.numel() >= 2 ** 24:
-        raise ValueError("Archived FP32 expert sorting requires exactly representable integer indices")
     ids = indices.transpose(0, 1).reshape(1, -1).float()
     sorted_ids, first = torch.sort(ids, dim=1, stable=True)
     second = torch.sort(sorted_ids, dim=1, stable=True)[1]

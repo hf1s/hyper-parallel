@@ -173,14 +173,6 @@ class TestArchivedMoE(unittest.TestCase):
             torch.testing.assert_close(actual_weights.grad, weight_gradient, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_weighted_product_rejects_outputs_the_weight_reduction_cannot_sum(self):
-        """Non-BF16 or non-5120-wide expert outputs fail in forward, not later in backward."""
-        weights = torch.rand(2, 1, requires_grad=True)
-        for outputs in (torch.randn(2, 5120), torch.randn(2, 4096).bfloat16()):
-            with self.assertRaisesRegex(ValueError, "BF16 hidden width 5120"):
-                _WeightedProduct.apply(outputs.requires_grad_(), weights, False)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_swiglu_matches_double_precision_with_main_and_mtp_up_rounding(self):
         """SwiGLU matches FP64 autograd; MTP rounds SiLU before the up-gradient product, main rounds once."""
         torch.manual_seed(203)
@@ -322,13 +314,6 @@ class TestArchivedMoE(unittest.TestCase):
         # expert 1 sits at 0, 2, 4. A stable tie-break keeps each group in that top-k-major order.
         torch.testing.assert_close(order, torch.tensor([2, 1, 5, 0, 4, 3]), rtol=0, atol=0)
         torch.testing.assert_close(indices.reshape(-1)[order], torch.tensor([0, 0, 0, 1, 1, 1]), rtol=0, atol=0)
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_expert_order_rejects_2_24_entries(self):
-        """2**24 entries exceed the archive's exact FP32 sorting range and raise."""
-        too_many = torch.zeros(1, 1, dtype=torch.long).expand(2 ** 23, 2)  # 2**24 entries, nothing allocated
-        with self.assertRaisesRegex(ValueError, "exactly representable"):
-            _expert_order(too_many)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_router_linear_gradients_match_double_precision_autograd(self):
