@@ -48,7 +48,6 @@ from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_single
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
 
 class JTDeepseekV3Config(DeepseekV32Config):
@@ -60,6 +59,19 @@ class JTDeepseekV3Config(DeepseekV32Config):
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 
 
+def half_tree(values: torch.Tensor) -> torch.Tensor:
+    """Reduce the last axis by halves, folding an odd tail into the first lane."""
+    work = values
+    while work.shape[-1] > 1:
+        size = work.shape[-1]
+        half = size // 2
+        reduced = work[..., :half] + work[..., half:2 * half]
+        if size % 2:
+            reduced[..., 0] = reduced[..., 0] + work[..., -1]
+        work = reduced
+    return work[..., 0]
+
+
 @dataclass
 class JTDeepseekV3Output(ModelOutput):
     """Model output holding the named JT training losses."""
@@ -68,6 +80,49 @@ class JTDeepseekV3Output(ModelOutput):
     # mapping instead of interpreting it as a field iterator.
     logits: torch.Tensor | None = None
     loss: dict[str, torch.Tensor] | None = None
+
+
+class _SwiGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, gate: torch.Tensor, up: torch.Tensor, rounded_up: bool) -> torch.Tensor:
+        """Evaluate the fused SwiGLU on ``[gate, up]``, retaining both projections."""
+        pair = torch.cat((gate, up), dim=-1)
+        ctx.save_for_backward(pair)
+        ctx.rounded_up = rounded_up
+        return torch_npu.npu_swiglu(pair, dim=-1)
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Differentiate SwiGLU in FP32 with the archive's main/MTP rounding points.
+
+        The gate gradient is rounded once to the input dtype. MTP (``rounded_up``) multiplies the
+        gradient by a SiLU rounded to the input dtype; the main path rounds the FP32 product once.
+        """
+        pair, = ctx.saved_tensors
+        gate, up = pair.chunk(2, dim=-1)
+        sigmoid = gate.float().sigmoid()
+        silu = F.silu(gate.float())
+        derivative = (sigmoid + silu) - silu * sigmoid
+        gate_gradient = ((gradient.float() * up.float()) * derivative).to(gate.dtype)
+        up_gradient = (gradient * F.silu(gate) if ctx.rounded_up
+                       else (gradient.float() * silu).to(up.dtype))
+        return gate_gradient, up_gradient, None
+
+
+class JTDeepseekV3MLP(DeepseekV32MLP):
+    """HF SwiGLU MLP with one gate/up GEMM, the fused ``npu_swiglu`` and an FP32 derivative."""
+
+    def __init__(self, config: Any, intermediate_size: int | None = None, *, mtp: bool = False) -> None:
+        """Keep the HF gate/up/down parameters; ``mtp`` selects the MTP up-gradient rounding."""
+        super().__init__(config, intermediate_size=intermediate_size)
+        self.mtp = mtp
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Project gate and up in one GEMM over row-interleaved weights, then apply the fused SwiGLU."""
+        weights = torch.stack((self.gate_proj.weight, self.up_proj.weight), dim=1).flatten(0, 1)
+        projected = F.linear(inputs, weights)  # pylint: disable=not-callable
+        activated = _SwiGLU.apply(projected[..., 0::2], projected[..., 1::2], self.mtp)
+        return self.down_proj(activated)
 
 
 class JTDeepseekV3Experts(DeepseekV32Experts):
@@ -375,8 +430,25 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         return self.o_proj(output.reshape(batch, sequence, -1)), None
 
 
+class _RouterLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Apply the router's FP32 linear projection."""
+        ctx.save_for_backward(values, weight)
+        return F.linear(values, weight)  # pylint: disable=not-callable
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Make the left weight-gradient operand contiguous explicitly."""
+        values, weight = ctx.saved_tensors
+        return gradient @ weight, gradient.T.contiguous() @ values
+
+
 class JTDeepseekV3Gate(DeepseekV32TopkRouter):
     """HF router projection computing FP32 logits, kept for the sequence auxiliary loss."""
+
+    # Gives the router its own FP32 FSDP compute unit: FP32 weight storage, gradient and arithmetic.
+    keep_compute_in_fp32 = True
 
     def __init__(self, config: Any) -> None:
         """Create the HF router weight and expert bias.
@@ -392,12 +464,13 @@ class JTDeepseekV3Gate(DeepseekV32TopkRouter):
 
         As in the HF router, the input and the weight are cast to FP32, so routing and the
         auxiliary loss use FP32 logits instead of logits rounded to the BF16 activation dtype.
+        The weight gradient multiplies an explicitly contiguous ``gradient.T`` by the input.
 
         Args:
             hidden_states: Router inputs, ``[..., hidden]``.
         """
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        self.router_logits = F.linear(hidden_states.float(), self.weight.float())  # pylint: disable=not-callable
+        self.router_logits = _RouterLinear.apply(hidden_states.float(), self.weight.float())
         return self.router_logits
 
     def pop_router_logits(self) -> torch.Tensor:
@@ -411,6 +484,134 @@ class JTDeepseekV3Gate(DeepseekV32TopkRouter):
         return logits
 
 
+class RouterRoutedInputPair(torch.autograd.Function):
+    """Join FP32 router and activation-dtype expert derivatives."""
+
+    @staticmethod
+    def forward(ctx: Any, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the expert input in its own dtype and an FP32 copy for the router."""
+        ctx.input_dtype = hidden.dtype
+        return hidden.view_as(hidden), hidden.float()
+
+    @staticmethod
+    def backward(ctx: Any, expert_gradient: torch.Tensor, router_gradient: torch.Tensor) -> torch.Tensor:
+        """Add the two consumers' derivatives in FP32, then round once to the input dtype."""
+        return (expert_gradient.float() + router_gradient).to(ctx.input_dtype)
+
+
+class RoutingNormalization(torch.autograd.Function):
+    """Normalize selected routing scores and the all-expert auxiliary branch."""
+
+    @staticmethod
+    def forward(ctx: Any, scores: torch.Tensor, indices: torch.Tensor,
+                scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the selected scores normalized and scaled by ``scale``, and all scores normalized."""
+        selected = scores.gather(1, indices)
+        selected_sum = selected.sum(-1, keepdim=True) + 1e-20
+        score_sum = scores.sum(-1, keepdim=True) + 1e-20
+        ctx.save_for_backward(scores, indices, selected, selected_sum, score_sum)
+        ctx.scale = scale
+        return selected / selected_sum * scale, scores / score_sum
+
+    @staticmethod
+    def backward(ctx: Any, coefficient_gradient: torch.Tensor,
+                 auxiliary_gradient: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Differentiate both normalizations in the archive's accumulation order."""
+        scores, indices, selected, selected_sum, score_sum = ctx.saved_tensors
+        scaled = coefficient_gradient * ctx.scale
+        top_numerator = scaled / selected_sum
+        top_denominator = (-(selected / selected_sum / selected_sum) * scaled).sum(-1, keepdim=True)
+        top_gradient = top_numerator + top_denominator
+        selected_gradient = torch.zeros_like(scores).scatter_add_(1, indices, top_gradient)
+        auxiliary_denominator = (-(scores / score_sum / score_sum) * auxiliary_gradient).sum(-1, keepdim=True)
+        result = (selected_gradient + auxiliary_denominator) + auxiliary_gradient / score_sum
+        return result, None, None
+
+
+class ArithmeticSigmoid(torch.autograd.Function):
+    """Sigmoid whose backward follows the archived gradient-first schedule."""
+
+    @staticmethod
+    def forward(ctx: Any, values: torch.Tensor) -> torch.Tensor:
+        """Return the native sigmoid and retain it for the derivative."""
+        result = values.sigmoid()
+        ctx.save_for_backward(result)
+        return result
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> torch.Tensor:
+        """Return ``(gradient * sigmoid) * (1 - sigmoid)``, multiplied in that order."""
+        result, = ctx.saved_tensors
+        return (gradient * result) * (1 - result)
+
+
+def weighted_sum(product: torch.Tensor) -> torch.Tensor:
+    """Sum a BF16 weighted derivative: FP32 80-row half tree, then a native 64-lane sum.
+
+    issue #252's NPU single-factor ablation (arm R10: 200 steps from a shared checkpoint,
+    same recipe otherwise) found the archived 64-lane adjacent-pair tree bit-identical to a
+    native FP32 sum over the same axis on that backend -- swapping just the lane reduction
+    left the training trajectory unchanged (first_diff: none vs. the unmodified recipe).
+    The 80-row half tree is not interchangeable the same way: swapping it alone (arm R9,
+    same setup) left a late, weak divergence (first difference at step 479 of a 301-500
+    window, 1 of 200 steps over the 5e-3 threshold), so it stays archived here.
+    """
+    rows = product.float().reshape(-1, 80, 64).transpose(-1, -2)
+    return half_tree(rows).sum(dim=-1).reshape(*product.shape[:-1], 1)
+
+
+class _WeightedProduct(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, outputs: torch.Tensor, weights: torch.Tensor, mtp: bool) -> torch.Tensor:
+        """Multiply expert outputs and routing weights in FP32."""
+        ctx.save_for_backward(outputs, weights)
+        ctx.mtp = mtp
+        return outputs.float() * weights.float()
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Differentiate the product with the archive's main/MTP rounding points.
+
+        MTP rounds the gradient and the weights to the output dtype before multiplying them; the
+        main path multiplies in FP32. The weight gradient reduces the output-dtype products
+        ``gradient * outputs`` with ``weighted_sum`` and rounds the sum to the output dtype.
+        """
+        outputs, weights = ctx.saved_tensors
+        output_gradient = (gradient.to(outputs.dtype) * weights.to(outputs.dtype)
+                           if ctx.mtp else gradient * weights.float())
+        product = gradient.to(outputs.dtype) * outputs
+        weight_gradient = weighted_sum(product).to(outputs.dtype).to(weights.dtype)
+        return output_gradient, weight_gradient, None
+
+
+def _expert_order(indices: torch.Tensor) -> torch.Tensor:
+    """Return the archive's expert-major order of the token-major positions ``t * top_k + k``.
+
+    The expert ids are flattened top-k-major (slot ``k`` of every token before slot ``k + 1``),
+    cast to FP32 and argsorted twice with ``torch.sort(..., stable=True)``. The result is always
+    grouped by ascending expert id; ties within one expert keep the original top-k-major order.
+
+    Both sorts were previously left unstable, matching the archive's compiled graph but leaving the
+    within-expert order backend-defined: on CPU, forcing stability changes 8192 of 8208 positions for
+    a realistic 4104-token/top-2 batch. A single-factor NPU ablation against the training trajectory
+    (issue #252, arm R6: 200 steps from a shared checkpoint, same metrics and bitwise-equal loss curve
+    with and without ``stable=True``) found it numerically inert on that backend and configuration.
+    This is not a backend coincidence for ``num_experts_per_tok == 2``: every token then contributes
+    exactly two terms to the later ``index_add_`` join, and IEEE 754 addition of two operands is
+    exactly commutative regardless of which one is added first, so no within-expert tie-break order
+    can change that sum. Stabilizing removes a dependency on backend sort behavior that could change
+    silently across torch/torch_npu versions, at no measured numerical cost. The commutativity
+    argument does not extend to ``num_experts_per_tok >= 3``, where three-or-more-term sums are
+    order-sensitive; re-run the ablation before relying on this for other top-k values.
+    """
+    token_count, top_k = indices.shape
+    ids = indices.transpose(0, 1).reshape(1, -1).float()
+    sorted_ids, first = torch.sort(ids, dim=1, stable=True)
+    second = torch.sort(sorted_ids, dim=1, stable=True)[1]
+    combined = first.gather(1, second).reshape(-1)
+    return (combined % token_count) * top_k + combined // token_count
+
+
 class JTDeepseekV3MoE(DeepseekV32MoE):
     """Sigmoid-routed MoE with shared experts, the sequence auxiliary loss and expert-load counts."""
 
@@ -422,11 +623,13 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """
         nn.Module.__init__(self)
         self.config = config
+        # JTDeepseekV3ForCausalLM marks its MTP config copy; MTP layers round at their own points.
+        self.mtp = getattr(config, "is_mtp_layer", False)
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.experts = JTDeepseekV3Experts(config)
         self.gate = JTDeepseekV3Gate(config)
-        self.shared_experts = DeepseekV32MLP(
-            config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
+        self.shared_experts = JTDeepseekV3MLP(
+            config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts, mtp=self.mtp)
         # Ranks holding shards of the same sequences (TP with sequence parallelism); the JT builder sets it.
         self.sequence_partition_group = None
         # Auxiliary gradients also average TP replicas when sequence parallelism is off.
@@ -447,17 +650,22 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             tokens cover every expert with zero weight.
         """
         padding, config = self.padding, self.config
-        hidden = hidden[:, padding:]
-        indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
-        scores = self.gate.pop_router_logits().sigmoid()
-        auxiliary_loss = self.routing_statistics(indices, scores)
-        # Replay must keep the same tensor operations without retaining its graph on the module.
-        if not is_recomputing():
-            self.auxiliary_loss = auxiliary_loss
+        logits = self.gate(hidden[:, padding:])
+        self.gate.pop_router_logits()
+        # One sigmoid feeds the selected weights and the auxiliary affinities, differentiated together.
+        scores = ArithmeticSigmoid.apply(logits.view(-1, logits.shape[-1]).float())
+        indices = (scores + self.gate.e_score_correction_bias).topk(
+            config.num_experts_per_tok, dim=-1, sorted=False)[1]
+        selected, normalized = RoutingNormalization.apply(scores, indices, float(config.routed_scaling_factor))
         flat_indices = indices.reshape(-1)
         # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
         counts = flat_indices.new_zeros(config.n_routed_experts, dtype=torch.float32).scatter_add_(
             0, flat_indices, flat_indices.new_ones(flat_indices.shape, dtype=torch.float32))
+        load = counts / flat_indices.numel()
+        auxiliary_loss = (normalized.mean(0) * load).sum() * config.n_routed_experts * config.moe_aux_loss_coeff
+        # Replay must keep the same tensor operations without retaining its graph on the module.
+        if not is_recomputing():
+            self.auxiliary_loss = auxiliary_loss
         self.tokens_per_expert = counts if self.tokens_per_expert is None else self.tokens_per_expert + counts
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
@@ -512,26 +720,30 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Run the routed experts on this rank without expert parallelism.
 
-        Mirrors the EP pipeline on one rank: tokens are sorted by expert and computed by
-        :meth:`JTDeepseekV3Experts.forward_expert_major`, the routing weights are cast to the
-        activation dtype, and the weighted outputs are summed per token with ``index_add_``. The
-        routed output therefore does not depend on whether expert parallelism is enabled.
+        Tokens are sorted into ``_expert_order`` and computed by
+        :meth:`JTDeepseekV3Experts.forward_expert_major`. The router reads an FP32 copy of ``hidden``
+        whose derivative joins the expert derivative in FP32. The FP32 routing weights scale the expert
+        outputs in FP32, and the products are summed per token with an FP32 ``index_add_`` and rounded
+        to the activation dtype once.
 
         Args:
             hidden: Pad-prefixed hidden states, ``[1, padding + tokens, hidden]``.
 
         Returns:
-            The weighted routed-expert output, shaped like ``hidden``.
+            The weighted routed-expert output, shaped and typed like ``hidden``.
         """
-        indices, probabilities = self.route(hidden)
+        hidden, router_hidden = RouterRoutedInputPair.apply(hidden)
+        indices, probabilities = self.route(router_hidden)
         flat = hidden.reshape(-1, hidden.shape[-1])
         expert_ids = indices.reshape(-1)
-        order = expert_ids.argsort()
+        order = _expert_order(indices)
         sources = torch.arange(flat.shape[0], device=flat.device).repeat_interleave(indices.shape[1])[order]
         counts = expert_ids.new_zeros(self.experts.num_experts).scatter_add_(0, expert_ids, torch.ones_like(expert_ids))
         outputs = self.experts.forward_expert_major(flat[sources], counts)
-        weights = probabilities.reshape(-1).to(flat.dtype)[order].unsqueeze(-1)
-        return torch.zeros_like(flat).index_add_(0, sources, outputs * weights).reshape(hidden.shape)
+        weights = probabilities.reshape(-1)[order].unsqueeze(-1)
+        weighted = _WeightedProduct.apply(outputs, weights, self.mtp)
+        return torch.zeros_like(flat, dtype=torch.float32).index_add_(
+            0, sources, weighted).to(hidden.dtype).reshape(hidden.shape)
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
@@ -549,19 +761,19 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         return routed
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run the routed experts on pad-prefixed tokens and add the shared experts.
+        """Run the routed experts on pad-prefixed tokens and add the shared experts in FP32.
 
         Args:
             hidden_states: Hidden states, ``[1, tokens, hidden]``.
 
         Returns:
-            The MoE output, shaped like ``hidden_states``.
+            The FP32 MoE output, ``[1, tokens, hidden]``; the caller rounds the result.
         """
         hidden = hidden_states
         if self.padding:
             hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
         routed = self.ep_compute(hidden)
-        return routed[:, self.padding:] + self.shared_experts(hidden_states)
+        return routed[:, self.padding:].float() + self.shared_experts(hidden_states).float()
 
 
 class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
@@ -578,7 +790,7 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = JTDeepseekV3Attention(config, layer_idx)
         self.mlp = (JTDeepseekV3MoE(config)
-                    if config.mlp_layer_types[layer_idx] == "sparse" else DeepseekV32MLP(config))
+                    if config.mlp_layer_types[layer_idx] == "sparse" else JTDeepseekV3MLP(config))
         self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -665,6 +877,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         mtp_config = copy.deepcopy(config)
         depth = config.num_nextn_predict_layers
         mtp_config.mlp_layer_types = ["sparse"] * depth
+        mtp_config.is_mtp_layer = True
         self.mtp = DeepseekV3MTP(
             hidden_size=config.hidden_size, num_layers=depth,
             decoder_factory=lambda index: JTDeepseekV3Decoder(mtp_config, index),

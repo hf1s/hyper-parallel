@@ -30,6 +30,7 @@ from hyper_parallel.distributed.activation_checkpoint import _apply_activation_c
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import _JTTrainingContext
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3ForCausalLM, JTDeepseekV3MoE
 from tests.ut.models.jt_deepseek_v3.test_modeling_jt_deepseek_v3 import small_config
+from tests.ut.models.jt_deepseek_v3.test_modeling_jt_deepseek_v3 import cpu_swiglu, native_weighted_sum
 
 
 def reference_grouped_swiglu(inputs: torch.Tensor, gate_up: torch.Tensor,
@@ -52,6 +53,10 @@ class TestJTPacked(unittest.TestCase):
         self.enterContext(patch(
             "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
             side_effect=reference_grouped_swiglu))
+        self.enterContext(patch(
+            "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.torch_npu.npu_swiglu", new=cpu_swiglu))
+        self.enterContext(patch(
+            "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.weighted_sum", new=native_weighted_sum))
 
     def test_packed_lm_mtp_equal_independent_documents(self) -> None:
         """Packed losses and gradients equal token-weighted independent document runs."""
