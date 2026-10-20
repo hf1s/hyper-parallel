@@ -149,16 +149,23 @@ class TestJTBuilder(unittest.TestCase):
         Expectation: FSDP2Config receives FP32 param/reduce overrides for every marked module parameter.
         """
         self.setup.fp32_main_params = True
-        self.build()
+        model = self.build()
         self.assertEqual(len(self.fsdp_configs), 1)
         config, mesh, fp32_main_params = self.fsdp_configs[0]
         self.assertIs(mesh, self.setup.mesh_context)
         self.assertTrue(fp32_main_params)
         self.assertIsInstance(config, FSDP2Config)
+        expected = {
+            f"{module_name}.{parameter_name}" if module_name else parameter_name
+            for module_name, module in model.named_modules()
+            if getattr(module, "keep_compute_in_fp32", False)
+            for parameter_name, _ in module.named_parameters(recurse=False)
+        }
         custom = config.mix_precision.custom_params
-        for name in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-                     "model.layers.0.input_layernorm.weight"):
-            self.assertEqual(custom[name], {"param_dtype": "float32", "reduce_dtype": "float32"})
+        self.assertEqual(set(custom), expected)
+        self.assertTrue(custom)
+        for value in custom.values():
+            self.assertEqual(value, {"param_dtype": "float32", "reduce_dtype": "float32"})
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_matching_reference_loads_exact_values(self) -> None:
