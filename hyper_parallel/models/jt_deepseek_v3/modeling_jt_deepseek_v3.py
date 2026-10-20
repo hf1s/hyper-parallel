@@ -60,6 +60,19 @@ class JTDeepseekV3Config(DeepseekV32Config):
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 
 
+def half_tree(values: torch.Tensor) -> torch.Tensor:
+    """Reduce the last axis by halves, folding an odd tail into the first lane."""
+    work = values
+    while work.shape[-1] > 1:
+        size = work.shape[-1]
+        half = size // 2
+        reduced = work[..., :half] + work[..., half:2 * half]
+        if size % 2:
+            reduced[..., 0] = reduced[..., 0] + work[..., -1]
+        work = reduced
+    return work[..., 0]
+
+
 @dataclass
 class JTDeepseekV3Output(ModelOutput):
     """Model output holding the named JT training losses."""
@@ -618,6 +631,99 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         return residual + branch
 
 
+def tiled_sum(exponent: torch.Tensor) -> torch.Tensor:
+    """Sum FP32 rows of width 152064 in the archived order; every add stays FP32.
+
+    Each row is split into 22 tiles of 108 x 64 values. A tile is reduced by a
+    halving tree over its 108 entries (entry ``j`` meets ``j + count // 2``; an
+    odd remainder is added to the first partial sum), then by a native FP32 sum
+    over its 64 lanes (issue #252 arm D2 found the archived adjacent-pair lane
+    tree numerically inert here).
+    Rows in complete 40-row blocks add the 22 tile sums left to right; the
+    remaining rows sum even and odd tiles separately and then add the two
+    partial sums.
+
+    Args:
+        exponent: FP32 values of shape ``[rows, 152064]``.
+
+    Returns:
+        FP32 row sums of shape ``[rows, 1]``.
+    """
+    tiles = exponent.reshape(exponent.shape[0], 22, 108, 64).transpose(-1, -2)
+    values = half_tree(tiles).sum(dim=-1).unsqueeze(-1)
+    total = values[:, 0, :]
+    for tile in range(1, 22):
+        total = total + values[:, tile, :]
+    regular = values.shape[0] // 40 * 40
+    tail = values[regular:]
+    even, odd = tail[:, 0, :], tail[:, 1, :]
+    for tile in range(2, 22, 2):
+        even = even + tail[:, tile, :]
+        odd = odd + tail[:, tile + 1, :]
+    return torch.cat((total[:regular], even + odd), dim=0)
+
+
+def log_probabilities(inputs: torch.Tensor) -> torch.Tensor:
+    """Return log-softmax rows in max, sub, exp, ``tiled_sum``, log, sub order."""
+    shifted = inputs - inputs.max(dim=-1, keepdim=True).values
+    total = tiled_sum(shifted.exp())
+    return shifted - total.log()
+
+
+class TreeBackwardCE(torch.autograd.Function):
+    """Native sum-reduced CE forward; softmax derivative recomputed in the archived order.
+
+    The backward pass does not reuse the forward log-softmax: it recomputes softmax from the saved
+    FP32 logits with the archived compiled graph's FP32 accumulation order over the vocabulary
+    (``log_probabilities``). That order is a reproducibility rule, not a more accurate reduction,
+    and it is defined only for vocabulary 152064.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, inputs: torch.Tensor, targets: torch.Tensor, ignore_index: int) -> torch.Tensor:
+        """Return native sum-reduced CE while saving inputs for the explicit derivative."""
+        ctx.save_for_backward(inputs, targets)
+        ctx.ignore_index = ignore_index
+        return F.cross_entropy(inputs, targets, reduction="sum", ignore_index=ignore_index)
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Recompute normalized probabilities from live logits and masked targets."""
+        inputs, targets = ctx.saved_tensors
+        result = log_probabilities(inputs).exp()
+        valid = targets != ctx.ignore_index
+        hot = torch.zeros_like(result).scatter_(1, torch.where(valid, targets, 0)[:, None], 1)
+        result = (result - hot) * (valid[:, None] * gradient)
+        return result, None, None
+
+
+def archived_cross_entropy(*, logits: torch.Tensor, labels: Any, vocab_size: int,
+                           shift_labels: torch.Tensor, num_items_in_batch: torch.Tensor,
+                           ignore_index: int = -100) -> torch.Tensor:
+    """Average the sum-reduced archived CE over the caller's valid-token denominator.
+
+    Accepts the keywords with which ``projected_cross_entropy`` calls its ``loss_fn``. The loss
+    value is native sum-reduced ``F.cross_entropy``; only the derivative differs (``TreeBackwardCE``).
+
+    Args:
+        logits: Full-vocabulary local logits.
+        labels: Unused; targets arrive pre-shifted in ``shift_labels``. Accepted so the signature matches
+            the ``projected_cross_entropy`` ``loss_fn`` contract.
+        vocab_size: Global vocabulary size of the local logits.
+        shift_labels: Pre-shifted targets aligned with ``logits``.
+        num_items_in_batch: Valid-target denominator chosen by the caller; ``projected_cross_entropy``
+            passes the same whole-sequence value to every chunk.
+        ignore_index: Target value excluded from the loss and its derivative.
+
+    Returns:
+        FP32 CE sum divided by ``num_items_in_batch``.
+    """
+    del labels
+    inputs = logits.float().reshape(-1, vocab_size)
+    targets = shift_labels.reshape(-1).to(inputs.device)
+    return TreeBackwardCE.apply(inputs, targets, ignore_index) / num_items_in_batch
+
+
 class JTDeepseekV3Model(DeepseekV32Model):
     """DeepSeek-V3.2 base model built from JT decoder layers."""
 
@@ -740,9 +846,9 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         return loss.reshape(())
 
     def _projection_loss(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Evaluate head and CE in checkpointed chunks of the CP-local sequence."""
+        """Evaluate head and ``archived_cross_entropy`` in checkpointed chunks of the CP-local sequence."""
         return projected_cross_entropy(
-            hidden, targets, head=self.lm_head, loss_fn=self.loss_function,
+            hidden, targets, head=self.lm_head, loss_fn=archived_cross_entropy,
             vocab_size=self.config.vocab_size, chunk_size=self.chunk_loss_size,
             sequence_parallel_size=self.loss_sequence_parallel_size, tp_mesh=self.loss_tp_mesh,
         )
