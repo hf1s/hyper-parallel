@@ -31,8 +31,6 @@ import torch
 
 def half_tree(values: torch.Tensor) -> torch.Tensor:
     """Reduce the last axis by halves, folding an odd tail into the first lane."""
-    if values.ndim == 0 or values.shape[-1] == 0:
-        raise ValueError("A reduction requires a nonempty final dimension")
     work = values
     while work.shape[-1] > 1:
         size = work.shape[-1]
@@ -47,8 +45,6 @@ def half_tree(values: torch.Tensor) -> torch.Tensor:
 def adjacent_tree(values: torch.Tensor) -> torch.Tensor:
     """Reduce adjacent pairs, padding the final axis to a power of two."""
     width = values.shape[-1]
-    if width <= 0:
-        raise ValueError("A reduction requires at least one lane")
     padded_width = 1 << (width - 1).bit_length()
     if padded_width != width:
         padded = values.new_zeros((*values.shape[:-1], padded_width))
@@ -69,8 +65,6 @@ def sequential_sum(values: np.ndarray) -> np.float32:
 
 def core_sum(partials: np.ndarray, cores: int = 40) -> np.float32:
     """Accumulate tiles on strided vector cores, then accumulate cores in order."""
-    if cores <= 0:
-        raise ValueError("The core count must be positive")
     accumulators = np.zeros(cores, dtype=np.float32)
     for index, partial in enumerate(partials):
         core = index % cores
@@ -80,11 +74,7 @@ def core_sum(partials: np.ndarray, cores: int = 40) -> np.float32:
 
 def tiled_square_sum(value: torch.Tensor, tile: int, width: int) -> np.float32:
     """Square FP32 values and execute a bounded-memory row/lane/core schedule."""
-    if value.dtype != torch.float32 or tile <= 0 or width <= 0 or tile % width:
-        raise ValueError("Expected FP32 values and a positive tile divisible by its SIMD width")
     flat = value.reshape(-1)
-    if not flat.numel():
-        raise ValueError("Cannot reduce an empty tensor")
     partials = []
     for start in range(0, flat.numel(), tile * 512):
         piece = flat[start:start + tile * 512]
@@ -92,7 +82,7 @@ def tiled_square_sum(value: torch.Tensor, tile: int, width: int) -> np.float32:
         padded = piece.new_zeros(tile_count * tile)
         padded[:piece.numel()] = piece * piece
         lanes = half_tree(padded.reshape(tile_count, tile // width, width).transpose(-1, -2))
-        partials.append(adjacent_tree(lanes).cpu().numpy())
+        partials.append(lanes.sum(dim=-1).cpu().numpy())
     parts = np.concatenate(partials)
     return parts[0] if len(parts) == 1 else core_sum(parts)
 
@@ -105,11 +95,18 @@ def gradient_square_sum(value: torch.Tensor) -> np.float32:
 
 
 def weighted_sum(product: torch.Tensor) -> torch.Tensor:
-    """Sum a BF16 weighted derivative with FP32 80-row/64-lane arithmetic."""
-    if product.shape[-1] != 5120 or product.dtype != torch.bfloat16:
-        raise ValueError("The archived weighted reduction requires BF16 hidden width 5120")
+    """Sum a BF16 weighted derivative: FP32 80-row half tree, then a native 64-lane sum.
+
+    issue #252's NPU single-factor ablation (arm R10: 200 steps from a shared checkpoint,
+    same recipe otherwise) found the archived 64-lane adjacent-pair tree bit-identical to a
+    native FP32 sum over the same axis on that backend -- swapping just the lane reduction
+    left the training trajectory unchanged (first_diff: none vs. the unmodified recipe).
+    The 80-row half tree is not interchangeable the same way: swapping it alone (arm R9,
+    same setup) left a late, weak divergence (first difference at step 479 of a 301-500
+    window, 1 of 200 steps over the 5e-3 threshold), so it stays archived here.
+    """
     rows = product.float().reshape(-1, 80, 64).transpose(-1, -2)
-    return adjacent_tree(half_tree(rows)).reshape(*product.shape[:-1], 1)
+    return half_tree(rows).sum(dim=-1).reshape(*product.shape[:-1], 1)
 
 
 __all__ = [
