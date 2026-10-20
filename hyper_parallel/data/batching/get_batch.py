@@ -17,7 +17,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import torch
@@ -262,6 +263,48 @@ class TextParallelBatch:
         Returns:
             Model inputs and loss inputs for one forward-backward step.
         """
+        return self._finalize_batch(self._prepare_parallel_batch(data_iterator))
+
+    def prepare_step(
+            self,
+            data_iterator: Any,
+            num_micro_steps: int,
+    ) -> tuple[list[Mapping[str, Any]], Iterator[tuple[Mapping[str, Any], Mapping[str, Any]]]]:
+        """Prepare step-wide supervision while deferring large forward-only inputs.
+
+        Args:
+            data_iterator: Iterator yielding collated source batches.
+            num_micro_steps: Number of micro-batches in the optimizer step.
+
+        Returns:
+            Supervision mappings for token counting and an iterator materializing
+            each corresponding forward batch in the same order. Only compact token
+            fields are buffered; dense attention masks are built on consumption.
+
+        Raises:
+            ValueError: If ``num_micro_steps`` is not a positive integer.
+            StopIteration: If the source cannot provide the complete optimizer step.
+        """
+        if isinstance(num_micro_steps, bool) or not isinstance(num_micro_steps, int) or num_micro_steps < 1:
+            raise ValueError(f"num_micro_steps must be a positive integer, got {num_micro_steps!r}")
+        batches = deque()
+        supervision = []
+        for _ in range(num_micro_steps):
+            batch = self._prepare_parallel_batch(data_iterator)
+            batches.append(batch)
+            supervision.append(self._split_model_and_loss_inputs(batch)[1])
+        return supervision, self._iter_prepared_batches(batches)
+
+    def _iter_prepared_batches(
+            self,
+            batches: deque,
+    ) -> Iterator[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+        """Release each compact batch as its forward inputs are materialized."""
+        while batches:
+            yield self._finalize_batch(batches.popleft())
+
+    def _prepare_parallel_batch(self, data_iterator: Any) -> dict[str, Any]:
+        """Prepare parallel-local token and supervision fields without attention masks."""
         source_batch = self._read_source_batch(data_iterator)
         canonical_batch = self._normalize_source_batch(source_batch)
         cu_seq_lens = self._resolve_sequence_boundaries(canonical_batch)
@@ -280,6 +323,13 @@ class TextParallelBatch:
 
         loss_mask = self._build_loss_mask(parallel_batch)
         parallel_batch["loss_mask"] = loss_mask
+        return parallel_batch
+
+    def _finalize_batch(
+            self,
+            parallel_batch: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        """Materialize runtime inputs only for the micro-batch about to execute."""
         runtime_inputs = self._build_runtime_inputs(parallel_batch)
 
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(
