@@ -28,6 +28,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3Gate, JTDeepseekV3MoE,
     JTDeepseekV3Attention, JTDeepseekV3MLAAttention, JTDeepseekV3RotaryEmbedding,
+    JTDeepseekV3LatentRMSNorm, SharedKeyHalfTree,
 )
 from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
@@ -57,6 +58,129 @@ def small_config() -> JTDeepseekV3Config:
         routed_scaling_factor=1.0, moe_aux_loss_coeff=0.01, mtp_loss_factor=0.3)
     config.rope_interleave = True
     return config
+
+
+def mla_rms_norm(values: torch.Tensor, weight: torch.Tensor, *,
+                 epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """CPU stand-in for ``torch_npu.npu_rms_norm`` with the HF RMSNorm's FP32 formula."""
+    rstd = torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + epsilon)
+    return values * rstd * weight, rstd
+
+
+def mla_source_attention(seed: int) -> JTDeepseekV3Attention:
+    """Build a materialized four-head source MLA whose latent norm weights differ from their initial ones."""
+    config = small_config()
+    config.num_attention_heads = config.num_key_value_heads = 4
+    torch.manual_seed(seed)
+    source = JTDeepseekV3Attention(config, 0)
+    with torch.no_grad():
+        for name in ("q_a_layernorm.weight", "kv_a_layernorm.weight"):
+            source.get_parameter(name).uniform_(0.5, 1.5)
+    return source
+
+
+class TestSharedKeyHalfTree(unittest.TestCase):
+    """The shared rope key expands over heads and reduces their gradients by an FP32 half tree."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_shared_key_expands_heads_not_tokens(self):
+        """The MLA projection contract is token-major, including its backward."""
+        values = torch.arange(30, dtype=torch.float32).reshape(2, 5, 1, 3).requires_grad_()
+        actual = SharedKeyHalfTree.apply(values, 8)
+        expected = values.expand(2, 5, 8, 3)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        weights = torch.arange(actual.numel(), dtype=torch.float32).reshape_as(actual)
+        (actual * weights).sum().backward()
+        torch.testing.assert_close(values.grad, weights.sum(2, keepdim=True), rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_shared_key_sums_head_gradients_by_fp32_half_tree(self):
+        """Head j meets head j + n / 2 first, in FP32, and the sum is rounded once to the key dtype."""
+        # (1e8 - 1e8) + (1 + 1) = 2, whereas a left-to-right FP32 sum loses each 1 against 1e8 (spacing 8) and
+        # gives 1, and pairing neighbours gives 0.
+        values = torch.zeros(1, 1, 1, 1, requires_grad=True)
+        SharedKeyHalfTree.apply(values, 4).backward(torch.tensor([1e8, 1.0, -1e8, 1.0]).reshape(1, 1, 4, 1))
+        self.assertEqual(values.grad.item(), 2.0)
+        # BF16 heads: (1 + 2**-8) + (2**-8 + 0) = 1 + 2**-7 in FP32, whereas BF16 partial sums tie 1 + 2**-8
+        # back to 1 and then 1 + 2**-8 back to 1 again.
+        values = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16, requires_grad=True)
+        gradient = torch.tensor([1.0, 2.0 ** -8, 2.0 ** -8, 0.0], dtype=torch.bfloat16).reshape(1, 1, 4, 1)
+        SharedKeyHalfTree.apply(values, 4).backward(gradient)
+        self.assertEqual(values.grad.item(), 1.0 + 2.0 ** -7)
+
+
+class TestMLAAttentionNumerics(unittest.TestCase):
+    """The MLA replacement keeps the source FP32 values and changes only rounding and summation order."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fp32_projection_matches_source_attention_bitwise(self):
+        """From the same materialized source, FP32 query, key and value equal the source attention's bitwise."""
+        source = mla_source_attention(5)
+        attention = JTDeepseekV3MLAAttention(module=copy.deepcopy(source))
+        hidden = torch.randn(2, 3, 16)
+        angle = torch.randn(2, 3, 4)
+        position_embeddings = (angle.cos(), angle.sin())
+        with patch("torch_npu.npu_rms_norm", mla_rms_norm):
+            actual = attention._project_attention_inputs(hidden, position_embeddings, None)
+        # On CPU the source attention passes its query, key and value to SDPA.
+        with patch.object(F, "scaled_dot_product_attention", wraps=F.scaled_dot_product_attention) as kernel:
+            source(hidden, position_embeddings=position_embeddings)
+        for name, expected, value in zip(("query", "key", "value"), kernel.call_args.args, actual, strict=True):
+            with self.subTest(name):
+                torch.testing.assert_close(value, expected, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_latent_projection_runs_the_two_source_gemms(self):
+        """The fused latent weight runs as one GEMM over the Q rows and one over the KV-latent and rope rows."""
+        attention = JTDeepseekV3MLAAttention(module=mla_source_attention(9))
+        hidden = torch.randn(2, 3, 16)
+        with patch("torch_npu.npu_rms_norm", mla_rms_norm), patch.object(F, "linear", wraps=F.linear) as gemm:
+            attention.project_latent_inputs(hidden)
+        weights = [call.args[1] for call in gemm.call_args_list]
+        self.assertEqual(len(weights), 2)
+        for rows, weight in zip((slice(0, 8), slice(8, 20)), weights, strict=True):
+            torch.testing.assert_close(weight, attention.linear_qkv.weight[rows], rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_latent_norms_round_fp32_rms_with_source_weights_once(self):
+        """BF16 latents are the FP32 RMSNorm with the source weights, BF16 or FP32, rounded once to BF16."""
+        source = mla_source_attention(7)
+        hidden = torch.randn(2, 8, 16, dtype=torch.bfloat16)
+        names = ("q_a_layernorm", "kv_a_layernorm")
+        for weight_dtype in (torch.bfloat16, torch.float32):
+            attention = JTDeepseekV3MLAAttention(module=copy.deepcopy(source))
+            for name, parameter in attention.named_parameters():
+                parameter.data = parameter.data.to(weight_dtype if "layernorm" in name else torch.bfloat16)
+            inputs = {}
+            for name in names:
+                attention.get_submodule(name).register_forward_hook(
+                    lambda _module, args, _output, name=name: inputs.__setitem__(name, args[0]))
+            with patch("torch_npu.npu_rms_norm", mla_rms_norm):
+                latents = attention.project_latent_inputs(hidden)[:2]
+            for name, latent in zip(names, latents, strict=True):
+                with self.subTest(name=name, weight_dtype=weight_dtype):
+                    weight = source.get_parameter(f"{name}.weight").to(weight_dtype).double()
+                    expected = mla_rms_norm(inputs[name].double(), weight,
+                                            epsilon=source.config.rms_norm_eps)[0].to(torch.bfloat16)
+                    torch.testing.assert_close(latent, expected, rtol=0, atol=0)
+                    if weight_dtype == torch.bfloat16:
+                        # The source HF norm rounds the normalized value to BF16 before the weight multiply.
+                        source_norm = copy.deepcopy(source.get_submodule(name)).to(torch.bfloat16)
+                        self.assertFalse(torch.equal(source_norm(inputs[name]), expected))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_shared_rope_key_gradient_reaches_projection_as_half_tree_sum(self):
+        """Per-head rope-key gradients [1e8, 1, -1e8, 1] reach the latent projection as their half-tree sum 2."""
+        attention = JTDeepseekV3MLAAttention(module=mla_source_attention(3))
+        hidden = torch.ones(1, 1, 16)
+        no_rotation = (torch.ones(1, 1, 4), torch.zeros(1, 1, 4))
+        with patch("torch_npu.npu_rms_norm", mla_rms_norm):
+            _, key, _ = attention._project_attention_inputs(hidden, no_rotation, None)
+        gradient = torch.zeros_like(key)
+        gradient[..., 4:] = torch.tensor([1e8, 1.0, -1e8, 1.0]).reshape(1, 4, 1, 1)
+        key.backward(gradient)
+        # The rope rows are the last four of the fused latent projection; a plain head sum would give 1.
+        torch.testing.assert_close(attention.linear_qkv.weight.grad[-4:], torch.full((4, 16), 2.0), rtol=0, atol=0)
 
 
 class TestCompleteModel(unittest.TestCase):
@@ -289,8 +413,11 @@ class TestCompleteModel(unittest.TestCase):
         self.assertEqual(sum(isinstance(m, JTDeepseekV3MLAAttention) for m in current.values()), 3)
         for name in ["model.layers.0", "model.layers.1.mlp", "model.norm", "mtp.layers.0"]:
             self.assertIs(current[name], previous[name])
-        self.assertIs(model.model.layers[0].self_attn.q_a_layernorm,
-                      previous["model.layers.0.self_attn.q_a_layernorm"])
+        for name in ("q_a_layernorm", "kv_a_layernorm"):
+            norm = model.model.layers[0].self_attn.get_submodule(name)
+            self.assertIsInstance(norm, JTDeepseekV3LatentRMSNorm)
+            self.assertTrue(norm.keep_compute_in_fp32)
+            self.assertIs(norm.weight, previous[f"model.layers.0.self_attn.{name}"].weight)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_replacement_loads_converted_reference_state(self):

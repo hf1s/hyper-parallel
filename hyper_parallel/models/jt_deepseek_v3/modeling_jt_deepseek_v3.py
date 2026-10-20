@@ -181,12 +181,48 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
     return result[0].transpose(1, 2), None
 
 
+class SharedKeyHalfTree(torch.autograd.Function):
+    """Expand a singleton token-major key and sum head gradients in FP32."""
+
+    @staticmethod
+    def forward(ctx: Any, value: torch.Tensor, heads: int) -> torch.Tensor:
+        """Broadcast a singleton head while keeping sequence-major storage."""
+        del ctx
+        return value.expand(-1, -1, heads, -1)
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Sum head contributions by a balanced FP32 tree, then round once to the key dtype."""
+        del ctx
+        reduced = gradient.float()
+        while reduced.shape[2] > 1:
+            half = reduced.shape[2] // 2
+            reduced = reduced[:, :, :half] + reduced[:, :, half:]
+        return reduced.to(gradient.dtype), None
+
+
+class JTDeepseekV3LatentRMSNorm(DeepseekV32RMSNorm):
+    """MLA latent RMSNorm: FP32 weight and arithmetic, rounded once to the input dtype.
+
+    ``keep_compute_in_fp32`` marks the weight for an FP32 FSDP compute policy.
+    """
+
+    keep_compute_in_fp32 = True
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize and scale in FP32 with the fused NPU kernel, then round once."""
+        value = torch_npu.npu_rms_norm(
+            hidden_states.float(), self.weight.float(), epsilon=self.variance_epsilon)[0]
+        return value.to(hidden_states.dtype)
+
+
 @module_replacement
 class JTDeepseekV3MLAAttention(MLAAttention):
     """MLA attention on the framework module with JT's rotary embedding and QK-clip statistics.
 
     Replaces :class:`JTDeepseekV3Attention`; ``q_a_proj`` and ``kv_a_proj_with_mqa``
-    are fused into ``linear_qkv``.
+    are fused into ``linear_qkv`` but still run as two GEMMs. The latent norms compute
+    in FP32 and the shared rotary key sums its head gradients by an FP32 half tree.
     """
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "", context: Any = None) -> None:
@@ -201,6 +237,11 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         if not self.linear_qkv.weight.is_meta:
             with torch.no_grad():
                 self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
+        # FP32 latent norms over the source norm parameters.
+        self.q_a_layernorm = JTDeepseekV3LatentRMSNorm(self.q_lora_rank, module.config.rms_norm_eps)
+        self.kv_a_layernorm = JTDeepseekV3LatentRMSNorm(self.kv_lora_rank, module.config.rms_norm_eps)
+        self.q_a_layernorm.weight = module.q_a_layernorm.weight
+        self.kv_a_layernorm.weight = module.kv_a_layernorm.weight
         self.explicit_rotary = JTDeepseekV3RotaryEmbedding(
             use_fused_rope=getattr(module.config, "use_fused_rope", False))
         self.key_rope_gather = nn.Identity()
@@ -213,7 +254,11 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         Args:
             hidden_states: Input activations in the layout selected by the model recipe.
         """
-        latent_states = self.linear_qkv(hidden_states)
+        # The source Q and KV-latent projections stay two GEMMs over the rows of the fused weight.
+        weight = self.linear_qkv.weight
+        latent_states = torch.cat((
+            F.linear(hidden_states, weight[:self.q_lora_rank]),  # pylint: disable=not-callable
+            F.linear(hidden_states, weight[self.q_lora_rank:])), dim=-1)  # pylint: disable=not-callable
         query_local, kv_local = latent_states.split(
             (self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim), dim=-1
         )
@@ -228,8 +273,9 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         """Project hidden states to queries, keys and values.
 
         Unlike the parent, the rotary key passes through ``key_rope_gather``, where
-        the recipe gathers the sequence-parallel shards, and both rotary parts use
-        :class:`JTDeepseekV3RotaryEmbedding`.
+        the recipe gathers the sequence-parallel shards, both rotary parts use
+        :class:`JTDeepseekV3RotaryEmbedding`, and :class:`SharedKeyHalfTree` expands
+        the rotated shared key over the heads.
 
         Args:
             hidden_states: Input hidden states, ``[batch, sequence, hidden]``.
@@ -257,7 +303,7 @@ class JTDeepseekV3MLAAttention(MLAAttention):
             batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
         key_rope = self.explicit_rotary(key_rope.unsqueeze(2), cos, sin, unsqueeze_dim=2)
-        key = torch.cat((key_pass, key_rope.expand(-1, -1, self.num_heads, -1)), dim=-1)
+        key = torch.cat((key_pass, SharedKeyHalfTree.apply(key_rope, self.num_heads)), dim=-1)
         # Preserve the BNSD interface with token-major storage for packed attention.
         return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
 
