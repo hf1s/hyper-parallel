@@ -92,7 +92,7 @@ def tiled_square_sum(value: torch.Tensor, tile: int, width: int) -> np.float32:
         padded = piece.new_zeros(tile_count * tile)
         padded[:piece.numel()] = piece * piece
         lanes = half_tree(padded.reshape(tile_count, tile // width, width).transpose(-1, -2))
-        partials.append(adjacent_tree(lanes).cpu().numpy())
+        partials.append(lanes.sum(dim=-1).cpu().numpy())
     parts = np.concatenate(partials)
     return parts[0] if len(parts) == 1 else core_sum(parts)
 

@@ -83,8 +83,8 @@ class TestArchivedReductions(unittest.TestCase):
             core_sum(partials, cores=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_square_sum_tile_reduces_rows_by_halves_then_lanes_by_neighbours(self):
-        """Element r * width + l is row r of lane l; rows meet by halves, then lanes by neighbours."""
+    def test_square_sum_tile_reduces_rows_by_halves_then_lanes_natively(self):
+        """Element r * width + l is row r of lane l; rows meet by halves, then lanes sum natively."""
         rows = torch.zeros(64, dtype=torch.float32)
         rows[[0, 16, 48]] = torch.tensor([1.0, 2.0 ** -12, 2.0 ** -12])  # squares 1, EPS, EPS in lane 0
         self.assertEqual(tiled_square_sum(rows, 64, 16), np.float32(ONE_PLUS_TWO_EPS))
