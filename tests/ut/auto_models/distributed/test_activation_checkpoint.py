@@ -20,6 +20,11 @@ from unittest.mock import MagicMock, call, patch
 
 from torch import Tensor, nn
 
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except ImportError:
+    # Only HF-specific contracts require this optional, version-dependent base class.
+    GradientCheckpointingLayer = None
 
 from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
 from hyper_parallel.distributed.activation_checkpoint import (
@@ -30,6 +35,7 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
+from tests.common.mark_utils import arg_mark
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -154,6 +160,53 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         blocks, _ = _find_transformer_block_modules(owner)
 
         self.assertEqual([block.child_name for block in blocks], ["2"])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    @unittest.skipIf(GradientCheckpointingLayer is None, "Requires the optional HF checkpoint-layer contract")
+    def test_leaf_checkpoint_layer_is_not_treated_as_a_container(self) -> None:
+        """Find an independently registered HF block without selecting its Linear children.
+
+        Feature: Non-container HF checkpoint block discovery.
+        Description: Register a leaf checkpoint layer beneath an unmarked auxiliary branch.
+        Expectation: The leaf is the only target and retains its actual replacement parent.
+        """
+        for enable_compile in (False, True):
+            with self.subTest(enable_compile=enable_compile):
+                model = nn.Module()
+                model.auxiliary = nn.Module()
+                block = GradientCheckpointingLayer()
+                block.attention = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+                block.mlp = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+                model.auxiliary.refiner = block
+                blocks, _ = _find_transformer_block_modules(model)
+                names = [info.fqn for info in blocks]
+                self.assertEqual(names, ["auxiliary.refiner"], f"expected=['auxiliary.refiner'], got={names}")
+                self.assertIs(blocks[0].parent, model.auxiliary,
+                              f"expected auxiliary parent, got={blocks[0].parent}")
+                _apply_activation_checkpointing(model, "full", enable_compile=enable_compile)
+                wrapped = model.auxiliary.refiner
+                blocks, _ = _find_transformer_block_modules(model)
+                names = [info.fqn for info in blocks]
+                self.assertEqual(names, ["auxiliary.refiner"], f"expected=['auxiliary.refiner'], got={names}")
+                self.assertIs(blocks[0].module, wrapped, f"expected original wrapper, got={blocks[0].module}")
+                _apply_activation_checkpointing(model, "full", enable_compile=enable_compile)
+                self.assertIs(model.auxiliary.refiner, wrapped,
+                              f"expected unchanged wrapper, got={model.auxiliary.refiner}")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_discovered_block_excludes_nested_checkpoint_owners(self) -> None:
+        """Prevent duplicate wrappers anywhere below an already selected block.
+
+        Feature: Outermost checkpoint-region ownership.
+        Description: Place a marked nested tower inside one selected repeated block.
+        Expectation: Discovery returns only the two original outer blocks.
+        """
+        model = _DiscoveryOwner()
+        model.decoder["2"].nested = _DiscoveryOwner()
+        blocks, _ = _find_transformer_block_modules(model)
+        names = [info.fqn for info in blocks]
+        self.assertEqual(names, ["decoder.2", "decoder.7"],
+                         f"expected=['decoder.2', 'decoder.7'], got={names}")
 
     def test_layer_count_selects_leading_flattened_layers(self):
         """A layer count should select a contiguous prefix in flattened order."""
