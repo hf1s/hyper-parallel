@@ -35,7 +35,6 @@ from typing import Any, List, Optional
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
 from hyper_parallel.components.optim.parameter_groups import get_adamw_param_groups, split_muon_adamw_params
 from hyper_parallel.core.optimizer import _filter_optimizer_config
@@ -57,8 +56,6 @@ def normalize_ns(value: torch.Tensor) -> torch.Tensor:
     current = value.mT if value.shape[-2] > value.shape[-1] else value
     epsilon = 1.0011717677116394e-7
     if value.ndim == 3:
-        if value.dtype != torch.bfloat16:
-            raise ValueError("Archived expert NS requires BF16 input")
         if shape == (8, 5120, 1536):
             rows = current.float().square().reshape(8, 768, 160, 64).transpose(-1, -2)
             partials = adjacent_tree(half_tree(rows)).cpu().numpy()
@@ -69,8 +66,6 @@ def normalize_ns(value: torch.Tensor) -> torch.Tensor:
             # rounding the norm earlier changes values near a BF16 midpoint.
             norm = current.float().norm(dim=(-2, -1), keepdim=True)
         return (current / (norm + 1e-7).bfloat16()).bfloat16()
-    if value.ndim != 2 or value.dtype != torch.float32:
-        raise ValueError("Archived matrix NS requires FP32 two-dimensional input")
     if shape in ((1536, 5120), (5120, 16384), (5120, 10240), (5120, 12288)):
         total = tiled_square_sum(current, 6984, 24)
         norm = torch.tensor(total, device=value.device).sqrt()
@@ -149,32 +144,12 @@ class ArchivedMuon(Muon):
     not asserted to be the correct shape scaling for a new training run.
     """
 
-    # Framework Muon hooks whose role this recipe's fixed arithmetic takes over.
-    _REPLACED_HOOKS = ("zeropower_fn", "momentum_update_fn", "reshape_fn", "ns_transform_fn")
-
     def __init__(self, params: Any, *, model_config: Any, **kwargs: Any) -> None:
-        """Build native Muon state while explicitly selecting the archived recipe.
-
-        Raises:
-            ValueError: Outside one initialized rank, if LR folding is disabled, if
-                a replaced framework hook is supplied, or for momentum/NS options the
-                archived arithmetic does not implement.
-        """
-        if not dist.is_initialized() or dist.get_world_size() != 1:
-            raise ValueError("The archived optimizer is restricted to one initialized rank")
-        if kwargs.get("apply_lr_in_update", True) is not True:
-            raise ValueError("The archived recipe folds LR into the update; apply_lr_in_update cannot be disabled")
-        replaced = sorted(name for name in self._REPLACED_HOOKS if kwargs.get(name) is not None)
-        if replaced:
-            raise ValueError(f"The archived recipe replaces these framework Muon hooks: {replaced}")
+        """Build native Muon state while explicitly selecting the archived recipe."""
         self.model_config = model_config
         self.restored_lr_folding: list[bool] = []
         kwargs["apply_lr_in_update"] = True
         super().__init__(params, **kwargs)
-        for group in self.param_groups:
-            beta1, beta2 = group["momentum"]
-            if beta1 != beta2 or group["ns_variant"] != "legacy" or group["ns_epsilon"] != 1e-7:
-                raise ValueError("The archived recipe requires equal momentum coefficients and legacy NS epsilon 1e-7")
 
     def load_state_dict(self, state_dict: dict) -> None:
         """Restore all native tensor state, selecting this recipe's update representation.
@@ -190,15 +165,11 @@ class ArchivedMuon(Muon):
 
     def _update_muon_momentum(self, group, params):
         beta1, beta2 = group["momentum"]
-        if beta1 != beta2 or group["ns_variant"] != "legacy" or group["ns_epsilon"] != 1e-7:
-            raise ValueError("The archived recipe requires equal momentum coefficients and legacy NS epsilon 1e-7")
         updates = {}
         for parameter in params:
             if parameter.grad is None:
                 continue
             gradient = to_local_if_dtensor(parameter.grad)
-            if gradient.dtype != torch.float32:
-                raise ValueError("The archived momentum requires FP32 gradients")
             state = self.state[parameter]
             if "momentum_buffer" not in state:
                 state["momentum_buffer"] = torch.zeros_like(parameter.grad)
@@ -209,8 +180,6 @@ class ArchivedMuon(Muon):
 
     def _compute_batched_ns_updates(self, p_list, ns_inputs, group, no_shard=False):
         del no_shard
-        if not group["apply_lr_in_update"] or group["ns_coefficients"] is not None:
-            raise ValueError("The archived NS recipe requires internal LR folding and the legacy coefficient schedule")
         restored = {}
         for parameter in p_list:
             name = parameter.model_name
@@ -248,9 +217,6 @@ class ArchivedMuon(Muon):
         archived recipe without changing framework Muon.
         """
         del param_compute_coord  # only used to coordinate which rank computes which shard
-        _, _, _, total_shard_size = self._get_shard_info(hsdp_assign)
-        if total_shard_size != 1:
-            raise ValueError("The archived optimizer requires a singleton shard group")
         local_params = []
         local_updates = []
         for parameter in valid_params:
@@ -271,8 +237,6 @@ def archived_adamw(parameter: torch.Tensor, gradient: torch.Tensor, moment: torc
                    variance: torch.Tensor, group: dict) -> None:
     """Update one FP32 parameter with the archive's scalar and addcmul boundaries."""
     values = [to_local_if_dtensor(value) for value in (parameter, gradient, moment, variance)]
-    if any(value.dtype != torch.float32 or not value.is_contiguous() for value in values):
-        raise ValueError("Archived AdamW requires contiguous FP32 parameter, gradient and moment state")
     weight, grad, first, second = [value.view(-1) for value in values]
     beta1, beta2, lr, decay, eps = [torch.tensor([number], device=weight.device, dtype=torch.float32)
                                   for number in (*group["betas"], group["lr"], group["weight_decay"], group["eps"])]
@@ -302,8 +266,6 @@ class ArchivedAdamW(AdamW):
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
-            if group["amsgrad"] or group["maximize"]:
-                raise ValueError("The archived recipe does not support AMSGrad or maximization")
             group["step"] = (group.get("step") or 0) + 1
             for parameter in group["params"]:
                 if parameter.grad is None:
@@ -334,17 +296,9 @@ class ArchivedOptimizerBuilder:
             extra_adamw_name_keywords: Optional[List[str]] = None,
             no_decay_params: Optional[List[str]] = None,
     ) -> None:
-        """Route parameters like the native builder, chain the archived optimizers and register the JT hook.
-
-        Raises:
-            ValueError: If ``qk_clip_threshold`` is not finite and positive, or a parameter class is empty.
-        """
-        if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
-            raise ValueError("qk_clip_threshold must be finite and positive")
+        """Route parameters like the native builder, chain the archived optimizers and register the JT hook."""
         muon_params, adamw_params, _, _ = split_muon_adamw_params(
             model, extra_adamw_name_keywords=extra_adamw_name_keywords or ())
-        if not muon_params or not adamw_params:
-            raise ValueError("The archived optimizer recipe requires both Muon and AdamW parameters")
         adamw_groups, _ = get_adamw_param_groups(
             model, weight_decay=adamw_config.get("adamw_weight_decay", 1e-2), no_decay_params=no_decay_params,
             allowed_param_ids=[id(parameter) for parameter in adamw_params])

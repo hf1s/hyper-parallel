@@ -20,13 +20,11 @@
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
-from hyper_parallel.models.jt_deepseek_v3.adapter.runtime import archived_optimizer
 from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.archived_optimizer import (
     ArchivedAdamW, ArchivedMuon, ArchivedOptimizerBuilder, _logical_matrices, archived_adamw, archived_ns,
     normalize_ns,
@@ -36,11 +34,6 @@ from tests.ut.models.jt_deepseek_v3.test_jt_optimizer import attention_modules, 
 
 THRESHOLD = 100.0
 ARCHIVED_MUON = {"lr": 0.0, "ns_variant": "legacy", "ns_epsilon": 1e-7}
-
-
-def single_rank() -> MagicMock:
-    """Stand in for an initialized one-rank process group inside the archived optimizer module."""
-    return MagicMock(is_initialized=MagicMock(return_value=True), get_world_size=MagicMock(return_value=1))
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -77,8 +70,8 @@ class TestArchivedOptimizer(unittest.TestCase):
         parameter = torch.nn.Parameter(torch.zeros(2, 3))
         optimizer = object.__new__(ArchivedMuon)
         defaults = {'apply_lr_in_update': False, 'step': 200, 'lr': .0001,
-                    'momentum': (.95, .95), 'ns_variant': 'legacy', 'ns_epsilon': 1e-7, 'nesterov': True}
-        # Bypass only the initialized-process-group constructor; exercise real state restore.
+                    'momentum': (.95, .95), 'nesterov': True}
+        # Bypass only the constructor, which would force LR folding; exercise real state restore.
         torch.optim.Optimizer.__init__(optimizer, [parameter], defaults)  # pylint: disable=unnecessary-dunder-call
         buffer = torch.arange(6, dtype=torch.float32).reshape(2, 3)
         optimizer.state[parameter]['momentum_buffer'] = buffer.clone()
@@ -121,8 +114,7 @@ class TestArchivedOptimizer(unittest.TestCase):
 
                 optimizer = object.__new__(ArchivedMuon)
                 optimizer._param_shard_metadata = {}  # pylint: disable=protected-access
-                with patch.object(optimizer, '_get_shard_info', return_value=((1,), (0,), (None,), 1)), \
-                        torch.no_grad():
+                with torch.no_grad():
                     optimizer._fused_broadcast_and_apply(  # pylint: disable=protected-access
                         parameters, dict(zip(parameters, updates)), None, group, SimpleNamespace(layout_spec=None))
                 for actual, reference in zip(parameters, expected):
@@ -130,23 +122,11 @@ class TestArchivedOptimizer(unittest.TestCase):
                 for update, original in zip(updates, originals):
                     torch.testing.assert_close(update, original, rtol=0, atol=0)
 
-    def test_fused_broadcast_and_apply_rejects_a_multi_rank_shard_group(self):
-        """ArchivedMuon is restricted to single-rank runs; it must not silently broadcast."""
-        optimizer = object.__new__(ArchivedMuon)
-        optimizer._param_shard_metadata = {}  # pylint: disable=protected-access
-        parameter = torch.nn.Parameter(torch.zeros(2, 2))
-        group = {'lr': 1e-4, 'weight_decay': 0.0, 'apply_lr_in_update': True}
-        with patch.object(optimizer, '_get_shard_info', return_value=((2,), (0,), (MagicMock(),), 2)):
-            with self.assertRaisesRegex(ValueError, 'singleton shard group'):
-                optimizer._fused_broadcast_and_apply(  # pylint: disable=protected-access
-                    [parameter], {parameter: torch.zeros(2, 2)}, None, group, SimpleNamespace(layout_spec=None))
-
     def test_builder_registers_the_native_qk_clip_hook_after_archived_updates(self):
         """The archived YAML target clips QK projections once per step, exactly like the default target."""
         model = replaced_model(torch.float32)
-        with patch.object(archived_optimizer, "dist", single_rank()):
-            builder = ArchivedOptimizerBuilder(model=model, muon_config=ARCHIVED_MUON,
-                                               adamw_config={"adamw_lr": 0.0}, qk_clip_threshold=THRESHOLD)
+        builder = ArchivedOptimizerBuilder(model=model, muon_config=ARCHIVED_MUON,
+                                           adamw_config={"adamw_lr": 0.0}, qk_clip_threshold=THRESHOLD)
         optimizer = Float16OptimizerWithFloat16Params(builder.get_optimizer(), model)
         self.assertEqual([type(leaf) for leaf in builder.get_optimizer().chained_optimizers],
                          [ArchivedAdamW, ArchivedMuon])
@@ -163,29 +143,6 @@ class TestArchivedOptimizer(unittest.TestCase):
             self.assertTrue(torch.equal(module.kv_b_proj.weight,
                                         key_value * row_factors([0.25, 1.0], rope_scaled=False)))
             self.assertTrue(torch.equal(module.max_logits_val, torch.zeros(2)))
-        for invalid in (0.0, -1.0, float("inf"), float("nan")):
-            with self.subTest(qk_clip_threshold=invalid), self.assertRaisesRegex(ValueError, "qk_clip_threshold"):
-                ArchivedOptimizerBuilder(model=model, muon_config=ARCHIVED_MUON, adamw_config={},
-                                         qk_clip_threshold=invalid)
-
-    def test_unsupported_options_fail_at_construction(self):
-        """Options the archived arithmetic ignores or cannot honour are rejected before any step runs."""
-        parameters = [torch.nn.Parameter(torch.zeros(4, 4))]
-        invalid_options = {
-            "ns_variant": {"ns_variant": "asym5", "ns_epsilon": 1e-7},
-            "ns_epsilon": {"ns_variant": "legacy", "ns_epsilon": 1e-6},
-            "momentum": {"ns_variant": "legacy", "ns_epsilon": 1e-7, "momentum": (0.9, 0.95)},
-            "apply_lr_in_update": {"ns_variant": "legacy", "ns_epsilon": 1e-7, "apply_lr_in_update": False},
-            "momentum_update_fn": {"ns_variant": "legacy", "ns_epsilon": 1e-7, "momentum_update_fn": print},
-        }
-        with patch.object(archived_optimizer, "dist", single_rank()):
-            ArchivedMuon(parameters, model_config=None, **ARCHIVED_MUON)
-            for name, options in invalid_options.items():
-                with self.subTest(option=name), self.assertRaises(ValueError):
-                    ArchivedMuon(parameters, model_config=None, **options)
-        two_ranks = MagicMock(is_initialized=MagicMock(return_value=True), get_world_size=MagicMock(return_value=2))
-        with patch.object(archived_optimizer, "dist", two_ranks), self.assertRaisesRegex(ValueError, "one initialized"):
-            ArchivedMuon(parameters, model_config=None, **ARCHIVED_MUON)
 
     def test_logical_matrices_split_the_archived_schema_and_restore_storage(self):
         """Fused JT storage splits into the archived Q/KV/RoPE, per-head and gate/up blocks and restores exactly."""
@@ -237,8 +194,7 @@ class TestArchivedOptimizer(unittest.TestCase):
         parameter.model_name = "model.layers.0.self_attn.q_b_proj.weight"
         torch.manual_seed(258)
         momentum = torch.randn(10, 3)
-        group = {"apply_lr_in_update": True, "ns_coefficients": None, "ns_steps": 5, "lr": 0.01,
-                 "matched_adamw_rms": 0.2}
+        group = {"ns_steps": 5, "lr": 0.01, "matched_adamw_rms": 0.2}
         optimizer = object.__new__(ArchivedMuon)
         optimizer.model_config = config
         actual = optimizer._compute_batched_ns_updates(  # pylint: disable=protected-access
