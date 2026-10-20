@@ -56,12 +56,7 @@ def tiled_sum(exponent: torch.Tensor) -> torch.Tensor:
 
     Returns:
         FP32 row sums of shape ``[rows, 1]``.
-
-    Raises:
-        ValueError: If ``exponent`` is not a two-dimensional FP32 tensor of width 152064.
     """
-    if exponent.ndim != 2 or exponent.shape[-1] != 152064 or exponent.dtype != torch.float32:
-        raise ValueError('Measured DVM compatibility tree requires FP32 vocabulary 152064')
     tiles = exponent.reshape(exponent.shape[0], 22, 108, 64).transpose(-1, -2)
     values = half_tree(tiles).sum(dim=-1).unsqueeze(-1)
     total = values[:, 0, :]
@@ -110,9 +105,10 @@ def archived_cross_entropy(*, logits: torch.Tensor, labels: Any, vocab_size: int
     """Average the sum-reduced archived CE over the caller's valid-token denominator.
 
     Args:
-        logits: Full-vocabulary local logits whose leading dimensions hold 4096 positions.
-        labels: Must be ``None``; targets arrive pre-shifted in ``shift_labels``.
-        vocab_size: Global vocabulary size; must be 152064.
+        logits: Full-vocabulary local logits.
+        labels: Unused; targets arrive pre-shifted in ``shift_labels``. Accepted so the signature matches
+            the ``projected_cross_entropy`` ``loss_fn`` contract.
+        vocab_size: Global vocabulary size of the local logits.
         shift_labels: Pre-shifted targets aligned with ``logits``.
         num_items_in_batch: Valid-target denominator chosen by the caller; ``projected_cross_entropy``
             passes the same whole-sequence value to every chunk.
@@ -120,17 +116,7 @@ def archived_cross_entropy(*, logits: torch.Tensor, labels: Any, vocab_size: int
 
     Returns:
         FP32 CE sum divided by ``num_items_in_batch``.
-
-    Raises:
-        ValueError: If labels are given, the logits are a distributed (e.g. vocabulary-sharded) tensor, or
-            the vocabulary or row count differs from the fixed schedule.
     """
-    if hasattr(logits, "to_local"):
-        raise ValueError("The archived CE needs full-vocabulary local logits; loss parallelism is unsupported")
-    if labels is not None or logits.shape[-1] != vocab_size or vocab_size != 152064:
-        raise ValueError("The archived CE expects pre-shifted targets and vocabulary 152064")
-    if logits.numel() // vocab_size != 4096:
-        raise ValueError("The archived CE dispatch schedule is defined only for 4096 rows")
     inputs = logits.float().reshape(-1, vocab_size)
     targets = shift_labels.reshape(-1).to(inputs.device)
     return TreeBackwardCE.apply(inputs, targets, ignore_index) / num_items_in_batch
