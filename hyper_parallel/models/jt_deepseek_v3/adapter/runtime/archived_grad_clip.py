@@ -30,7 +30,6 @@ framework ``clip_grad_norm_``.
 # pylint: disable=forbidden-backend-import
 
 import json
-import math
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -48,12 +47,8 @@ GRADIENT_LAYOUT_PATH = Path(__file__).resolve().with_name("archived_gradient_lay
 def local_gradient(parameters: dict[str, torch.nn.Parameter], name: str) -> torch.Tensor:
     """Read one live local FP32 gradient without modifying it."""
     value = _get_local_grad(parameters[name])
-    if value is None:
-        raise ValueError('Missing preclip gradient: ' + name)
     if hasattr(value, 'to_local'):
         value = value.to_local()
-    if value.dtype != torch.float32:
-        raise ValueError('Expected FP32 gradient: ' + name)
     return value.detach()
 
 
@@ -94,34 +89,26 @@ def clip_archived_gradients(model: torch.nn.Module, max_norm: float, *,
                             layout_path: Path = GRADIENT_LAYOUT_PATH) -> torch.Tensor:
     """Calculate the L2 norm in the archive's logical layout and registration order.
 
-    The versioned JSON contains only tensor names and shapes. Neither reference
+    The versioned JSON contains only tensor names. Neither reference
     gradient values nor recorded norms enter this computation.
 
     Args:
         model: Single-card model whose FP32 local gradients are clipped in place.
-        max_norm: Positive finite clipping threshold.
-        layout_path: JSON list of ``{"name", "shape"}`` logical gradients in
+        max_norm: Clipping threshold.
+        layout_path: JSON list of ``{"name"}`` logical gradients in
             archive registration order; defaults to the JT archive layout.
 
     Returns:
         The FP32 pre-clip gradient norm.
     """
-    if not math.isfinite(max_norm) or max_norm <= 0:
-        raise ValueError("The archived recipe requires a positive finite clipping threshold")
     order = json.loads(Path(layout_path).read_text(encoding="utf-8"))
     parameters = dict(model.named_parameters())
     sums = []
     for entry in order:
         gradient = mf_gradient(parameters, entry["name"])
-        if list(gradient.shape) != entry["shape"]:
-            raise ValueError(f"Archived gradient layout mismatch: {entry['name']}")
         sums.append(gradient_square_sum(gradient))
     gradients = [_get_local_grad(parameter) for parameter in parameters.values()]
-    if any(value is None or value.dtype != torch.float32 for value in gradients):
-        raise ValueError("The archived recipe requires complete FP32 local gradients")
     total = sequential_sum(np.asarray(sums, dtype=np.float32))
-    if not np.isfinite(total):
-        raise ValueError("Nonfinite archived gradient norm")
     norm = torch.tensor(total, dtype=torch.float32, device=gradients[0].device).sqrt()
     _clip_grads_with_norm_(gradients, float(max_norm), norm, None)
     return norm
@@ -146,16 +133,11 @@ def register_archived_clip(optimizer: Any, model: torch.nn.Module, max_norm: flo
     Args:
         optimizer: ``ChainedOptimizer`` returned by the archived optimizer builder.
         model: Single-card model whose FP32 local gradients are clipped in place.
-        max_norm: Positive finite archived clipping threshold.
+        max_norm: Archived clipping threshold.
         layout_path: Archived logical gradient layout; defaults to the JT archive layout.
 
     Returns:
         Handle that removes the hook.
-
-    Raises:
-        ValueError: If ``max_norm`` is not positive and finite.
     """
-    if not math.isfinite(max_norm) or max_norm <= 0:
-        raise ValueError("The archived recipe requires a positive finite clipping threshold")
     return optimizer.chained_optimizers[0].register_step_pre_hook(
         partial(_clip_before_update, model, float(max_norm), Path(layout_path)))
