@@ -25,7 +25,9 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed.mesh import DistributedSetup
+from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.jt_deepseek_v3.adapter import jt_builder
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
@@ -75,6 +77,11 @@ class TestJTBuilder(unittest.TestCase):
         self.enterContext(patch.object(jt_builder.torch_npu.npu, "set_compile_mode"))
         self.enterContext(patch.object(jt_builder, "get_device_id", return_value=0))
         self.enterContext(patch.object(jt_builder, "instantiate_infrastructure", return_value=(None, None)))
+        self.fsdp_configs = []
+        def record_fsdp(config, mesh, fp32_main_params=False):
+            self.fsdp_configs.append((config, mesh, fp32_main_params))
+            return None
+        self.enterContext(patch.object(jt_builder, "FSDP2Manager", side_effect=record_fsdp))
 
     def build(self, seed: int = 42, **options: Any) -> JTDeepseekV3ForCausalLM:
         """Build through the production entry with a caller-owned seed."""
@@ -133,6 +140,25 @@ class TestJTBuilder(unittest.TestCase):
         before = model.model.embed_tokens.weight.detach().clone()
         torch.optim.SGD(model.parameters(), lr=0.01, foreach=False).step()
         self.assertFalse(torch.equal(before, model.model.embed_tokens.weight))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_build_uses_fsdp_custom_params(self) -> None:
+        """Feature: FP32 FSDP precision in the production entry.
+
+        Description: Build through the production entry with FP32 main parameters and no strategy config.
+        Expectation: FSDP2Config receives FP32 param/reduce overrides for every marked module parameter.
+        """
+        self.setup.fp32_main_params = True
+        self.build()
+        self.assertEqual(len(self.fsdp_configs), 1)
+        config, mesh, fp32_main_params = self.fsdp_configs[0]
+        self.assertIs(mesh, self.setup.mesh_context)
+        self.assertTrue(fp32_main_params)
+        self.assertIsInstance(config, FSDP2Config)
+        custom = config.mix_precision.custom_params
+        for name in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                     "model.layers.0.input_layernorm.weight"):
+            self.assertEqual(custom[name], {"param_dtype": "float32", "reduce_dtype": "float32"})
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_matching_reference_loads_exact_values(self) -> None:

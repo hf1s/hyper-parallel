@@ -621,6 +621,20 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         return residual + branch
 
 
+class JTDeepseekV3Embedding(nn.Embedding):
+    """FP32-stored token embedding with an optional dense-activation output cast."""
+
+    keep_compute_in_fp32 = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.output_dtype: torch.dtype | None = None
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        result = super().forward(values)
+        return result if self.output_dtype is None else result.to(self.output_dtype)
+
+
 class JTDeepseekV3Model(DeepseekV32Model):
     """DeepSeek-V3.2 base model built from JT decoder layers."""
 
@@ -632,7 +646,7 @@ class JTDeepseekV3Model(DeepseekV32Model):
         """
         DeepseekV32PreTrainedModel.__init__(self, config)
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = JTDeepseekV3Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
         self.norm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)

@@ -26,9 +26,11 @@ from typing import Any
 import numpy as np
 import torch
 import torch_npu
+from torch import nn
 from transformers import PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config, get_device_id
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
@@ -130,7 +132,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | No
         distributed_setup, module_replacements=(),
         strategy_config=distributed_setup.strategy_config or FSDP2Config(),
     )
-    planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
+    planner, _ = instantiate_infrastructure(distributed_setup=framework_setup)
     with torch.device("meta"):
         model = JTDeepseekV3ForCausalLM(config)
         model, _ = _apply_module_replacement_actions(
@@ -146,6 +148,25 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | No
         with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
             arrays = {name: archive[name] for name in archive.files}
         _load_reference_state(model, arrays)
+
+    param_dtype = framework_setup.strategy_config.mix_precision.param_dtype
+    if param_dtype is not None:
+        dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[param_dtype]
+        model.model.embed_tokens.output_dtype = dtype
+    custom_params = {}
+    for module_name, module in model.named_modules():
+        if not getattr(module, "keep_compute_in_fp32", False):
+            continue
+        for parameter_name, _ in module.named_parameters(recurse=False):
+            fqn = f"{module_name}.{parameter_name}" if module_name else parameter_name
+            custom_params[fqn] = {"param_dtype": "float32", "reduce_dtype": "float32"}
+    strategy_config = framework_setup.strategy_config
+    strategy_config = replace(
+        strategy_config,
+        mix_precision=replace(strategy_config.mix_precision, custom_params=custom_params),
+    )
+    framework_setup = replace(framework_setup, strategy_config=strategy_config)
+    fsdp = FSDP2Manager(strategy_config, mesh, fp32_main_params=framework_setup.fp32_main_params)
 
     device = torch.device(mesh.device_mesh.device_type, get_device_id())
     model.to(device)
