@@ -58,6 +58,8 @@ class JTDeepseekV3Config(DeepseekV32Config):
     # The MF archive recipe uses absolute RoPE positions and lets MTP shifts cross
     # packed-document boundaries; the default JT objective resets positions and masks tails.
     archive_absolute_positions: bool = False
+    # Optional dense-activation dtype for the FP32-stored token embedding output.
+    embedding_output_dtype: str | None = None
 
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
@@ -626,9 +628,9 @@ class JTDeepseekV3Embedding(nn.Embedding):
 
     keep_compute_in_fp32 = True
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, output_dtype: torch.dtype | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.output_dtype: torch.dtype | None = None
+        self.output_dtype = output_dtype
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         result = super().forward(values)
@@ -646,7 +648,12 @@ class JTDeepseekV3Model(DeepseekV32Model):
         """
         DeepseekV32PreTrainedModel.__init__(self, config)
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
-        self.embed_tokens = JTDeepseekV3Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        embedding_dtype = getattr(config, "embedding_output_dtype", None)
+        embedding_dtype = None if embedding_dtype is None else {
+            "bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32,
+        }[embedding_dtype]
+        self.embed_tokens = JTDeepseekV3Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx, output_dtype=embedding_dtype)
         self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
         self.norm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)

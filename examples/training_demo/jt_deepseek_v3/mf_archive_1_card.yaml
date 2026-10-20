@@ -51,6 +51,7 @@ model:
     enable_chunk_loss: true
     chunk_loss_size: 4096
     archive_absolute_positions: true
+    embedding_output_dtype: bfloat16
   reference_weights: /checkpoints/converted-mf-step200
 loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
@@ -166,6 +167,67 @@ fsdp_config:
     param_dtype: bfloat16
     reduce_dtype: float32
     cast_forward_inputs: false
+    custom_params:
+      lm_head.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.embed_tokens.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.input_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.post_attention_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.self_attn.kv_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.self_attn.q_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.input_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.mlp.gate.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.post_attention_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.self_attn.kv_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.self_attn.q_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.norm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.enorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.final_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.hnorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.input_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.mlp.gate.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.post_attention_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.self_attn.kv_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.self_attn.q_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
 activation_checkpoint:
   mode: 'off'
 activation_swap: none
