@@ -200,10 +200,6 @@ class VLMTrainer:
             )
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
             self.base.current_token_counts = count_loss_token(loss_inputs)
-            self.base.step_token_counts = {
-                name: token_count * num_micro_steps
-                for name, token_count in self.base.current_token_counts.items()
-            }
             loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
             # Release each device batch as soon as its backward pass completes;
@@ -231,6 +227,14 @@ class VLMTrainer:
         training_batches = [first_training_batch]
         for _ in range(1, num_micro_steps):
             training_batches.append(self.base.get_batch(data_iterator))
+
+        # Micro-batches in one optimizer step hold different numbers of valid
+        # targets, so a per-micro-batch count times the micro-batch count is not
+        # the step total. Count the whole step once; every micro-step then divides
+        # by the same optimizer-step total, independent of the DP/CP split.
+        self.base.step_token_counts = count_loss_token(
+            [loss_inputs for _, loss_inputs in training_batches]
+        )
 
         self.on_step_begin(
             micro_batches=[model_inputs for model_inputs, _ in training_batches]
