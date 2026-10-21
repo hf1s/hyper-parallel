@@ -41,6 +41,7 @@ from hyper_parallel.components.losses.mtp import iter_mtp_targets
 from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP, shift_mtp_sequence
 from hyper_parallel.components.modules.mla_attention import MLAAttention
+from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
 )
@@ -55,6 +56,30 @@ class JTDeepseekV3Config(DeepseekV32Config):
     """DeepSeek-V3.2 configuration registered as the ``jt_deepseek_v3`` model type."""
 
     model_type = "jt_deepseek_v3"
+
+    def __init__(self, use_fused_rms_norm: bool = False, **kwargs: Any) -> None:
+        """Initialize the JT configuration.
+
+        Args:
+            use_fused_rms_norm: Construct public NPU RMSNorm modules. The default
+                keeps the Transformers implementation. Parameter precision remains
+                controlled by the training precision policy.
+            **kwargs: Fields forwarded to ``DeepseekV32Config``.
+
+        Raises:
+            TypeError: If ``use_fused_rms_norm`` is not a bool.
+        """
+        if not isinstance(use_fused_rms_norm, bool):
+            raise TypeError("use_fused_rms_norm must be a bool")
+        super().__init__(**kwargs)
+        self.use_fused_rms_norm = use_fused_rms_norm
+
+
+def _make_rms_norm(config: Any, size: int) -> nn.Module:
+    """Select the normalization module without changing its parameter layout."""
+    if getattr(config, "use_fused_rms_norm", False):
+        return RMSNorm(hidden_size=size, eps=config.rms_norm_eps)
+    return DeepseekV32RMSNorm(size, config.rms_norm_eps)
 
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
@@ -310,10 +335,10 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         self.scaling = self.qk_head_dim ** -0.5
         self.attention_dropout, self.is_causal, self.sliding_window = config.attention_dropout, True, None
         self.q_a_proj = nn.Linear(config.hidden_size, self.q_lora_rank, bias=False)
-        self.q_a_layernorm = DeepseekV32RMSNorm(self.q_lora_rank, config.rms_norm_eps)
+        self.q_a_layernorm = _make_rms_norm(config, self.q_lora_rank)
         self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
-        self.kv_a_layernorm = DeepseekV32RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
+        self.kv_a_layernorm = _make_rms_norm(config, self.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
@@ -579,8 +604,8 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         self.self_attn = JTDeepseekV3Attention(config, layer_idx)
         self.mlp = (JTDeepseekV3MoE(config)
                     if config.mlp_layer_types[layer_idx] == "sparse" else DeepseekV32MLP(config))
-        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = _make_rms_norm(config, config.hidden_size)
+        self.post_attention_layernorm = _make_rms_norm(config, config.hidden_size)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: Any = None,
                 position_ids: Any = None, past_key_values: Any = None, use_cache: bool = False,
@@ -631,7 +656,7 @@ class JTDeepseekV3Model(DeepseekV32Model):
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
-        self.norm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = _make_rms_norm(config, config.hidden_size)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()
@@ -668,8 +693,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.mtp = DeepseekV3MTP(
             hidden_size=config.hidden_size, num_layers=depth,
             decoder_factory=lambda index: JTDeepseekV3Decoder(mtp_config, index),
-            norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
-            output_norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
+            norm_factory=lambda size: _make_rms_norm(mtp_config, size),
+            output_norm_factory=lambda size: _make_rms_norm(mtp_config, size),
         )
         self.loss_tp_mesh = None
         self.loss_sequence_parallel_size = 1
