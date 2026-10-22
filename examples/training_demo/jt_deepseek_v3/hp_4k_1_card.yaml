@@ -165,6 +165,15 @@ fsdp_config:
     param_dtype: bfloat16
     reduce_dtype: float32
     cast_forward_inputs: false
+    # Preserve FP32 router weights for this reference recipe; casting a BF16
+    # compute copy to FP32 inside the gate cannot recover its rounded bits.
+    custom_params:
+      model.layers.1.mlp.gate.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.mlp.gate.weight:
+        param_dtype: float32
+        reduce_dtype: float32
 activation_checkpoint:
   mode: 'off'
 activation_swap: none
