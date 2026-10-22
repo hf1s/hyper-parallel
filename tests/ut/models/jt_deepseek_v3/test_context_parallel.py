@@ -270,3 +270,58 @@ class TestJTContextParallel(unittest.TestCase):
         torch.testing.assert_close(inputs.grad, other.grad, atol=1e-7, rtol=1e-6)
         for parameter, reference in zip(packed.parameters(), separate.parameters()):
             torch.testing.assert_close(parameter.grad, reference.grad, atol=1e-7, rtol=1e-6)
+
+
+    def test_padding_aware_fa_crops_inputs_and_restores_gradients(self):
+        """FA sees real documents only; restored tail outputs and their input gradients are zero."""
+        torch.manual_seed(32)
+        query, key, value = [torch.randn(1, 2, 10, 4, requires_grad=True) for _ in range(3)]
+        observer = SimpleNamespace(max_logits_val=None, is_causal=True)
+
+        def kernel(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                   _heads: int, layout: str, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            """Emulate FA on the actual token domain received by the operator."""
+            self.assertEqual(layout, "TND")
+            self.assertEqual(query.shape[0], 7)
+            self.assertEqual(kwargs["actual_seq_qlen"], [3, 7])
+            parts, maxima = [], []
+            for begin, end in ((0, 3), (3, 7)):
+                q, k, v = [tensor[begin:end].transpose(0, 1) for tensor in (query, key, value)]
+                scores = q @ k.transpose(-1, -2) * kwargs["scale"]
+                scores = scores.masked_fill(torch.ones(end - begin, end - begin, dtype=torch.bool).triu(1),
+                                            -torch.inf)
+                parts.append((scores.softmax(-1) @ v).transpose(0, 1))
+                maxima.append(scores.amax(-1).transpose(0, 1).unsqueeze(-1).expand(-1, -1, 8))
+            return torch.cat(parts), torch.cat(maxima)
+
+        with patch("torch_npu.npu_fusion_attention", side_effect=kernel):
+            output, _ = observed_fusion_attention(observer, query, key, value, None,
+                                                  actual_seq_len=(3, 7, 10), attention_seq_len=(3, 7))
+        self.assertEqual(output.shape, (1, 10, 2, 4))
+        self.assertEqual(output[:, 7:].count_nonzero(), 0)
+        references = [tensor.detach().clone().requires_grad_() for tensor in (query, key, value)]
+        allowed = torch.zeros(7, 10, dtype=torch.bool)
+        allowed[:3, :3] = torch.ones(3, 3, dtype=torch.bool).tril()
+        allowed[3:, 3:7] = torch.ones(4, 4, dtype=torch.bool).tril()
+        scores = (references[0][:, :, :7] @ references[1].transpose(-1, -2)) / 2
+        expected = (scores.masked_fill(~allowed, -torch.inf).softmax(-1) @ references[2]).transpose(1, 2)
+        torch.testing.assert_close(output[:, :7], expected)
+        upstream = torch.randn_like(output)
+        output.backward(upstream)
+        expected.backward(upstream[:, :7])
+        for tensor, reference in zip((query, key, value), references):
+            torch.testing.assert_close(tensor.grad, reference.grad)
+            self.assertEqual(tensor.grad[:, :, 7:].count_nonzero(), 0)
+
+    def test_padding_runtime_requires_a_trailing_document(self):
+        """Real-token metadata cannot truncate a real document or describe an interior gap."""
+        runtime = JTSequenceRuntime()
+        context = RuntimeInputContext(local_input_shape=(1, 5), parallel_ranks={"cp": 1},
+                                      parallel_sizes={"cp": 2}, options={})
+        batch = {"cu_seq_lens": torch.tensor([0, 3, 7, 10]), "attention_token_count": torch.tensor([7])}
+        self.assertEqual(runtime.build_runtime_inputs(batch=batch, context=context),
+                         {"actual_seq_len": (3, 7, 10), "attention_seq_len": (3, 7)})
+        for count in (0, 3, 6, 11):
+            batch["attention_token_count"] = torch.tensor([count])
+            with self.assertRaisesRegex(ValueError, "document boundary"):
+                runtime.build_runtime_inputs(batch=batch, context=context)

@@ -133,6 +133,24 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         return output.to(values.dtype)
 
 
+def _attention_inputs_without_padding(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: Any, kwargs: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int] | None, list[int] | None]:
+    """Keep physical document boundaries separate from the FA token domain."""
+    query_lengths, key_lengths = resolve_packed_sequence_lengths(
+        kwargs, query.shape[0] * query.shape[2], key.shape[0] * key.shape[2])
+    attention_ends = kwargs.get("attention_seq_len")
+    if attention_ends is None:
+        return query, key, value, query_lengths, key_lengths
+    ends = tuple(attention_ends)
+    if (query.shape[0] != 1 or key.shape[0] != 1 or attention_mask is not None
+            or query_lengths is None or query_lengths != key_lengths or not ends or ends[0] <= 0
+            or ends not in (tuple(query_lengths), tuple(query_lengths[:-1]))):
+        raise ValueError("Attention ends must omit only the trailing padding document in a batch-one sequence")
+    length = ends[-1]
+    return query[:, :, :length], key[:, :, :length], value[:, :, :length], list(ends), list(ends)
+
+
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
                               value: torch.Tensor, attention_mask: Any, dropout: float = 0.0,
                               scaling: float | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
@@ -156,8 +174,8 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         The attention output, ``[batch, sequence, heads, v_head_dim]``, and ``None``.
     """
     batch_size, _, query_length, head_dim = query.shape
-    query_lengths, key_lengths = resolve_packed_sequence_lengths(
-        kwargs, batch_size * query_length, key.shape[0] * key.shape[2])
+    query, key, value, query_lengths, key_lengths = _attention_inputs_without_padding(
+        query, key, value, attention_mask, kwargs)
     pre_tokens, next_tokens, sparse_mode, window, causal = _attention_options(module, kwargs)
     query, key, value, layout, mask, sparse_mode = _prepare_attention_inputs(
         query, key, value, attention_mask, is_packed=query_lengths is not None,
@@ -177,7 +195,12 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
             module.max_logits_val = torch.zeros_like(maximum)
         module.max_logits_val.copy_(torch.maximum(module.max_logits_val, maximum))
     if query_lengths is not None:
-        return result[0].reshape(batch_size, query_length, *result[0].shape[1:]), None
+        output = result[0]
+        padding = batch_size * query_length - output.shape[0]
+        if padding:
+            # CP restore exchanges the original physical shape, including its tail.
+            output = F.pad(output, (0, 0, 0, 0, 0, padding))
+        return output.reshape(batch_size, query_length, *output.shape[1:]), None
     return result[0].transpose(1, 2), None
 
 
@@ -356,7 +379,8 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
             output, _ = observed_fusion_attention(self, query, key, value, attention_mask,
                                                   scaling=self.scaling, **kwargs)
         else:
-            lengths, _ = resolve_packed_sequence_lengths(kwargs, batch * sequence, batch * sequence)
+            query, key, value, lengths, _ = _attention_inputs_without_padding(
+                query, key, value, attention_mask, kwargs)
             if lengths is not None:
                 if batch != 1 or attention_mask is not None:
                     raise ValueError("JT packed attention requires batch one and no explicit mask")
@@ -371,6 +395,8 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
             else:
                 output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask,
                                                         is_causal=attention_mask is None, scale=self.scaling)
+            if output.shape[2] < sequence:
+                output = F.pad(output, (0, 0, 0, sequence - output.shape[2]))
             output = output.transpose(1, 2)
         return self.o_proj(output.reshape(batch, sequence, -1)), None
 
@@ -689,7 +715,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None, *,
                 labels: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
                 attention_mask: torch.Tensor | None = None, use_cache: bool = False,
-                actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0) -> JTDeepseekV3Output:
+                actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0,
+                attention_seq_len: tuple[int, ...] | None = None) -> JTDeepseekV3Output:
         """Compute the JT training losses of one batch.
 
         Args:
@@ -701,6 +728,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             use_cache: Must be ``False``.
             actual_seq_len: Global cumulative document ends, without a leading zero.
             sequence_start: Global offset of the local input interval.
+            attention_seq_len: Optional real document ends, excluding the padding tail from Attention only.
 
         Returns:
             Output whose ``loss`` maps ``foundation_loss/lm``, ``foundation_loss/mtp`` and
@@ -719,7 +747,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT does not support cached decoding")
         # Same rule as the shared text batch's loss mask; JT data folds its 0/1 mask into the labels.
         losses = self.compute_jt_losses(input_ids, shift_labels, shift_labels >= 0, position_ids=position_ids,
-                                        actual_seq_len=actual_seq_len, sequence_start=sequence_start)
+                                        actual_seq_len=actual_seq_len, sequence_start=sequence_start,
+                                        attention_seq_len=attention_seq_len)
         # ``<token-domain>_loss[/<name>]`` keys: every JT objective is weighted by foundation tokens.
         return JTDeepseekV3Output(loss={
             "foundation_loss/lm": losses["lm_loss"],
@@ -760,7 +789,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                           loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None,
-                          actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0
+                          actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0,
+                          attention_seq_len: tuple[int, ...] | None = None,
                           ) -> dict[str, torch.Tensor]:
         """Compute the LM, MTP and router auxiliary losses on pre-shifted labels.
 
@@ -771,6 +801,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             position_ids: Optional sequence positions for RoPE.
             actual_seq_len: Global cumulative ends of independent documents.
             sequence_start: Global offset of the local input interval.
+            attention_seq_len: Optional real document ends, excluding the padding tail from Attention only.
 
         Returns:
             ``lm_loss``, ``mtp_loss`` and ``aux_loss`` as 0-d tensors.
@@ -810,6 +841,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         hidden = self.model.embed_tokens(input_ids)
         # FP32 tables; JTDeepseekV3RotaryEmbedding rotates in FP32 and rounds to the activation dtype once.
         attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()), "actual_seq_len": ends}
+        if attention_seq_len is not None:
+            attention_kwargs["attention_seq_len"] = attention_seq_len
         auxiliary = torch.zeros((), device=hidden.device, dtype=torch.float32)
         for layer in self.model.layers:
             hidden = layer(hidden, **attention_kwargs)
