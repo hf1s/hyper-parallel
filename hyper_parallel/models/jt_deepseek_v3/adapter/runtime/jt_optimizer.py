@@ -19,12 +19,12 @@
 
 import math
 from functools import partial
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.components.optim.builders import AdamW, Muon
 from hyper_parallel.core.utils.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
@@ -121,17 +121,30 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> None:
 
 
 @torch.no_grad()
-def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
-    """Clip the QK projections and update the routing biases after an optimizer step."""
-    del optimizer, args, kwargs
-    clip_qk(model, threshold)
+def _update_router_bias(model: torch.nn.Module) -> None:
+    """Update the enabled JT router biases using the current batch counts."""
     config = model.config
-    if config.moe_router_enable_expert_bias:
+    if getattr(config, "moe_router_enable_expert_bias", False):
         for module in model.modules():
             if isinstance(module, JTDeepseekV3MoE):
                 sync_and_update_expert_bias(
                     module, lr=config.moe_router_bias_update_rate,
                     tp_group=module.sequence_partition_group, dp_group=model.expert_load_group)
+
+
+@torch.no_grad()
+def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Clip the QK projections and update the routing biases after an optimizer step."""
+    del optimizer, args, kwargs
+    clip_qk(model, threshold)
+    _update_router_bias(model)
+
+
+@torch.no_grad()
+def _after_adamw_update(model: torch.nn.Module, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Update the routing biases after an AdamW step without QK clipping."""
+    del optimizer, args, kwargs
+    _update_router_bias(model)
 
 
 def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
@@ -156,4 +169,26 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     })
     optimizer = builder.get_optimizer()
     optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
+    return builder
+
+
+def build_adamw_optimizer(*, model: torch.nn.Module, adamw_config: dict,
+                          no_decay_params: Optional[list[str]] = None) -> AdamW:
+    """Build AdamW with the JT router-bias update after the final sub-optimizer.
+
+    This entry point performs no QK clipping. Router-bias updates follow
+    ``moe_router_enable_expert_bias`` and use ``moe_router_bias_update_rate``
+    from the model configuration, as in the Muon entry point.
+
+    Args:
+        model: Model whose final FSDP parameter layouts are already prepared.
+        adamw_config: AdamW hyperparameters resolved from the training recipe.
+        no_decay_params: Optional names excluded from weight decay.
+
+    Returns:
+        The AdamW builder.
+    """
+    builder = AdamW(model=model, adamw_config=adamw_config, no_decay_params=no_decay_params)
+    optimizer = builder.get_optimizer()
+    optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_adamw_update, model))
     return builder
