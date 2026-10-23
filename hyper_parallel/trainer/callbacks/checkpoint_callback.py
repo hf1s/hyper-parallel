@@ -18,9 +18,11 @@ __all__ = ["CheckpointerCallback"]
 
 import os
 import random
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.checkpoint import build_checkpointer
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
@@ -61,6 +63,58 @@ def _unwrap_single(values: List[Any]) -> Any:
     if len(values) == 1:
         return values[0]
     return values
+
+
+def _reader_dataloader_state(parallel_context: Any, dataloader_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the DataLoader state of the TP rank that reads this rank's input.
+
+    Only TP rank zero of each CP coordinate iterates its DataLoader; the other
+    TP ranks receive its batches and never advance their own position. Every
+    rank persists the reader's state so that a layout in which those ranks read
+    input themselves resumes them at the trained position.
+    """
+    if not parallel_context.distributed_enabled or parallel_context.tp_world_size <= 1:
+        return dataloader_state
+    reader_state = [dataloader_state if parallel_context.tp_rank == 0 else None]
+    dist.broadcast_object_list(reader_state, group=parallel_context.tp_group, group_src=0)
+    return reader_state[0]
+
+
+def _sampler_position(dataloader_state: Any) -> Any:
+    """Return the batch-sampler position recorded in a DataLoader state.
+
+    Fixed batches keep it in torchdata's sampler state; dynamic batching nests
+    its source DataLoader state under ``source_dataloader``.
+    """
+    while isinstance(dataloader_state, Mapping) and "source_dataloader" in dataloader_state:
+        dataloader_state = dataloader_state["source_dataloader"]
+    if not isinstance(dataloader_state, Mapping):
+        return None
+    return dataloader_state.get("_index_sampler_state")
+
+
+def _check_reader_positions(parallel_context: Any, dataloader_state: Any) -> None:
+    """Reject a restore in which the ranks that read input resume different positions.
+
+    The batch-sampler position is global: each reading rank derives its DP slice
+    from the same position. Checkpoints saved before TP ranks persisted their
+    reader's state keep an unread position on the other TP ranks, which a
+    layout without TP would otherwise load silently.
+    """
+    if not parallel_context.distributed_enabled:
+        return
+    local_position = (_sampler_position(dataloader_state),) if parallel_context.build_on_rank() else None
+    positions: List[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(positions, local_position)
+    readers = [(rank, position[0]) for rank, position in enumerate(positions) if position is not None]
+    for rank, position in readers[1:]:
+        if position != readers[0][1]:
+            raise ValueError(
+                f"Checkpoint dataloader positions differ across input ranks: rank {readers[0][0]} "
+                f"restores {readers[0][1]}, rank {rank} restores {position}. The checkpoint was "
+                "saved before every TP rank persisted its reader's position; resume it once with "
+                "its saving layout and save again."
+            )
 
 
 class CheckpointerCallback(Callback):
@@ -194,6 +248,10 @@ class CheckpointerCallback(Callback):
         }
         return {name: value for name, value in state_dict.items() if name in trainable}
 
+    def _input_parallel_context(self) -> Any:
+        """Return which ranks read DataLoader input, when the batch reader assigns them."""
+        return getattr(getattr(self.trainer, "get_batch", None), "parallel_context", None)
+
     def _collect_extra_state(self, state: TrainerState) -> Dict[str, Any]:
         """Build the extra_state bundle (progress / scheduler / dataloader / RNG)."""
         # Prefer the iterator snapshot: with background prefetching the loader has
@@ -206,6 +264,9 @@ class CheckpointerCallback(Callback):
             self.trainer.train_dataloader, "state_dict"
         ):
             dataloader_state = self.trainer.train_dataloader.state_dict()
+        parallel_context = self._input_parallel_context()
+        if parallel_context is not None:
+            dataloader_state = _reader_dataloader_state(parallel_context, dataloader_state)
 
         schedulers = _as_list(self.trainer.lr_scheduler)
         lr_scheduler_sd = _unwrap_single([sch.state_dict() for sch in schedulers])
@@ -444,7 +505,23 @@ class CheckpointerCallback(Callback):
             for scheduler, scheduler_sd in zip(schedulers, scheduler_sds):
                 scheduler.load_state_dict(scheduler_sd)
 
-        dataloader_sd = extra.get("train_dataloader")
+        self._restore_dataloader(extra.get("train_dataloader"))
+
+        rng_state = extra.get("rng_state") or {}
+        torch_cpu_rng = rng_state.get("torch_cpu")
+        if torch_cpu_rng is not None:
+            torch.set_rng_state(torch_cpu_rng)
+        set_device_rng_state(rng_state.get("torch_device"))
+        python_rng = rng_state.get("python")
+        if python_rng is not None:
+            random.setstate(python_rng)
+
+    def _restore_dataloader(self, dataloader_sd: Any) -> None:
+        """Restore the checkpointed dataloader position unless the run opts out."""
+        trainer = self.trainer
+        parallel_context = self._input_parallel_context()
+        if parallel_context is not None and self._restore_dataloader_state:
+            _check_reader_positions(parallel_context, dataloader_sd)
         if dataloader_sd and not self._restore_dataloader_state:
             logger.info(
                 "restore_dataloader_state=False: retaining the configured "
@@ -458,15 +535,6 @@ class CheckpointerCallback(Callback):
                 "the resumed epoch replays samples from its start.",
                 type(trainer.train_dataloader).__name__,
             )
-
-        rng_state = extra.get("rng_state") or {}
-        torch_cpu_rng = rng_state.get("torch_cpu")
-        if torch_cpu_rng is not None:
-            torch.set_rng_state(torch_cpu_rng)
-        set_device_rng_state(rng_state.get("torch_device"))
-        python_rng = rng_state.get("python")
-        if python_rng is not None:
-            random.setstate(python_rng)
 
     def _set_start_position_from_state(self) -> None:
         """Derive the compatibility start position from the current state."""
