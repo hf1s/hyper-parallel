@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32RMSNorm
 
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
@@ -31,10 +32,12 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
 )
 from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
+from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.core.activation_memory import checkpoint_wrapper
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
 from hyper_parallel.models.registry import get_model_adapter
@@ -61,6 +64,91 @@ def small_config() -> JTDeepseekV3Config:
 
 class TestCompleteModel(unittest.TestCase):
     """Exercise model semantics without a builder, EP adapter or replacement pass."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fused_rms_norm_config_roundtrip(self) -> None:
+        """Feature: Model-level normalization selection.
+
+        Description: Round-trip both modes and reject invalid flag types.
+        Expectation: The default is unchanged and saved configurations retain the explicit choice.
+        """
+        config_dict = small_config().to_dict()
+        self.assertIs(config_dict.pop("use_fused_rms_norm"), False)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                config = JTDeepseekV3Config(**config_dict, use_fused_rms_norm=enabled)
+                restored = JTDeepseekV3Config.from_dict(config.to_dict())
+                self.assertIs(restored.use_fused_rms_norm, enabled)
+                self.assertEqual(restored.to_dict(), config.to_dict())
+        for invalid in (1, "false", None):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(TypeError, "must be a bool"):
+                JTDeepseekV3Config(**config_dict, use_fused_rms_norm=invalid)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fused_rms_norm_covers_model_and_loads_existing_state(self) -> None:
+        """Feature: Normalization construction and checkpoint compatibility.
+
+        Description: Select the public module at every trunk, attention and MTP normalization.
+        Expectation: All 16 locations retain their names and FP32 scale parameters; old state loads exactly.
+        """
+        config = small_config()
+        default = JTDeepseekV3ForCausalLM(config)
+        config = copy.deepcopy(config)
+        config.use_fused_rms_norm = True
+        fused = JTDeepseekV3ForCausalLM(config)
+        default_norms = {name: module for name, module in default.named_modules()
+                         if isinstance(module, DeepseekV32RMSNorm)}
+        fused_norms = {name: module for name, module in fused.named_modules() if isinstance(module, RMSNorm)}
+        self.assertEqual(len(default_norms), 16)
+        self.assertEqual(set(fused_norms), set(default_norms))
+        self.assertFalse(any(isinstance(module, DeepseekV32RMSNorm) for module in fused.modules()))
+        for name, module in fused_norms.items():
+            with self.subTest(norm=name):
+                self.assertEqual(module.weight.dtype, torch.float32)
+                self.assertTrue(torch.equal(module.weight, torch.ones_like(module.weight)))
+                self.assertEqual(module.eps, default_norms[name].variance_epsilon)
+        state = default.state_dict()
+        self.assertEqual(list(fused.state_dict()), list(state))
+        for name in default_norms:
+            state[name + ".weight"].fill_(1.25)
+        fused.load_state_dict(state, strict=True)
+        for name, value in fused.state_dict().items():
+            self.assertTrue(torch.equal(value, state[name]), name)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fused_rms_norm_survives_meta_materialization_and_mla(self) -> None:
+        """Feature: Meta construction with optional MLA replacement.
+
+        Description: Replace attention while preserving its selected norms, then materialize and initialize.
+        Expectation: Both modes preserve norm objects and parameter names; native initialization sets scales to one.
+        """
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                config = small_config()
+                config.use_fused_rms_norm = enabled
+                norm_type = RMSNorm if enabled else DeepseekV32RMSNorm
+                with torch.device("meta"):
+                    model = JTDeepseekV3ForCausalLM(config)
+                    norms = {name: module for name, module in model.named_modules() if isinstance(module, norm_type)}
+                    rules = entries_to_module_replacements(jt_test_config().plan_overrides)
+                    plan = compile_module_replacements(model, rules)
+                    apply_module_replacements(model, plan, weights_mapping=[])
+                current = dict(model.named_modules())
+                self.assertEqual(sum(isinstance(module, JTDeepseekV3MLAAttention)
+                                     for module in current.values()), 3)
+                for name, module in norms.items():
+                    self.assertIs(current[name], module, name)
+                    self.assertIs(dict(model.named_parameters())[name + ".weight"], module.weight)
+                model.to_empty(device="cpu")
+                _initialize_model_weights(model)
+                for name, module in norms.items():
+                    self.assertTrue(torch.equal(module.weight, torch.ones_like(module.weight)), name)
+                generator = torch.Generator().manual_seed(62)
+                arrays = {name: torch.randn(value.shape, generator=generator).to(value.dtype).numpy()
+                          for name, value in model.state_dict().items()}
+                _load_reference_state(model, arrays)
+                for name, value in model.state_dict().items():
+                    self.assertEqual(value.detach().numpy().tobytes(), arrays[name].tobytes(), name)
 
     def test_auxiliary_loss_pop_preserves_router_and_input_gradients(self):
         """Consuming the loss clears its owner but preserves the differentiable objective."""
