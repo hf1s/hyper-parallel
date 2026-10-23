@@ -153,6 +153,49 @@ plan_overrides:
   exact_type: true
   replace_module:
     _target_: hyper_parallel.components.modules.rms_norm.RMSNorm
+# CP requires an explicit attention wrapper at every attention boundary.
+- match: "*.self_attn"
+  when: cp
+  inner_target: self
+  region_dispatch: false
+  inner_wrapper:
+    _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
+    strategy: expanded_ulysses
+    overlap: false
+# Fused routed-expert weights are incompatible with contiguous-block TP shards.
+# Gate on sequence parallelism (TP2 in this recipe); other arms skip this entry.
+- match: model.layers.1.mlp
+  when: sequence_parallel
+  params:
+    gate.weight:
+      tp: replicate
+      cp: replicate
+    experts.gate_up_proj:
+      tp: replicate
+      cp: replicate
+    experts.down_proj:
+      tp: replicate
+      cp: replicate
+  out_src:
+    output:
+      tp: replicate
+      cp: replicate
+- match: mtp.layers.0.transformer_layer.mlp
+  when: sequence_parallel
+  params:
+    gate.weight:
+      tp: replicate
+      cp: replicate
+    experts.gate_up_proj:
+      tp: replicate
+      cp: replicate
+    experts.down_proj:
+      tp: replicate
+      cp: replicate
+  out_src:
+    output:
+      tp: replicate
+      cp: replicate
 training:
   train_iters: 2000
   lr_scheduler_iters: 1000
