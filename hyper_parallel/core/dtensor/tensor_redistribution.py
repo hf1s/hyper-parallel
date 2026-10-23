@@ -270,6 +270,8 @@ class TensorRedistribution:
     def redistribution(self, input_x, to_layout):
         """tensor redistribution"""
         x_layout = input_x.layout
+        self._check_equal_shard_sizes(x_layout, input_x.shape)
+        self._check_equal_shard_sizes(to_layout, input_x.shape)
         x = input_x
         if input_x.layout.is_partial():
             # Solve partial status first
@@ -286,12 +288,24 @@ class TensorRedistribution:
             to_layout.ragged_shard, RaggedShardInfo
         ):
             return self._redistribute_ragged(x, to_layout)
-        if from_layout.has_uneven_shard or to_layout.has_uneven_shard:
+        return self._redistribution_normal(x, to_layout)
+
+    @staticmethod
+    def _check_equal_shard_sizes(layout: Layout, global_shape: tuple[int, ...]) -> None:
+        """Reject unsupported shard geometry before any collective or cached transform."""
+        if layout.has_uneven_shard:
             # FSDP uneven shard/unshard uses its private padded collectives.
             raise NotImplementedError(
                 "DTensor redistribution does not support uneven chunk-sharded layouts."
             )
-        return self._redistribution_normal(x, to_layout)
+        for tensor_dim, size in enumerate(global_shape):
+            split_count = layout.get_dim_split_num(tensor_dim)
+            if size % split_count:
+                raise NotImplementedError(
+                    "DTensor redistribution requires equal-sized shards: "
+                    f"global shape {tuple(global_shape)}, dimension {tensor_dim} with size {size} "
+                    f"cannot be evenly split across {split_count} shards."
+                )
 
     def _redistribution_normal(self, input_x: DTensor, to_layout: Layout) -> DTensor:
         """Run the existing redistribution path for normal layouts."""
@@ -487,6 +501,8 @@ class TensorRedistribution:
         if from_layout is None or not from_layout.is_partial():
             return x
 
+        self._check_equal_shard_sizes(from_layout, input_x.shape)
+        self._check_equal_shard_sizes(to_layout, input_x.shape)
         x = x.to_local()
         if from_layout.mesh_shape != to_layout.mesh_shape:
             raise ValueError(f"For reduce partial, mesh_shape between from_layout and to_layout must be the same, "

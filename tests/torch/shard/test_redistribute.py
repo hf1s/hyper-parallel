@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+
 """test redistribute"""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
@@ -48,4 +51,24 @@ def test_redistribute_group1_gloo():
     """
     parallel_run([
         TorchCase(REDISTRIBUTE, "test_different_mesh", num_proc=2),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux", "platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_uneven_shard_reconstruction() -> None:
+    """Both ranks reject unsupported uneven layouts before entering communication."""
+    worker = str(Path(__file__).resolve().with_name(REDISTRIBUTE))
+    parallel_run([
+        TorchCase(worker, "test_uneven_shard_reconstruction_rejected", num_proc=2),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux", "platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_uneven_partial_reduction() -> None:
+    """Four ranks preserve the same rejection through the explicit partial-reduction API."""
+    worker = str(Path(__file__).resolve().with_name(REDISTRIBUTE))
+    parallel_run([
+        TorchCase(worker, "test_uneven_partial_reduction_rejected", num_proc=4),
     ])
