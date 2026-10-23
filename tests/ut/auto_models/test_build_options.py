@@ -21,10 +21,12 @@ import sys
 import unittest
 from dataclasses import fields
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 import torch
 
+from hyper_parallel.models import build_options
 from hyper_parallel.models.build_options import (
     CompileConfig,
     FSDP2Config,
@@ -40,6 +42,33 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 def _field_snapshot(cls):
     """Snapshot dataclass field names and defaults in declaration order."""
     return [(field.name, repr(field.default)) for field in fields(cls)]
+
+
+class TestDeviceDiscovery(unittest.TestCase):
+    """Device indices remain suitable for the model builders' torch.device call."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_cpu_device_has_no_index(self) -> None:
+        """CPU discovery constructs the canonical unindexed CPU device."""
+        with patch.object(build_options, "IS_CUDA_AVAILABLE", False), \
+                patch.object(build_options, "IS_NPU_AVAILABLE", False):
+            device = torch.device(build_options.get_device_type(), build_options.get_device_id())
+        self.assertEqual(device, torch.device("cpu"))
+        self.assertIsNone(device.index)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_accelerator_current_index_is_preserved(self) -> None:
+        """CUDA and NPU retain their backend's current index without touching hardware."""
+        for device_type in ("cuda", "npu"):
+            with self.subTest(device_type=device_type):
+                backend = Mock()
+                backend.current_device.return_value = 3
+                with patch.object(build_options, "get_device_type", return_value=device_type), \
+                        patch.object(build_options, "get_torch_device", return_value=backend):
+                    self.assertEqual(build_options.get_device_id(), 3)
+                backend.current_device.assert_called_once_with()
 
 
 class TestBuildOptionsFields(unittest.TestCase):
