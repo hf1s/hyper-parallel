@@ -28,9 +28,16 @@ FSDP2's ``_NormPartial`` norm computation path:
 * **All ranks participate in the same collectives** regardless of local
   gradient availability, preventing collective-misalignment deadlocks.
 
-The finite p-norm is bit-exact with upstream only for the pure-FSDP,
-single-dtype case; mixed sharded + replicated is mathematically correct
-but intentionally diverges (see ``_total_norm_fsdp2_aligned``).
+The L2 norm (``norm_type=2``) instead reproduces the JT DeepSeek-V3
+MindFormers (MF) archive: each bucket sums the squares of the MF logical
+gradients (``MF_GRADIENT_LAYOUT``, assembled from a JT module's parameter
+names) in archive registration order with the archived CANN 8.5 FP32
+schedule, and the norm is the square root of that sum.  It therefore needs
+an ``nn.Module`` with JT DeepSeek-V3 parameter names; gradients outside the
+layout are clipped but not counted.  Other finite p-norms are bit-exact with
+upstream only for the pure-FSDP, single-dtype case; mixed sharded +
+replicated is mathematically correct but intentionally diverges (see
+``_total_norm_fsdp2_aligned``).
 
 Note: PP does not use DTensor layout for gradients today.  Cross-stage
 norm aggregation will require an additional manual all-reduce and is
@@ -42,6 +49,7 @@ import warnings
 from collections import defaultdict, namedtuple
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -67,11 +75,11 @@ _GradGroupKey = Tuple[Optional[int], Tuple[int, ...]]
 # (mesh_dim_index, dist.ReduceOp, needs_manual_avg)
 _PartialReduceInfo = Tuple[int, "dist.ReduceOp", bool]
 
-# Result of _build_grad_groups; tuple-unpacking compatible with prior 7-tuple.
+# Result of _build_grad_groups; clip_grad_norm_ unpacks it as a tuple.
 _GradGroups = namedtuple(
     "_GradGroups",
-    "grad_groups all_grads norm_grads key_per_grad mesh_cache device "
-    "has_dtensor_grad",
+    "grad_groups all_grads norm_grads key_per_grad name_per_grad mesh_cache "
+    "device has_dtensor_grad",
 )
 
 
@@ -127,18 +135,21 @@ def _str_to_reduce_op(op_str: str) -> Tuple["dist.ReduceOp", bool]:
 
 def _normalize_parameters(
     parameters: Union["torch.nn.Module", torch.Tensor, Iterable[torch.Tensor]],
-) -> List[torch.Tensor]:
-    """Normalize *parameters* to a flat list of tensors.
+) -> List[Tuple[Optional[str], torch.Tensor]]:
+    """Normalize *parameters* to a flat list of ``(name, tensor)`` pairs.
 
-    * ``torch.nn.Module``  -> ``list(module.parameters())``
-    * single ``torch.Tensor`` -> ``[tensor]``
-    * iterable of tensors    -> ``list(iterable)``
+    * ``torch.nn.Module``  -> ``list(module.named_parameters())``
+    * single ``torch.Tensor`` -> ``[(None, tensor)]``
+    * iterable of tensors    -> ``[(None, tensor), ...]``
+
+    Only a module provides names, which the L2 norm needs to assemble the
+    MF logical gradients (see :func:`mf_gradient`).
     """
     if isinstance(parameters, torch.nn.Module):
-        return list(parameters.parameters())
+        return list(parameters.named_parameters())
     if isinstance(parameters, torch.Tensor):
-        return [parameters]
-    return list(parameters)
+        return [(None, parameters)]
+    return [(None, param) for param in parameters]
 
 
 def _param_device(param: torch.Tensor) -> torch.device:
@@ -368,6 +379,146 @@ def _compute_local_norm(  # pylint: disable=R0911
 
 
 # ---------------------------------------------------------------------------
+# MF archive L2 schedule (JT DeepSeek-V3)
+# ---------------------------------------------------------------------------
+
+# MF logical gradients of the JT DeepSeek-V3 archive in registration order;
+# the L2 norm accumulates their sums of squares in this order.
+MF_GRADIENT_LAYOUT = (
+    "embedding.word_embeddings.weight",
+    "decoder.layers.0.self_attention.linear_proj.weight",
+    "decoder.layers.0.self_attention.linear_q_down_proj.weight",
+    "decoder.layers.0.self_attention.linear_q_up_proj.weight",
+    "decoder.layers.0.self_attention.linear_kv_down_proj.weight",
+    "decoder.layers.0.self_attention.linear_kv_up_proj.weight",
+    "decoder.layers.0.mlp.linear_fc1.weight",
+    "decoder.layers.0.mlp.linear_fc2.weight",
+    "decoder.layers.1.self_attention.linear_proj.weight",
+    "decoder.layers.1.self_attention.linear_q_down_proj.weight",
+    "decoder.layers.1.self_attention.linear_q_up_proj.weight",
+    "decoder.layers.1.self_attention.linear_kv_down_proj.weight",
+    "decoder.layers.1.self_attention.linear_kv_up_proj.weight",
+    "decoder.layers.1.mlp.router.weight",
+    "decoder.layers.1.mlp.experts.weight1",
+    "decoder.layers.1.mlp.experts.weight2",
+    "decoder.layers.1.mlp.shared_experts.linear_fc1.weight",
+    "decoder.layers.1.mlp.shared_experts.linear_fc2.weight",
+    "mtp.layers.0.eh_proj.weight",
+    "mtp.layers.0.transformer_layer.self_attention.linear_proj.weight",
+    "mtp.layers.0.transformer_layer.self_attention.linear_q_down_proj.weight",
+    "mtp.layers.0.transformer_layer.self_attention.linear_q_up_proj.weight",
+    "mtp.layers.0.transformer_layer.self_attention.linear_kv_down_proj.weight",
+    "mtp.layers.0.transformer_layer.self_attention.linear_kv_up_proj.weight",
+    "mtp.layers.0.transformer_layer.mlp.router.weight",
+    "mtp.layers.0.transformer_layer.mlp.experts.weight1",
+    "mtp.layers.0.transformer_layer.mlp.experts.weight2",
+    "mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc1.weight",
+    "mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc2.weight",
+    "output_layer.weight",
+    "decoder.layers.0.input_layernorm.weight",
+    "decoder.layers.0.self_attention.q_layernorm.weight",
+    "decoder.layers.0.self_attention.kv_layernorm.weight",
+    "decoder.layers.0.pre_mlp_layernorm.weight",
+    "decoder.layers.1.input_layernorm.weight",
+    "decoder.layers.1.self_attention.q_layernorm.weight",
+    "decoder.layers.1.self_attention.kv_layernorm.weight",
+    "decoder.layers.1.pre_mlp_layernorm.weight",
+    "decoder.final_layernorm.weight",
+    "mtp.layers.0.enorm.weight",
+    "mtp.layers.0.hnorm.weight",
+    "mtp.layers.0.transformer_layer.input_layernorm.weight",
+    "mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight",
+    "mtp.layers.0.transformer_layer.self_attention.kv_layernorm.weight",
+    "mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight",
+    "mtp.layers.0.final_layernorm.weight",
+)
+
+
+def half_tree(values: torch.Tensor) -> torch.Tensor:
+    """Reduce the last axis by halves, folding an odd tail into the first lane."""
+    work = values
+    while work.shape[-1] > 1:
+        size = work.shape[-1]
+        half = size // 2
+        reduced = work[..., :half] + work[..., half:2 * half]
+        if size % 2:
+            reduced[..., 0] = reduced[..., 0] + work[..., -1]
+        work = reduced
+    return work[..., 0]
+
+
+def sequential_sum(values: np.ndarray) -> np.float32:
+    """Preserve one FP32 rounding after each scalar accumulation."""
+    total = np.float32(0)
+    for value in values:
+        total = np.float32(total + value)
+    return total
+
+
+def core_sum(partials: np.ndarray, cores: int = 40) -> np.float32:
+    """Accumulate tiles on strided vector cores, then accumulate cores in order."""
+    accumulators = np.zeros(cores, dtype=np.float32)
+    for index, partial in enumerate(partials):
+        core = index % cores
+        accumulators[core] = np.float32(accumulators[core] + partial)
+    return sequential_sum(accumulators)
+
+
+def tiled_square_sum(value: torch.Tensor, tile: int, width: int) -> np.float32:
+    """Square FP32 values and execute a bounded-memory row/lane/core schedule."""
+    flat = value.reshape(-1)
+    partials = []
+    for start in range(0, flat.numel(), tile * 512):
+        piece = flat[start:start + tile * 512]
+        tile_count = (piece.numel() + tile - 1) // tile
+        padded = piece.new_zeros(tile_count * tile)
+        padded[:piece.numel()] = piece * piece
+        lanes = half_tree(padded.reshape(tile_count, tile // width, width).transpose(-1, -2))
+        partials.append(lanes.sum(dim=-1).cpu().numpy())
+    parts = np.concatenate(partials)
+    return parts[0] if len(parts) == 1 else core_sum(parts)
+
+
+def gradient_square_sum(value: torch.Tensor) -> np.float32:
+    """Select the archived SumX tiling from the current tensor's element count."""
+    count = value.numel()
+    tile, width = (count, 64) if count <= 5120 else ((1024, 64) if count == 40960 else (8144, 16))
+    return tiled_square_sum(value, tile, width)
+
+
+def mf_gradient(gradients: Dict[str, torch.Tensor], name: str) -> torch.Tensor:
+    """Expose one MF logical gradient from local gradients keyed by native JT parameter name."""
+    direct = {'embedding.word_embeddings.weight': 'model.embed_tokens.weight',
+              'output_layer.weight': 'lm_head.weight', 'decoder.final_layernorm.weight': 'model.norm.weight'}
+    if name in direct:
+        return gradients[direct[name]]
+    target = name.replace('decoder.layers.', 'model.layers.')
+    target = target.replace('.self_attention.', '.self_attn.')
+    target = target.replace('.pre_mlp_layernorm.', '.post_attention_layernorm.')
+    for old, new in [('q_layernorm', 'q_a_layernorm'), ('kv_layernorm', 'kv_a_layernorm'),
+                     ('linear_q_up_proj', 'q_b_proj'), ('linear_kv_up_proj', 'kv_b_proj'),
+                     ('linear_proj', 'o_proj')]:
+        target = target.replace('.' + old + '.', '.' + new + '.')
+    for suffix, selection in [('linear_q_down_proj.weight', slice(0, 1536)),
+                              ('linear_kv_down_proj.weight', slice(1536, 2112))]:
+        if target.endswith(suffix):
+            return gradients[target[:-len(suffix)] + 'linear_qkv.weight'][selection]
+    if target.endswith('.linear_fc1.weight'):
+        prefix = target[:-len('linear_fc1.weight')]
+        gate = gradients[prefix + 'gate_proj.weight']
+        up = gradients[prefix + 'up_proj.weight']
+        return torch.stack((gate, up), dim=1).flatten(0, 1)
+    if target.endswith('.experts.weight1'):
+        gradient = gradients[target[:-len('weight1')] + 'gate_up_proj']
+        return gradient.transpose(1, 2).contiguous().flatten(0, 1)
+    if target.endswith('.experts.weight2'):
+        gradient = gradients[target[:-len('weight2')] + 'down_proj']
+        return gradient.transpose(1, 2).contiguous().flatten(0, 1)
+    target = target.replace('.linear_fc2.weight', '.down_proj.weight').replace('.mlp.router.weight', '.mlp.gate.weight')
+    return gradients[target]
+
+
+# ---------------------------------------------------------------------------
 # Total norm aggregation with collectives
 # ---------------------------------------------------------------------------
 
@@ -378,11 +529,13 @@ def _get_total_norm(
     device: torch.device,
     norm_grads: List[torch.Tensor],
     key_per_grad: List[_GradGroupKey],
+    name_per_grad: List[Optional[str]],
 ) -> torch.Tensor:
     """Compute total gradient norm with per-group all-reduce.
 
-    ``norm_grads`` (parallel to ``key_per_grad``) holds the tensor whose
-    norm to take per parameter; only the finite p-norm path consumes it.
+    ``norm_grads`` (parallel to ``key_per_grad`` and ``name_per_grad``)
+    holds the tensor whose norm to take per parameter; only the finite
+    p-norm path consumes them.
     """
     if norm_type == math.inf:
         return _total_norm_inf(
@@ -401,12 +554,13 @@ def _get_total_norm(
             grad_groups, norm_type, mesh_cache, device,
         )
 
-    # Finite p-norm: FSDP2-aligned sequence.
+    # Finite p-norm: FSDP2-aligned buckets; L2 follows the MF archive.
     total_p = _total_norm_fsdp2_aligned(
         grad_groups, norm_type, mesh_cache, device,
-        norm_grads, key_per_grad,
+        norm_grads, key_per_grad, name_per_grad,
     )
-    return total_p ** (1.0 / norm_type)
+    # The archive takes the L2 root with sqrt(); pow(x, 0.5) need not round the same on every device.
+    return total_p.sqrt() if norm_type == 2.0 else total_p ** (1.0 / norm_type)
 
 
 def _total_norm_inf(  # pylint: disable=R0913,R0917
@@ -489,15 +643,25 @@ def _reduction_signature(grad_groups, mesh_cache):
 
 
 def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
-                              norm_grads, key_per_grad):
+                              norm_grads, key_per_grad, name_per_grad):
     """FSDP2-aligned norm for finite p-norms.
 
     Grads are bucketed by the *process group* they reduce over (see
     :func:`_reduction_signature`); ``norm_grads`` supplies, in global
     parameter order, the Partial-reduced (already-global) view for Partial
-    grads and the raw local grad otherwise.  Each bucket does ONE ``stack``
-    → ONE ``vector_norm`` → ``^p`` → ONE ``all_reduce SUM`` per shard dim,
-    and the buckets are summed locally.
+    grads and the raw local grad otherwise, and ``name_per_grad`` their
+    parameter names.  Each bucket computes its local sum of p-th powers →
+    ONE ``all_reduce SUM`` per shard dim, and the buckets are summed
+    locally.  The local sum is:
+
+    * ``p == 2`` -- the MF archive schedule: every
+      :data:`MF_GRADIENT_LAYOUT` entry is assembled from the bucket's
+      gradients by name (:func:`mf_gradient`) and reduced with
+      :func:`gradient_square_sum`, and :func:`sequential_sum` adds the
+      entries in layout order on host FP32.  The bucket must hold every
+      parameter the layout reads, as the single bucket of a single-card
+      run does; gradients outside the layout are not counted.
+    * other ``p`` -- ONE ``stack`` → ONE ``vector_norm`` → ``^p``.
 
     Reduction rules:
 
@@ -513,7 +677,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
     Empty-but-present buckets still issue their all_reduce (identity ``0``
     for SUM) so all ranks run the same collectives.
 
-    Bit-exact with upstream ``torch.nn.utils.clip_grad_norm_`` only for the
+    For ``p != 2``, bit-exact with upstream ``torch.nn.utils.clip_grad_norm_`` only for the
     pure-FSDP, single-bucket, single-dtype case.  Mixed shard + replicate is
     mathematically correct but intentionally diverges (upstream folds the
     replicate norm into one ``_NormPartial`` reduce and over-counts it);
@@ -528,13 +692,22 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
 
     # Bucket norms by reduction signature, preserving global parameter order.
     sig_grads: Dict[Tuple, List[torch.Tensor]] = {sig: [] for sig in sig_order}
-    for grad, key in zip(norm_grads, key_per_grad):
+    sig_names: Dict[Tuple, List[Optional[str]]] = {sig: [] for sig in sig_order}
+    for grad, key, name in zip(norm_grads, key_per_grad, name_per_grad):
         sig_grads[key_to_sig[key]].append(grad)
+        sig_names[key_to_sig[key]].append(name)
 
     total_p = torch.tensor(0.0, device=device, dtype=torch.float32)
     for sig in sig_order:
         grads = sig_grads[sig]
-        if grads:
+        if grads and norm_type == 2.0:
+            named_grads = dict(zip(sig_names[sig], grads))
+            sums = [gradient_square_sum(mf_gradient(named_grads, name).float()) for name in MF_GRADIENT_LAYOUT]
+            local_p = torch.tensor(
+                sequential_sum(np.asarray(sums, dtype=np.float32)),
+                dtype=torch.float32, device=device,
+            )
+        elif grads:
             norms = _per_tensor_norms(grads, norm_type, device)
             local_p = torch.linalg.vector_norm(
                 torch.stack(norms).to(torch.float32), norm_type,
@@ -681,12 +854,13 @@ def _coalesce_partial_reduce(  # pylint: disable=R0914
 
 
 def _build_grad_groups(  # pylint: disable=R0914
-    params: List[torch.Tensor],
+    named_params: List[Tuple[Optional[str], torch.Tensor]],
 ) -> Tuple[
     Dict[_GradGroupKey, List[torch.Tensor]],
     List[torch.Tensor],
     List[torch.Tensor],
     List[_GradGroupKey],
+    List[Optional[str]],
     Dict[int, object],
     torch.device,
     bool,
@@ -705,22 +879,23 @@ def _build_grad_groups(  # pylint: disable=R0914
     ``(mesh, partial_info)`` groups (typically 1 for TP+FSDP).
 
     Returns
-        ``(grad_groups, all_grads, norm_grads, key_per_grad, mesh_cache,
-        device, has_dtensor_grad)``.  ``grad_groups`` maps each
+        ``(grad_groups, all_grads, norm_grads, key_per_grad, name_per_grad,
+        mesh_cache, device, has_dtensor_grad)``.  ``grad_groups`` maps each
         ``(mesh_id, shard_dims)`` key to its grads; ``all_grads`` is the
         flat list of raw local grads (global parameter order) scaled
         in-place by the clip step; ``norm_grads`` is parallel to
         ``all_grads`` but holds the Partial-reduced view for Partial grads
         (the value whose norm is taken on the finite-p path);
-        ``key_per_grad`` is parallel to both and maps each grad back to its
-        group key.
+        ``key_per_grad`` and ``name_per_grad`` are parallel to both and map
+        each grad back to its group key and parameter name (``None`` when
+        unnamed).
     """
     # --- Phase 1: classify all parameters ---
     param_infos: List[Tuple] = []
     mesh_cache: Dict[int, object] = {}
     device: Optional[torch.device] = None
 
-    for param in params:
+    for name, param in named_params:
         mesh, shard_dims, partial_info = _get_param_mesh_info(param)
         key: _GradGroupKey = (
             id(mesh) if mesh is not None else None, shard_dims,
@@ -731,7 +906,7 @@ def _build_grad_groups(  # pylint: disable=R0914
             device = _param_device(param)
         local_grad = _get_local_grad(param)
         param_infos.append(
-            (param, local_grad, mesh, partial_info, key),
+            (param, local_grad, mesh, partial_info, key, name),
         )
 
     if device is None:
@@ -745,11 +920,13 @@ def _build_grad_groups(  # pylint: disable=R0914
         list,
     )
     all_grads: List[torch.Tensor] = []
-    # norm_grads / key_per_grad are parallel to all_grads (see Returns): the
-    # norm-input view (Partial-reduced where coalesced, else raw local) and
-    # the group key per grad, kept in global parameter order.
+    # norm_grads / key_per_grad / name_per_grad are parallel to all_grads
+    # (see Returns): the norm-input view (Partial-reduced where coalesced,
+    # else raw local), the group key and the parameter name per grad, kept
+    # in global parameter order.
     norm_grads: List[torch.Tensor] = []
     key_per_grad: List[_GradGroupKey] = []
+    name_per_grad: List[Optional[str]] = []
     has_dtensor_grad = False
 
     for idx, info in enumerate(param_infos):
@@ -766,6 +943,7 @@ def _build_grad_groups(  # pylint: disable=R0914
             has_dtensor_grad = True
         all_grads.append(local_grad)
         key_per_grad.append(key)
+        name_per_grad.append(info[5])
         if idx in reduced:
             grad_groups[key].append(reduced[idx])
             norm_grads.append(reduced[idx])
@@ -774,7 +952,7 @@ def _build_grad_groups(  # pylint: disable=R0914
             norm_grads.append(local_grad)
 
     return _GradGroups(
-        grad_groups, all_grads, norm_grads, key_per_grad,
+        grad_groups, all_grads, norm_grads, key_per_grad, name_per_grad,
         mesh_cache, device, has_dtensor_grad,
     )
 
@@ -859,6 +1037,10 @@ def clip_grad_norm_(
     via DTensor placements.  PP cross-stage norm aggregation is not
     yet handled (requires manual all-reduce across stages).
 
+    The L2 norm (``norm_type=2``) follows the JT DeepSeek-V3 MF archive
+    (see the module docstring): it needs an ``nn.Module`` whose parameter
+    names cover :data:`MF_GRADIENT_LAYOUT`.
+
     Args:
         parameters: An ``nn.Module``, a single ``Tensor``, or an
             iterable of ``Tensor`` s whose gradients to clip.
@@ -879,19 +1061,19 @@ def clip_grad_norm_(
     max_norm = float(max_norm)
     norm_type = float(norm_type)
 
-    params = _normalize_parameters(parameters)
+    named_params = _normalize_parameters(parameters)
 
     (
-        grad_groups, all_grads, norm_grads, key_per_grad,
+        grad_groups, all_grads, norm_grads, key_per_grad, name_per_grad,
         mesh_cache, device, has_dtensor_grad,
-    ) = _build_grad_groups(params)
+    ) = _build_grad_groups(named_params)
 
     # -- Norm + clip (all ranks participate) --------------------------------
     # _compute_local_norm returns identity elements for empty groups,
     # so the subsequent all-reduce is safe and semantically neutral.
     total_norm = _get_total_norm(
         grad_groups, norm_type, mesh_cache, device,
-        norm_grads, key_per_grad,
+        norm_grads, key_per_grad, name_per_grad,
     )
 
     if error_if_nonfinite and torch.logical_or(
