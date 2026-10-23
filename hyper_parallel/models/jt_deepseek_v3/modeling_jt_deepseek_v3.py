@@ -73,6 +73,13 @@ class JTDeepseekV3Output(ModelOutput):
 class JTDeepseekV3Experts(DeepseekV32Experts):
     """HF packed experts with the expert-major grouped-GEMM entry of both routed paths."""
 
+    def __init__(self, config: JTDeepseekV3Config) -> None:
+        """Configure optional FP32 expert weight-gradient accumulation."""
+        super().__init__(config)
+        self.fp32_weight_gradients = getattr(config, "expert_fp32_weight_gradients", False)
+        if not isinstance(self.fp32_weight_gradients, bool):
+            raise TypeError("expert_fp32_weight_gradients must be a bool")
+
     def forward_expert_major(self, inputs: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
         """Run the SwiGLU experts on tokens grouped by local expert.
 
@@ -86,6 +93,10 @@ class JTDeepseekV3Experts(DeepseekV32Experts):
         Returns:
             Expert outputs in the order of ``inputs``.
         """
+        if self.fp32_weight_gradients:
+            return npu_grouped_swiglu(
+                inputs, self.gate_up_proj, self.down_proj, counts, fp32_weight_gradients=True,
+            )
         return npu_grouped_swiglu(inputs, self.gate_up_proj, self.down_proj, counts)
 
 
