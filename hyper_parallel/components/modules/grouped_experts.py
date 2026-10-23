@@ -463,18 +463,17 @@ class GroupedExperts(nn.Module):
             hidden_states_flat,
             top_k_index,
         )
-        flatten_probs = top_k_weights.view(-1)
-        permuted_probs = flatten_probs.index_select(0, sorted_indices)
         tokens_per_expert = torch.histc(
             top_k_index.view(-1).float(),
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
         ).long()
+        # Unpermute weights the complete expert output, including its down-projection bias.
+        # Passing scores here would also weight the activation when router_gating_in_fp32 is false.
         expert_outputs = self.forward_expert_major(
             permuted_tokens,
             tokens_per_expert,
-            permuted_probs,
         )
         output = moe_token_unpermute(  # pylint: disable=not-callable
             expert_outputs,
