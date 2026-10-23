@@ -74,8 +74,8 @@ class CheckpointerCallback(Callback):
 
     The payload is the model and optimizer state dicts plus an ``extra_state``
     bundle holding what those cannot represent: ``global_step`` / ``epoch``, the
-    LR scheduler, the dataloader position, and the CPU / device / Python RNG
-    states.
+    LR scheduler, the dataloader position, cumulative sample/token metrics, and
+    the CPU / device / Python RNG states.
 
     Saving and restoring are independent: ``save_ckpt`` gates the write path,
     ``restore_from`` the read path. Turning saving off while pointing at a
@@ -210,7 +210,7 @@ class CheckpointerCallback(Callback):
         schedulers = _as_list(self.trainer.lr_scheduler)
         lr_scheduler_sd = _unwrap_single([sch.state_dict() for sch in schedulers])
 
-        return {
+        extra_state = {
             "global_step": state.global_step,
             "epoch": state.epoch,
             "lr_scheduler": lr_scheduler_sd,
@@ -221,6 +221,10 @@ class CheckpointerCallback(Callback):
                 "python": random.getstate(),
             },
         }
+        meter = getattr(self.trainer, "environ_meter_callback", None)
+        if meter is not None:
+            extra_state["environ_meter"] = meter.state_dict()
+        return extra_state
 
     def _steps_per_epoch(self) -> int:
         """Return the optimizer steps one epoch contains.
@@ -427,6 +431,8 @@ class CheckpointerCallback(Callback):
         # checkpoint it just loaded.
         self._last_saved_step = trainer.state.global_step
 
+        self._restore_meter_state(extra.get("environ_meter"))
+
         lr_scheduler_sd = extra.get("lr_scheduler")
         schedulers = _as_list(trainer.lr_scheduler)
         if lr_scheduler_sd and schedulers:
@@ -467,6 +473,12 @@ class CheckpointerCallback(Callback):
         python_rng = rng_state.get("python")
         if python_rng is not None:
             random.setstate(python_rng)
+
+    def _restore_meter_state(self, meter_state: Optional[Dict[str, int]]) -> None:
+        """Apply persisted cumulative metrics when both the state and meter exist."""
+        meter = getattr(self.trainer, "environ_meter_callback", None)
+        if meter is not None and meter_state is not None:
+            meter.load_state_dict(meter_state)
 
     def _set_start_position_from_state(self) -> None:
         """Derive the compatibility start position from the current state."""
