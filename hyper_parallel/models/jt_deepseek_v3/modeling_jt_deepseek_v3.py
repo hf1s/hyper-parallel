@@ -55,6 +55,11 @@ class JTDeepseekV3Config(DeepseekV32Config):
     """DeepSeek-V3.2 configuration registered as the ``jt_deepseek_v3`` model type."""
 
     model_type = "jt_deepseek_v3"
+    # The MF archive recipe uses absolute RoPE positions and lets MTP shifts cross
+    # packed-document boundaries; the default JT objective resets positions and masks tails.
+    archive_absolute_positions: bool = False
+    # Optional dense-activation dtype for the FP32-stored token embedding output.
+    embedding_output_dtype: str | None = None
 
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
@@ -620,6 +625,20 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         return residual + branch
 
 
+class JTDeepseekV3Embedding(nn.Embedding):
+    """FP32-stored token embedding with an optional dense-activation output cast."""
+
+    keep_compute_in_fp32 = True
+
+    def __init__(self, *args: Any, output_dtype: torch.dtype | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.output_dtype = output_dtype
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        result = super().forward(values)
+        return result if self.output_dtype is None else result.to(self.output_dtype)
+
+
 class JTDeepseekV3Model(DeepseekV32Model):
     """DeepSeek-V3.2 base model built from JT decoder layers."""
 
@@ -631,12 +650,44 @@ class JTDeepseekV3Model(DeepseekV32Model):
         """
         DeepseekV32PreTrainedModel.__init__(self, config)
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        embedding_dtype = getattr(config, "embedding_output_dtype", None)
+        embedding_dtype = None if embedding_dtype is None else {
+            "bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32,
+        }[embedding_dtype]
+        self.embed_tokens = JTDeepseekV3Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx, output_dtype=embedding_dtype)
         self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
         self.norm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()
+
+
+def _packed_positions_and_mask(
+        config: Any, indices: torch.Tensor, ends: tuple[int, ...],
+        position_ids: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Resolve packed-document RoPE positions and the MTP document-tail mask.
+
+    The archive recipe keeps absolute positions and does not mask the MTP shift at
+    document boundaries. The default JT objective uses document-local positions and
+    masks the last token of each packed document.
+    """
+    if getattr(config, "archive_absolute_positions", False):
+        absolute = indices.unsqueeze(0)
+        if position_ids is not None and not torch.equal(position_ids, absolute):
+            raise ValueError("archive_absolute_positions requires absolute position_ids")
+        return absolute, None
+    if len(ends) <= 1:
+        if position_ids is None:
+            position_ids = indices.unsqueeze(0)
+        return position_ids, None
+    boundaries = indices.new_tensor((0, *ends))
+    documents = torch.bucketize(indices, boundaries[1:], right=True)
+    sequence_end_mask = (indices + 1 == boundaries[documents + 1]).unsqueeze(0)
+    if position_ids is None:
+        position_ids = (indices - boundaries[documents]).unsqueeze(0)
+    return position_ids, sequence_end_mask
+
 
 
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
@@ -791,20 +842,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                 or sequence_start < 0 or sequence_start + sequence_length > ends[-1]):
             raise ValueError("JT cumulative document ends must increase and cover the local token interval")
         indices = torch.arange(sequence_start, sequence_start + sequence_length, device=input_ids.device)
-        sequence_end_mask = None
-        if len(ends) > 1:
-            boundaries = indices.new_tensor((0, *ends))
-            documents = torch.bucketize(indices, boundaries[1:], right=True)
-            sequence_end_mask = (indices + 1 == boundaries[documents + 1]).unsqueeze(0)
-            default_positions = indices - boundaries[documents]
-        else:
-            default_positions = indices
+        position_ids, sequence_end_mask = _packed_positions_and_mask(cfg, indices, ends, position_ids)
         # NumPy FP32 inverse frequencies match MindFormers bitwise; torch.pow rounds some entries differently.
         dim = cfg.qk_rope_head_dim
         inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         inverse = torch.from_numpy(inverse.astype(np.float32)).to(input_ids.device)
-        if position_ids is None:
-            position_ids = default_positions.unsqueeze(0)
         if position_ids.shape != input_ids.shape:
             raise ValueError("JT position_ids must match input_ids")
         frequency = position_ids.to(device=input_ids.device, dtype=torch.float32).unsqueeze(-1) * inverse
