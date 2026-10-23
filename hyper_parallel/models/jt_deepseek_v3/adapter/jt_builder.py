@@ -37,8 +37,10 @@ from hyper_parallel.models._transformers.model_builder import (
     instantiate_infrastructure,
 )
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
+    JTDeepseekV3Attention,
     JTDeepseekV3Config,
     JTDeepseekV3ForCausalLM,
+    JTDeepseekV3MLAAttention,
     JTDeepseekV3MoE,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
@@ -128,6 +130,8 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | No
     torch.use_deterministic_algorithms(True)
     config = JTDeepseekV3Config(**config)
     mesh = distributed_setup.mesh_context
+    if getattr(config, "attention_head_chunk_size", 0) and (mesh.tp_size != 1 or mesh.cp_size != 1):
+        raise ValueError("Head-chunked JT MLA requires tp_size=cp_size=1")
     # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
     framework_setup = replace(
         distributed_setup, module_replacements=(),
@@ -136,12 +140,22 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | No
     planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
     with torch.device("meta"):
         model = JTDeepseekV3ForCausalLM(config)
+        chunk_attention_names = []
+        if getattr(config, "attention_head_chunk_size", 0):
+            chunk_attention_names = [name for name, module in model.named_modules()
+                                     if isinstance(module, JTDeepseekV3Attention)]
         model, _ = _apply_module_replacement_actions(
             model,
             getattr(distributed_setup, "module_replacements", None),
             weights_mapping=get_model_conversion_mapping(model),
             context=_build_replacement_context(distributed_setup, None),
         )
+        missing = [name for name in chunk_attention_names
+                   if not isinstance(model.get_submodule(name), JTDeepseekV3MLAAttention)]
+        if missing:
+            raise ValueError(
+                "attention_head_chunk_size requires a JTDeepseekV3MLAAttention replacement for: " + ", ".join(missing)
+            )
     model.to_empty(device="cpu")
     if reference_weights is None:
         _initialize_model_weights(model)

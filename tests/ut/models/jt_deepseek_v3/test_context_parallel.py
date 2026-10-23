@@ -100,6 +100,13 @@ class TestJTContextParallel(unittest.TestCase):
                                           actual_seq_len=(3,) if packed else None)
             self.assertEqual(kernel.call_args.kwargs["softmax_layout"], "TND" if packed else "")
             torch.testing.assert_close(observer.max_logits_val, maxima)
+            observer = SimpleNamespace(max_logits_val=None, is_causal=True, num_heads=4)
+            with patch("torch_npu.npu_fusion_attention", return_value=(output, stats)):
+                observed_fusion_attention(observer, query, query, query, None, head_range=(1, 3),
+                                          actual_seq_len=(3,) if packed else None)
+                observed_fusion_attention(observer, query, query, query, None, head_range=(0, 2),
+                                          actual_seq_len=(3,) if packed else None)
+            torch.testing.assert_close(observer.max_logits_val, torch.tensor([2.0, 7.0, 7.0, 0.0]))
 
     def test_mtp_loss_uses_global_target_denominator(self):
         """Local MTP sums use global target counts before the model-level CP sum."""

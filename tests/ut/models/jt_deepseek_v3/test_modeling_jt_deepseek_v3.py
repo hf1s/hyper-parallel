@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
@@ -31,7 +32,10 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
 )
 from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
-from hyper_parallel.core.activation_memory import checkpoint_wrapper
+from hyper_parallel.core.activation_memory import CheckpointWrapper, checkpoint_wrapper, is_recomputing
+from hyper_parallel.distributed.activation_checkpoint import (
+    _apply_activation_checkpointing, make_selective_checkpoint_context_fn,
+)
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
@@ -190,6 +194,124 @@ class TestCompleteModel(unittest.TestCase):
                         self.assertIsNotNone(replayed.grad)
                         torch.testing.assert_close(replayed.grad, original.grad, rtol=1e-5, atol=1e-7)
                 self.assertGreater(candidate.model.embed_tokens.weight.grad.abs().sum().item(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_mla_head_chunk_options_fail_early(self):
+        """Feature: Head-chunk configuration contract.
+
+        Description: Supply invalid block sizes and a nonzero dropout probability.
+        Expectation: Reject unsupported settings when constructing the replacement.
+        """
+        config = small_config()
+        for value in (True, -1, 1.5, config.num_attention_heads + 1):
+            with self.subTest(chunk_size=value):
+                config.attention_head_chunk_size = value
+                with self.assertRaisesRegex(ValueError, "attention_head_chunk_size"):
+                    JTDeepseekV3ForCausalLM(config)
+                with self.assertRaisesRegex(ValueError, "attention_head_chunk_size"):
+                    JTDeepseekV3MLAAttention(module=JTDeepseekV3Attention(config, 0))
+        config.attention_head_chunk_size, config.attention_dropout = 1, 0.1
+        with self.assertRaisesRegex(ValueError, "attention_dropout=0"):
+            JTDeepseekV3ForCausalLM(config)
+        with self.assertRaisesRegex(ValueError, "attention_dropout=0"):
+            JTDeepseekV3MLAAttention(module=JTDeepseekV3Attention(config, 0))
+        config.attention_dropout = 0.0
+        with self.assertRaisesRegex(ValueError, "requires.*JTDeepseekV3MLAAttention"):
+            JTDeepseekV3Attention(config, 0)(torch.zeros(1, 7, config.hidden_size))
+        module = JTDeepseekV3MLAAttention(module=JTDeepseekV3Attention(config, 0))
+        with patch(f"{module.__module__}.is_compiling", return_value=True):
+            with self.assertRaisesRegex(ValueError, "requires eager execution"):
+                module(torch.zeros(1, 7, config.hidden_size))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_mla_head_chunks_use_trainer_hyper_checkpoint_wrappers(self):
+        """Feature: Existing Trainer checkpoint selection.
+
+        Description: Enable head chunks with or without MTP and apply full/selective checkpointing.
+        Expectation: Trainer uses Hyper wrappers, including the trunk-only HF-native candidate.
+        """
+        for depth in (0, 1):
+            for mode in ("full", "selective"):
+                with self.subTest(depth=depth, mode=mode):
+                    config = small_config()
+                    config.num_nextn_predict_layers = depth
+                    config.attention_head_chunk_size = 1
+                    model = JTDeepseekV3ForCausalLM(config)
+                    _apply_activation_checkpointing(model, mode)
+                    self.assertIsInstance(model.model.layers[0], CheckpointWrapper)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_mla_head_chunks_preserve_outputs_and_gradients(self):
+        """Feature: Optional head-chunked MLA.
+
+        Description: Compare uneven head chunks under off/full/selective checkpointing to ordinary attention.
+        Expectation: Outputs and gradients agree; off never replays and outer SAC does not cache chunk projections.
+        """
+        config = small_config()
+        config.num_attention_heads = config.num_key_value_heads = 3
+        torch.manual_seed(9)
+        reference = JTDeepseekV3MLAAttention(module=JTDeepseekV3Attention(config, 0))
+        hidden = torch.randn(1, 7, config.hidden_size)
+        angles = torch.randn(1, 7, config.qk_rope_head_dim)
+        captures = []
+        previous_device = DefaultDeviceType.get_device_type()
+        DefaultDeviceType.set_device_type("cpu")
+        try:
+            for chunk_size, mode in ((0, "off"), (0, "full"), (0, "selective"),
+                                     (2, "off"), (2, "full"), (2, "selective")):
+                config.attention_head_chunk_size = chunk_size
+                module = JTDeepseekV3MLAAttention(module=JTDeepseekV3Attention(config, 0))
+                module.load_state_dict(reference.state_dict(), strict=True)
+                inputs = hidden.clone().requires_grad_()
+                positions = (angles.cos().requires_grad_(), angles.sin().requires_grad_())
+                heads_seen = []
+                replay_seen = []
+                contexts = []
+
+                def attention(_module: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                              _mask: Any, **_kwargs: Any) -> tuple[torch.Tensor, None]:
+                    """Use independent CPU attention and record the actual head block widths."""
+                    heads_seen.append(query.shape[1])
+                    replay_seen.append(is_recomputing())
+                    output = F.scaled_dot_product_attention(query, key, value, is_causal=True, scale=module.scaling)
+                    return output.transpose(1, 2), None
+
+                module.attention_interface = attention
+
+                def context_fn() -> tuple:
+                    """Observe the same selective cache policy used by the Trainer."""
+                    pair = make_selective_checkpoint_context_fn()()
+                    contexts.append(pair)
+                    return pair
+
+                wrapped = module if mode == "off" else checkpoint_wrapper(
+                    module, **({"context_fn": context_fn} if mode == "selective" else {}))
+                output = wrapped(inputs, positions)[0]
+                forward_calls = len(heads_seen)
+                if chunk_size and contexts:
+                    saved_mm = contexts[0][0].storage[torch.ops.aten.mm.default]
+                    # Only the fused latent and full output projections belong to
+                    # this region. Expanded per-block Q/KV must stay in the inner one.
+                    self.assertTrue(saved_mm)
+                    self.assertTrue(all(entry.val.shape[-1] not in (8, 16) for entry in saved_mm))
+                output.square().sum().backward()
+                if mode == "off":
+                    self.assertEqual(len(heads_seen), forward_calls)
+                else:
+                    self.assertGreater(len(heads_seen), forward_calls)
+                    self.assertTrue(any(replay_seen))
+                if chunk_size:
+                    self.assertEqual(heads_seen[:2], [2, 1])
+                    self.assertLessEqual(max(heads_seen), chunk_size)
+                captures.append({"output": output.detach(), "input": inputs.grad,
+                                 "cos": positions[0].grad, "sin": positions[1].grad,
+                                 **{name: value.grad.clone() for name, value in module.named_parameters()}})
+        finally:
+            DefaultDeviceType.set_device_type(previous_device)
+        for actual in captures[1:]:
+            for name, expected in captures[0].items():
+                with self.subTest(tensor=name):
+                    torch.testing.assert_close(actual[name], expected, rtol=1e-5, atol=1e-6)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_standalone_forward_backward(self):

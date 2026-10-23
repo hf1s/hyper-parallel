@@ -14,6 +14,7 @@
 # ============================================================================
 """JT entry-point initialization and strict reference-loading contracts."""
 
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -108,6 +109,28 @@ class TestJTBuilder(unittest.TestCase):
                 self.assertEqual(isinstance(shared, SwiGLUMLP), filename == "hp_4k_1_card.yaml")
                 for name in document["fsdp_config"]["mix_precision"].get("custom_params", {}):
                     self.assertIn(name, dict(model.named_parameters()))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_head_chunks_require_complete_mla_replacement(self) -> None:
+        """Reject unsupported topology or missing trunk/MTP replacements before materializing weights."""
+        self.config["attention_head_chunk_size"] = 8
+        rules = entries_to_module_replacements(jt_test_config().plan_overrides)
+        for replacements, missing in (
+                ((), "model.layers.0.self_attn"),
+                ((replace(rules[0], match=("model.layers.*.self_attn",)),),
+                 "mtp.layers.0.transformer_layer.self_attn")):
+            with self.subTest(missing=missing):
+                self.setup.module_replacements = replacements
+                with self.assertRaisesRegex(ValueError, missing):
+                    self.build()
+        self.setup.module_replacements = rules
+        model = self.build()
+        attentions = [module for module in model.modules() if isinstance(module, JTDeepseekV3MLAAttention)]
+        self.assertEqual([module.head_chunk_size for module in attentions], [8, 8, 8])
+        for axis in ("tp_size", "cp_size"):
+            with self.subTest(axis=axis), patch.object(self.setup.mesh_context, axis, 2):
+                with self.assertRaisesRegex(ValueError, "tp_size=cp_size=1"):
+                    self.build()
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_optional_reference_uses_native_initialization(self) -> None:
