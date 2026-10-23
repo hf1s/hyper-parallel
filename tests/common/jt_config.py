@@ -14,6 +14,12 @@
 # ============================================================================
 """JT model and sharding fixtures shared by UT and CP workers."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from unittest.mock import patch
+
+import torch
+
 from hyper_parallel.trainer.config.resolver import resolve_config
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
@@ -81,3 +87,33 @@ def jt_test_config() -> TrainerConfig:
             "qk_clip_threshold": 100.0,
         },
     })
+
+
+def cpu_rms_norm(values: torch.Tensor, weight: torch.Tensor, *, epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """CPU stand-in for ``torch_npu.npu_rms_norm``: normalized and scaled values, and the reciprocal RMS."""
+    rstd = torch.rsqrt(values.square().mean(-1, keepdim=True) + epsilon)
+    return values * rstd * weight, rstd
+
+
+def cpu_rms_norm_backward(gradient: torch.Tensor, values: torch.Tensor, weight: torch.Tensor,
+                          rstd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """CPU stand-in for ``npu_rms_norm_backward``: the exact RMSNorm input and weight derivatives."""
+    normalized = values * rstd
+    scaled = gradient * weight
+    input_gradient = rstd * (scaled - normalized * (scaled * normalized).mean(-1, keepdim=True))
+    return input_gradient, (gradient * normalized).reshape(-1, values.shape[-1]).sum(0)
+
+
+def cpu_head_weight_gradient(gradient: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+    """CPU stand-in for the NPU output-head weight-gradient GEMM ``gradient.T @ inputs``."""
+    return gradient.T @ inputs
+
+
+@contextmanager
+def cpu_npu_kernels() -> Iterator[None]:
+    """Run the JT RMSNorm and output-head weight-gradient NPU kernels as their CPU stand-ins."""
+    with patch("torch_npu.npu_rms_norm", cpu_rms_norm), \
+            patch.object(torch.ops.npu, "npu_rms_norm_backward", cpu_rms_norm_backward, create=True), \
+            patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.head_weight_gradient",
+                  cpu_head_weight_gradient):
+        yield

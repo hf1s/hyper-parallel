@@ -19,8 +19,9 @@
 from __future__ import annotations
 
 import copy
+import ctypes as ct
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any
 
 import numpy as np
@@ -133,6 +134,63 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         return output.to(values.dtype)
 
 
+class NormResidual(torch.autograd.Function):
+    """Round once after joining residual and RMSNorm input gradients."""
+
+    @staticmethod
+    def forward(ctx: Any, values: torch.Tensor, weight: torch.Tensor,
+                epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return normalized activations and the residual identity."""
+        inputs = values.float()
+        normalized, rstd = torch_npu.npu_rms_norm(inputs, weight.float(), epsilon=epsilon)
+        ctx.save_for_backward(inputs, weight, rstd)
+        ctx.input_dtype = values.dtype
+        return normalized.to(values.dtype), values
+
+    @staticmethod
+    def backward(ctx: Any, norm_gradient: torch.Tensor,
+                 residual_gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Join both input derivatives before rounding to the activation dtype."""
+        inputs, weight, rstd = ctx.saved_tensors
+        dx, dw = torch.ops.npu.npu_rms_norm_backward(
+            norm_gradient.float(), inputs, weight.float(), rstd)
+        return (dx + residual_gradient.float()).to(ctx.input_dtype), dw, None
+
+
+class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
+    """RMSNorm with FP32 weight and arithmetic, rounded once at an explicit output boundary.
+
+    The HF norm rounds the normalized values to the input dtype before applying the weight;
+    ``npu_rms_norm`` normalizes and applies the weight in FP32. ``keep_compute_in_fp32``
+    gives the module its own FP32 FSDP compute unit.
+    """
+
+    keep_compute_in_fp32 = True
+
+    def __init__(self, hidden_size: int, eps: float, *, residual: bool = False,
+                 output_dtype: torch.dtype | None = None) -> None:
+        """Choose the residual gradient join and output cast boundary.
+
+        Args:
+            hidden_size: Size of the normalized last axis.
+            eps: Epsilon added to the mean square.
+            residual: Return ``(normalized, residual)``, the residual being the input; the norm and
+                residual input gradients are summed in FP32 and rounded to the input dtype once.
+            output_dtype: Dtype of the normalized output without ``residual``; the input dtype if ``None``.
+        """
+        super().__init__(hidden_size, eps)
+        self.residual = residual
+        self.output_dtype = output_dtype
+
+    def forward(self, hidden_states: torch.Tensor) -> Any:
+        """Return the normalized tensor, or the normalization/residual pair."""
+        if self.residual:
+            return NormResidual.apply(hidden_states, self.weight, self.variance_epsilon)
+        value = torch_npu.npu_rms_norm(
+            hidden_states.float(), self.weight.float(), epsilon=self.variance_epsilon)[0]
+        return value.to(self.output_dtype or hidden_states.dtype)
+
+
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
                               value: torch.Tensor, attention_mask: Any, dropout: float = 0.0,
                               scaling: float | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
@@ -181,12 +239,33 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
     return result[0].transpose(1, 2), None
 
 
+class SharedKeyHalfTree(torch.autograd.Function):
+    """Expand a singleton token-major key and sum head gradients in FP32."""
+
+    @staticmethod
+    def forward(ctx: Any, value: torch.Tensor, heads: int) -> torch.Tensor:
+        """Broadcast a singleton head while keeping sequence-major storage."""
+        del ctx
+        return value.expand(-1, -1, heads, -1)
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Sum head contributions by a balanced FP32 tree, then round once to the key dtype."""
+        del ctx
+        reduced = gradient.float()
+        while reduced.shape[2] > 1:
+            half = reduced.shape[2] // 2
+            reduced = reduced[:, :, :half] + reduced[:, :, half:]
+        return reduced.to(gradient.dtype), None
+
+
 @module_replacement
 class JTDeepseekV3MLAAttention(MLAAttention):
     """MLA attention on the framework module with JT's rotary embedding and QK-clip statistics.
 
     Replaces :class:`JTDeepseekV3Attention`; ``q_a_proj`` and ``kv_a_proj_with_mqa``
-    are fused into ``linear_qkv``.
+    are fused into ``linear_qkv`` but still run as two GEMMs. The latent norms compute
+    in FP32 and the shared rotary key sums its head gradients by an FP32 half tree.
     """
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "", context: Any = None) -> None:
@@ -201,6 +280,11 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         if not self.linear_qkv.weight.is_meta:
             with torch.no_grad():
                 self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
+        # FP32 latent norms over the source norm parameters.
+        self.q_a_layernorm = JTDeepseekV3RMSNorm(self.q_lora_rank, module.config.rms_norm_eps)
+        self.kv_a_layernorm = JTDeepseekV3RMSNorm(self.kv_lora_rank, module.config.rms_norm_eps)
+        self.q_a_layernorm.weight = module.q_a_layernorm.weight
+        self.kv_a_layernorm.weight = module.kv_a_layernorm.weight
         self.explicit_rotary = JTDeepseekV3RotaryEmbedding(
             use_fused_rope=getattr(module.config, "use_fused_rope", False))
         self.key_rope_gather = nn.Identity()
@@ -213,7 +297,11 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         Args:
             hidden_states: Input activations in the layout selected by the model recipe.
         """
-        latent_states = self.linear_qkv(hidden_states)
+        # The source Q and KV-latent projections stay two GEMMs over the rows of the fused weight.
+        weight = self.linear_qkv.weight
+        latent_states = torch.cat((
+            F.linear(hidden_states, weight[:self.q_lora_rank]),  # pylint: disable=not-callable
+            F.linear(hidden_states, weight[self.q_lora_rank:])), dim=-1)  # pylint: disable=not-callable
         query_local, kv_local = latent_states.split(
             (self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim), dim=-1
         )
@@ -228,8 +316,9 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         """Project hidden states to queries, keys and values.
 
         Unlike the parent, the rotary key passes through ``key_rope_gather``, where
-        the recipe gathers the sequence-parallel shards, and both rotary parts use
-        :class:`JTDeepseekV3RotaryEmbedding`.
+        the recipe gathers the sequence-parallel shards, both rotary parts use
+        :class:`JTDeepseekV3RotaryEmbedding`, and :class:`SharedKeyHalfTree` expands
+        the rotated shared key over the heads.
 
         Args:
             hidden_states: Input hidden states, ``[batch, sequence, hidden]``.
@@ -257,7 +346,7 @@ class JTDeepseekV3MLAAttention(MLAAttention):
             batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
         key_rope = self.explicit_rotary(key_rope.unsqueeze(2), cos, sin, unsqueeze_dim=2)
-        key = torch.cat((key_pass, key_rope.expand(-1, -1, self.num_heads, -1)), dim=-1)
+        key = torch.cat((key_pass, SharedKeyHalfTree.apply(key_rope, self.num_heads)), dim=-1)
         # Preserve the BNSD interface with token-major storage for packed attention.
         return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
 
@@ -569,25 +658,32 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
 class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
     """Pre-norm decoder layer with MLA attention and a dense or MoE MLP."""
 
-    def __init__(self, config: Any, layer_idx: int) -> None:
+    def __init__(self, config: Any, layer_idx: int, *, shared_output: bool = False) -> None:
         """Build the attention, MLP and norms of one layer.
 
         Args:
             config: JT model configuration.
             layer_idx: Layer index; ``config.mlp_layer_types[layer_idx]`` selects the MLP.
+            shared_output: Return the output in FP32; set on the last trunk layer, whose output
+                feeds both the final norm and the MTP hidden norm.
         """
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.self_attn = JTDeepseekV3Attention(config, layer_idx)
         self.mlp = (JTDeepseekV3MoE(config)
                     if config.mlp_layer_types[layer_idx] == "sparse" else DeepseekV32MLP(config))
-        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps, residual=True)
+        self.post_attention_layernorm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps, residual=True)
+        self.shared_output = shared_output
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: Any = None,
                 position_ids: Any = None, past_key_values: Any = None, use_cache: bool = False,
                 position_embeddings: Any = None, **kwargs: Any) -> torch.Tensor:
         """Apply the attention and MLP sublayers, each with a residual connection.
+
+        Each norm also returns its input as the residual, so the residual and norm input
+        gradients are summed in FP32 and rounded once. The MLP branch is added to the
+        residual before a single cast to the activation dtype.
 
         Args:
             hidden_states: Input hidden states, ``[batch, sequence, hidden]``.
@@ -599,25 +695,25 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
             **kwargs: Attention kernel options.
 
         Returns:
-            The layer output, shaped like ``hidden_states``.
+            The layer output, shaped like ``hidden_states``; FP32 if ``shared_output``.
 
         Raises:
             ValueError: If cached decoding is requested.
         """
         if past_key_values is not None or use_cache:
             raise ValueError("JT does not support cached decoding")
-        residual = hidden_states
+        normalized, residual = self.input_layernorm(hidden_states)
         branch, _ = self.self_attn(
-            self.input_layernorm(residual),
+            normalized,
             attention_mask=attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + branch
-        residual = hidden_states
-        branch = self.mlp(self.post_attention_layernorm(residual))
-        return residual + branch
+        normalized, residual = self.post_attention_layernorm(hidden_states)
+        result = (residual + self.mlp(normalized)).to(hidden_states.dtype)
+        return result.float() if self.shared_output else result
 
 
 class JTDeepseekV3Model(DeepseekV32Model):
@@ -632,11 +728,150 @@ class JTDeepseekV3Model(DeepseekV32Model):
         DeepseekV32PreTrainedModel.__init__(self, config)
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
-        self.norm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Shared by the trunk and MTP; its own FP32 FSDP unit keeps the parameter and gradient in FP32
+        # and rounds the output to the activation dtype.
+        self.embed_tokens.keep_compute_in_fp32 = True
+        self.layers = nn.ModuleList([
+            JTDeepseekV3Decoder(config, index, shared_output=index == config.num_hidden_layers - 1)
+            for index in range(config.num_hidden_layers)])
+        self.norm = JTDeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps, output_dtype=torch.bfloat16)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()
+
+
+@lru_cache(maxsize=1)
+def _acl_api() -> dict:
+    """Load and type the ACL operator-compiler entry points lazily."""
+    library = ct.CDLL("libacl_op_compiler.so")
+    pointer = ct.c_void_p
+    pointers = ct.POINTER(pointer)
+    signatures = {
+        "create_desc": ("aclCreateTensorDesc", [ct.c_int, ct.c_int, ct.POINTER(ct.c_int64), ct.c_int], pointer),
+        "destroy_desc": ("aclDestroyTensorDesc", [pointer], None),
+        "create_buffer": ("aclCreateDataBuffer", [pointer, ct.c_size_t], pointer),
+        "destroy_buffer": ("aclDestroyDataBuffer", [pointer], ct.c_int32),
+        "create_attr": ("aclopCreateAttr", [], pointer),
+        "destroy_attr": ("aclopDestroyAttr", [pointer], None),
+        "set_bool": ("aclopSetAttrBool", [pointer, ct.c_char_p, ct.c_uint8], ct.c_int32),
+        "set_storage_shape": ("aclSetTensorStorageShape", [pointer, ct.c_int, ct.POINTER(ct.c_int64)], ct.c_int32),
+        "set_storage_format": ("aclSetTensorStorageFormat", [pointer, ct.c_int], ct.c_int32),
+        "execute": ("aclopCompileAndExecuteV2", [ct.c_char_p, ct.c_int, pointers, pointers, ct.c_int,
+                                                pointers, pointers, pointer, ct.c_int, ct.c_int,
+                                                ct.c_char_p, pointer], ct.c_int32),
+    }
+    result = {"library": library}
+    for key, (name, arguments, return_type) in signatures.items():
+        function = getattr(library, name)
+        function.argtypes, function.restype = arguments, return_type
+        result[key] = function
+    return result
+
+
+def _check_acl(status: int, operation: str) -> None:
+    if status:
+        raise RuntimeError(f"{operation}: CANN status {status}")
+
+
+def _nz_matmul(gradient: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+    """Compute BF16 ``gradient.T @ inputs`` with the MatMulV2 operator on NZ-format operands."""
+    api = _acl_api()
+    pointer = ct.c_void_p
+    left, right = [torch_npu.npu_format_cast(value, 29) for value in (gradient, inputs)]
+    output = torch_npu.empty_with_format((gradient.shape[1], inputs.shape[1]),
+                                         dtype=torch.bfloat16, device=inputs.device, acl_format=29)
+    descriptors, buffers = [], []
+    attribute = api["create_attr"]()
+    if not attribute:
+        raise RuntimeError("aclopCreateAttr returned null")
+    try:
+        for value in (left, right, output):
+            shape = list(value.shape)
+            storage = [shape[1] // 16, shape[0] // 16, 16, 16]
+            descriptor = api["create_desc"](27, 2, (ct.c_int64 * 2)(*shape), 2)
+            if not descriptor:
+                raise RuntimeError("aclCreateTensorDesc returned null")
+            descriptors.append(descriptor)
+            _check_acl(api["set_storage_shape"](descriptor, 4, (ct.c_int64 * 4)(*storage)), "aclSetTensorStorageShape")
+            _check_acl(api["set_storage_format"](descriptor, 29), "aclSetTensorStorageFormat")
+            buffer = api["create_buffer"](value.data_ptr(), value.untyped_storage().nbytes())
+            if not buffer:
+                raise RuntimeError("aclCreateDataBuffer returned null")
+            buffers.append(buffer)
+        _check_acl(api["set_bool"](attribute, b"transpose_x1", 1), "transpose_x1")
+        _check_acl(api["set_bool"](attribute, b"transpose_x2", 0), "transpose_x2")
+        torch.npu.synchronize()
+        _check_acl(api["execute"](b"MatMulV2", 2, (pointer * 2)(*descriptors[:2]), (pointer * 2)(*buffers[:2]),
+                                  1, (pointer * 1)(descriptors[2]), (pointer * 1)(buffers[2]), attribute,
+                                  0, 0, None, torch.npu.current_stream().npu_stream), "MatMulV2/NZ")
+        torch.npu.synchronize()
+        result = torch_npu.npu_format_cast(output, 2)
+        torch.npu.synchronize()
+        return result
+    finally:
+        for buffer in buffers:
+            _check_acl(api["destroy_buffer"](buffer), "aclDestroyDataBuffer")
+        for descriptor in descriptors:
+            api["destroy_desc"](descriptor)
+        api["destroy_attr"](attribute)
+
+
+def head_weight_gradient(gradient: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+    """Compute ``gradient.T @ inputs`` with the archived head GEMM under scoped compiler state.
+
+    The MatMulV2 NZ route reproduces the archived head's GEMM accumulation. It switches on JIT
+    compilation and internal formats only for the call and restores the caller's settings even
+    if the kernel fails. These options are process-global runtime state, so another Python thread
+    must not change them concurrently; the trainer is single-threaded.
+    """
+    was_eager = torch_npu.npu.is_jit_compile_false()
+    # TorchNPU 2.12 exposes a setter-only config attribute. Read its backing
+    # option so this scoped operation restores the caller's actual setting.
+    internal_option = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")  # pylint: disable=protected-access
+    internal_format = internal_option == b"enable"
+    with torch.npu.device(inputs.device):
+        try:
+            torch_npu.npu.set_compile_mode(jit_compile=True)
+            torch.npu.config.allow_internal_format = True
+            return _nz_matmul(gradient, inputs)
+        finally:
+            torch_npu.npu.set_compile_mode(jit_compile=not was_eager)
+            torch.npu.config.allow_internal_format = internal_format
+
+
+class _HeadGradient(torch.autograd.Function):
+    """Linear projection whose weight derivative uses ``head_weight_gradient``."""
+
+    @staticmethod
+    def forward(ctx: Any, values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Project with the ordinary linear forward operation."""
+        ctx.save_for_backward(values, weight)
+        return F.linear(values, weight)  # pylint: disable=not-callable
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use the archived NZ GEMM only for the weight derivative."""
+        values, weight = ctx.saved_tensors
+        dy = gradient.reshape(-1, gradient.shape[-1])
+        inputs = values.reshape(-1, values.shape[-1])
+        dx = torch.mm(dy, weight).reshape_as(values) if ctx.needs_input_grad[0] else None
+        dw = head_weight_gradient(dy.contiguous(), inputs.contiguous()) if ctx.needs_input_grad[1] else None
+        return dx, dw
+
+
+class JTDeepseekV3LMHead(nn.Linear):
+    """Output head shared by the trunk and MTP, with the archived weight-gradient GEMM.
+
+    Each use casts the FP32 weight to its input dtype separately, so the per-use weight
+    derivatives are summed in the FP32 parameter gradient. ``keep_compute_in_fp32`` gives
+    the module its own FP32 FSDP compute unit.
+    """
+
+    keep_compute_in_fp32 = True
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        """Project ``values`` with the weight cast to their dtype."""
+        return _HeadGradient.apply(values, self.weight.to(values.dtype))
 
 
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
@@ -663,16 +898,19 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT rotary computation currently requires rope_type='default'")
         self.model = JTDeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = JTDeepseekV3LMHead(config.hidden_size, config.vocab_size, bias=False)
         mtp_config = copy.deepcopy(config)
         depth = config.num_nextn_predict_layers
         mtp_config.mlp_layer_types = ["sparse"] * depth
         self.mtp = DeepseekV3MTP(
             hidden_size=config.hidden_size, num_layers=depth,
             decoder_factory=lambda index: JTDeepseekV3Decoder(mtp_config, index),
-            norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
-            output_norm_factory=lambda size: DeepseekV32RMSNorm(size, eps=config.rms_norm_eps),
+            norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
+            output_norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
         )
+        for layer in self.mtp.layers:
+            # Only the first depth reads the FP32 trunk output; each depth rounds its normalized state to BF16.
+            layer.hnorm.output_dtype = torch.bfloat16
         self.loss_tp_mesh = None
         self.loss_sequence_parallel_size = 1
         self.enable_chunk_loss = getattr(config, "enable_chunk_loss", False)
