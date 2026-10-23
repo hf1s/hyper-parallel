@@ -46,6 +46,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_single
+from hyper_parallel.core.activation_memory import checkpoint_exclude_wrapper
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
@@ -55,6 +56,64 @@ class JTDeepseekV3Config(DeepseekV32Config):
     """DeepSeek-V3.2 configuration registered as the ``jt_deepseek_v3`` model type."""
 
     model_type = "jt_deepseek_v3"
+
+    def __init__(self, *, preserve_fa: bool = False, preserve_fa_layer_count: int | None = None,
+                 preserve_fa_layer_indices: list[int] | None = None, **kwargs: Any) -> None:
+        """Configure optional FA state preservation during full checkpointing.
+
+        Args:
+            preserve_fa: Enable native FA state preservation; disabled by default.
+            preserve_fa_layer_count: Select the first N trunk layers, including zero.
+            preserve_fa_layer_indices: Select explicit zero-based trunk layer indices.
+            **kwargs: Configuration fields forwarded to DeepSeek-V3.2.
+
+        Raises:
+            ValueError: If selectors are invalid, combined, or used while disabled.
+        """
+        super().__init__(**kwargs)
+        if not isinstance(preserve_fa, bool):
+            raise ValueError("JT preserve_fa must be a bool")
+        if preserve_fa_layer_count is not None and preserve_fa_layer_indices is not None:
+            raise ValueError("Specify only one of preserve_fa_layer_count and preserve_fa_layer_indices")
+        if not preserve_fa and (preserve_fa_layer_count is not None or preserve_fa_layer_indices is not None):
+            raise ValueError("FA layer selection requires preserve_fa=True")
+        self.preserve_fa = preserve_fa
+        self.preserve_fa_layer_count = preserve_fa_layer_count
+        self.preserve_fa_layer_indices = preserve_fa_layer_indices
+        self._validate_fa_layer_selection()
+
+    def _validate_fa_layer_selection(self) -> None:
+        """Reject malformed or out-of-range selectors before model allocation."""
+        count, indices = self.preserve_fa_layer_count, self.preserve_fa_layer_indices
+        if count is not None:
+            if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= self.num_hidden_layers:
+                raise ValueError("preserve_fa_layer_count must be an integer between 0 and num_hidden_layers")
+        if indices is not None:
+            if not isinstance(indices, (list, tuple)) or not indices:
+                raise ValueError("preserve_fa_layer_indices must be a non-empty list of trunk layer indices")
+            if any(isinstance(index, bool) or not isinstance(index, int)
+                   or not 0 <= index < self.num_hidden_layers for index in indices):
+                raise ValueError("preserve_fa_layer_indices must contain integers in [0, num_hidden_layers)")
+            if len(set(indices)) != len(indices):
+                raise ValueError("preserve_fa_layer_indices must not contain duplicates")
+            self.preserve_fa_layer_indices = list(indices)
+
+    def preserve_fa_for_layer(self, layer_idx: int) -> bool:
+        """Resolve the switch once when constructing a trunk attention module.
+
+        Args:
+            layer_idx: Zero-based index in the trunk decoder layers.
+
+        Returns:
+            Whether this layer should retain native FA state during replay.
+        """
+        if not self.preserve_fa:
+            return False
+        if self.preserve_fa_layer_count is not None:
+            return layer_idx < self.preserve_fa_layer_count
+        if self.preserve_fa_layer_indices is not None:
+            return layer_idx in self.preserve_fa_layer_indices
+        return True
 
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
@@ -133,9 +192,18 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         return output.to(values.dtype)
 
 
+@checkpoint_exclude_wrapper
+def _preserved_fusion_attention(*args: Any, **kwargs: Any) -> tuple:
+    """Keep native FA backward state while its input tensors are rebuilt by Hyper."""
+    if torch.compiler.is_compiling():
+        raise ValueError("JT preserve_fa requires eager Hyper non-reentrant checkpointing")
+    return torch_npu.npu_fusion_attention(*args, **kwargs)
+
+
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
                               value: torch.Tensor, attention_mask: Any, dropout: float = 0.0,
-                              scaling: float | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
+                              scaling: float | None = None, preserve_fa: bool = False,
+                              **kwargs: Any) -> tuple[torch.Tensor, None]:
     """Run NPU fused attention and record per-head maxima of the attention logits.
 
     Inputs are prepared like the framework's ``npu_fusion_attention_forward``; the
@@ -150,6 +218,7 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         attention_mask: Optional attention mask.
         dropout: Attention dropout probability.
         scaling: Attention score scale; ``head_dim ** -0.5`` when ``None``.
+        preserve_fa: Reuse native FA state inside eager Hyper checkpoint replay.
         **kwargs: Packed sequence lengths and attention window options.
 
     Returns:
@@ -162,7 +231,10 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
     query, key, value, layout, mask, sparse_mode = _prepare_attention_inputs(
         query, key, value, attention_mask, is_packed=query_lengths is not None,
         is_causal=causal, sliding_window=window, sparse_mode=sparse_mode)
-    result = torch_npu.npu_fusion_attention(
+    if not isinstance(preserve_fa, bool):
+        raise ValueError("JT preserve_fa must be a bool")
+    attention = _preserved_fusion_attention if preserve_fa else torch_npu.npu_fusion_attention
+    result = attention(
         query, key, value, query.shape[1], layout,
         pse=None, padding_mask=None, atten_mask=mask,
         scale=head_dim**-0.5 if scaling is None else scaling,
@@ -204,6 +276,7 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         self.explicit_rotary = JTDeepseekV3RotaryEmbedding(
             use_fused_rope=getattr(module.config, "use_fused_rope", False))
         self.key_rope_gather = nn.Identity()
+        self.preserve_fa = module.preserve_fa
         self.register_buffer("max_logits_val", None, persistent=False)
         self.attention_interface = observed_fusion_attention
 
@@ -285,6 +358,7 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         output, weights = self.attention_interface(
             self, query, key, value, attention_mask,
             dropout=self.attention_dropout if self.training else 0.0, scaling=self.scaling,
+            preserve_fa=self.preserve_fa,
             sliding_window=self.sliding_window, actual_seq_len=actual_seq_len, **kwargs)
         output = output.reshape(query.shape[0], query.shape[2], -1).contiguous()
         return self.o_proj(output), weights
@@ -302,6 +376,7 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         """
         nn.Module.__init__(self)
         self.config, self.layer_idx = config, layer_idx
+        self.preserve_fa = config.preserve_fa_for_layer(layer_idx)
         self.num_heads = config.num_attention_heads
         self.q_lora_rank, self.kv_lora_rank = config.q_lora_rank, config.kv_lora_rank
         self.qk_rope_head_dim, self.qk_nope_head_dim = config.qk_rope_head_dim, config.qk_nope_head_dim
@@ -353,8 +428,10 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         rope = self.explicit_rotary(rope.unsqueeze(1), cos, sin).expand(-1, self.num_heads, -1, -1)
         key = torch.cat((key, rope), dim=-1)
         if hidden_states.device.type == "npu":
-            output, _ = observed_fusion_attention(self, query, key, value, attention_mask,
-                                                  scaling=self.scaling, **kwargs)
+            output, _ = observed_fusion_attention(
+                self, query, key, value, attention_mask,
+                dropout=self.attention_dropout if self.training else 0.0,
+                scaling=self.scaling, preserve_fa=self.preserve_fa, **kwargs)
         else:
             lengths, _ = resolve_packed_sequence_lengths(kwargs, batch * sequence, batch * sequence)
             if lengths is not None:
@@ -665,6 +742,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         mtp_config = copy.deepcopy(config)
+        # Explicit selectors refer only to trunk layers; MTP indices restart at zero.
+        if config.preserve_fa_layer_count is not None or config.preserve_fa_layer_indices is not None:
+            mtp_config.preserve_fa = False
+            mtp_config.preserve_fa_layer_count = None
+            mtp_config.preserve_fa_layer_indices = None
         depth = config.num_nextn_predict_layers
         mtp_config.mlp_layer_types = ["sparse"] * depth
         self.mtp = DeepseekV3MTP(

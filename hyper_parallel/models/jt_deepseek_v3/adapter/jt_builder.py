@@ -29,6 +29,7 @@ import torch_npu
 from transformers import PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
+from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.models.build_options import FSDP2Config, get_device_id
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
@@ -111,7 +112,10 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | No
     """Build the JT model with optional converted ``model.npz`` weights.
 
     Args:
-        config: JT model configuration fields.
+        config: JT model configuration fields. ``preserve_fa=True`` retains native
+            FA state during eager full checkpointing; the default is ``False``.
+            Optional ``preserve_fa_layer_count`` or ``preserve_fa_layer_indices``
+            limits preservation to the selected trunk layers, excluding MTP.
         reference_weights: Directory containing ``model.npz``. If omitted or None,
             initialize from ``config`` using the model's native initialization
             and the caller's random seed.
@@ -124,9 +128,16 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | No
     Raises:
         ValueError: If the weights or explicit context-parallel plan do not match the model.
     """
+    config = JTDeepseekV3Config(**config)
+    preserve_fa = config.preserve_fa
+    if preserve_fa:
+        compile_options = infrastructure_options.get("compile_config")
+        compiling = (compile_options.get("enabled", False) if isinstance(compile_options, dict)
+                     else getattr(compile_options, "enabled", False))
+        if infrastructure_options.get("activation_checkpoint") != "full" or compiling:
+            raise ValueError("JT preserve_fa requires eager activation_checkpoint.mode=full")
     torch_npu.npu.set_compile_mode(jit_compile=False)
     torch.use_deterministic_algorithms(True)
-    config = JTDeepseekV3Config(**config)
     mesh = distributed_setup.mesh_context
     # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
     framework_setup = replace(
@@ -163,6 +174,8 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | No
         is_hf_model=True,
         **infrastructure_options,
     )
+    if preserve_fa and not any(isinstance(module, CheckpointWrapper) for module in model.modules()):
+        raise ValueError("JT preserve_fa requires Hyper checkpoint wrappers, not HF-native checkpointing")
     _bind_statistics_groups(model, mesh)
     configure_context_parallel(model, mesh)
     return model

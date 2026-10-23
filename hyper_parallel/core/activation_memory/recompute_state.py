@@ -20,9 +20,10 @@ from typing import Any, Callable, Dict, Optional, Tuple
 class _RecomputeInvocation:
     """Own resources whose lifetime is one checkpoint invocation."""
 
-    def __init__(self) -> None:
-        """Initialize an empty invocation resource registry."""
+    def __init__(self, preserve_rng_state: bool = True) -> None:
+        """Initialize an invocation and its inherited RNG preservation setting."""
         self.identity = object()
+        self.preserve_rng_state = preserve_rng_state
         self.resources: Dict[object, Any] = {}
 
     def get_resource(self, key: object, factory: Callable[[], Any]) -> Any:
@@ -52,6 +53,11 @@ class RecomputeState:
     def invocation_id(self) -> object:
         """Return an identity that is stable across forward and recomputation."""
         return self._invocation.identity
+
+    @property
+    def preserve_rng_state(self) -> bool:
+        """Return whether the surrounding checkpoint preserves default RNG states."""
+        return self._invocation.preserve_rng_state
 
     def get_resource(self, key: object, factory: Callable[[], Any]) -> Any:
         """Get an invocation-local resource shared by both execution phases."""
@@ -101,9 +107,11 @@ def is_recomputing() -> bool:
     return state is not None and state.is_recomputing
 
 
-def create_recompute_contexts() -> Tuple[_RecomputeContext, _RecomputeContext]:
-    """Create forward and recompute contexts for one checkpoint invocation."""
-    invocation = _RecomputeInvocation()
+def create_recompute_contexts(
+    *, preserve_rng_state: bool = True,
+) -> Tuple[_RecomputeContext, _RecomputeContext]:
+    """Create invocation contexts carrying the checkpoint RNG preservation setting."""
+    invocation = _RecomputeInvocation(preserve_rng_state)
     return (
         _RecomputeContext(RecomputeState(invocation, recomputing=False)),
         _RecomputeContext(RecomputeState(invocation, recomputing=True)),

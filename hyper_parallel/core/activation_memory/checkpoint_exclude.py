@@ -20,6 +20,8 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import torch
 
+from .checkpoint import _get_device_module, _get_device_states, _infer_device_type, _set_device_states
+
 _RECOMPUTE_INPUT_HANDLE_ATTR = "_hyper_parallel_recompute_input_handle"
 _SAVE_OUTPUT_SOURCE_ATTR = "_hyper_parallel_save_output_source"
 _MISSING = object()
@@ -59,12 +61,46 @@ class _InputBinding:
 
 
 @dataclass
+class _RNGState:
+    """Default generator states after an excluded call, without retaining its inputs."""
+
+    cpu_state: torch.Tensor
+    device_type: str
+    device_ids: List[int]
+    device_states: List[Any]
+
+    @classmethod
+    def capture(cls, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> "_RNGState":
+        """Capture generator states supported by the surrounding checkpoint.
+
+        Args:
+            args: Positional inputs used to identify participating devices.
+            kwargs: Keyword inputs used to identify participating devices.
+
+        Returns:
+            Default CPU and input-device generator states after the call.
+        """
+        device_type = _infer_device_type(args, kwargs)
+        device_module = _get_device_module(device_type)
+        device_ids, device_states = ([], [])
+        if getattr(device_module, "_initialized", False):
+            device_ids, device_states = _get_device_states(device_type, args, kwargs)
+        return cls(torch.get_rng_state(), device_type, device_ids, device_states)
+
+    def restore(self) -> None:
+        """Advance replay past random draws omitted by the cached call."""
+        torch.set_rng_state(self.cpu_state)
+        _set_device_states(self.device_type, self.device_ids, self.device_states)
+
+
+@dataclass
 class _ExcludeCacheEntry:
     """Store one excluded call's replay value and deferred input bindings."""
 
     output: Any
     input_bindings: List[_InputBinding]
     output_tensor_count: int = 1
+    rng_state: Optional[_RNGState] = None
 
 
 class _ExcludeCache:

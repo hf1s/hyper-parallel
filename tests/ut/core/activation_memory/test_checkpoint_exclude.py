@@ -24,6 +24,9 @@ import unittest
 from unittest.mock import patch, sentinel
 
 import torch
+from torch.utils.checkpoint import DefaultDeviceType
+
+from hyper_parallel.core.activation_memory import checkpoint, checkpoint_exclude_wrapper
 
 
 _checkpoint_exclude = importlib.import_module("hyper_parallel.core.activation_memory.checkpoint_exclude")
@@ -514,6 +517,78 @@ class TestReplayOutputs(_CheckpointExcludeTestCase):
         )
 
         self.assertIs(result, sentinel.output)
+
+
+class TestExcludedRandomRegions(_CheckpointExcludeTestCase):
+    """Check gradients and RNG progression across cached stochastic regions."""
+
+    @staticmethod
+    def _run(exclude: bool, preserve_rng_state: bool, early_stop: bool) -> tuple:
+        """Compare two in-flight invocations sharing one wrapper and parameter."""
+        torch.manual_seed(1234)
+        weight = torch.nn.Parameter(torch.linspace(0.5, 1.5, 256))
+        inputs = [torch.ones(256, requires_grad=True) for _ in range(2)]
+        calls = []
+
+        def region(value: torch.Tensor) -> torch.Tensor:
+            """Consume RNG inside the region excluded from replay."""
+            calls.append(None)
+            return torch.nn.functional.dropout(value * weight, p=0.5, training=True)
+
+        inner = checkpoint_exclude_wrapper(region) if exclude else region
+
+        def block(value: torch.Tensor) -> torch.Tensor:
+            """Consume further RNG after two calls to the excluded region."""
+            return torch.nn.functional.dropout(inner(inner(value)), p=0.5, training=True)
+
+        outputs = [
+            checkpoint(block, value, preserve_rng_state=preserve_rng_state, early_stop=early_stop)
+            if exclude else block(value)
+            for value in inputs
+        ]
+        rng_before_backward = torch.get_rng_state()
+        sum(output.sum() for output in outputs).backward()
+        rng_after_backward = torch.get_rng_state()
+        return (
+            [output.detach() for output in outputs],
+            [value.grad for value in inputs],
+            weight.grad,
+            torch.rand(16),
+            torch.equal(rng_before_backward, rng_after_backward),
+            len(calls),
+        )
+
+    def test_excluded_dropout_preserves_downstream_masks_and_gradients(self) -> None:
+        """Feature: RNG preservation across excluded random regions.
+
+        Description: Share one wrapper across repeated calls and two in-flight checkpoints.
+        Expectation: Outputs, input/parameter gradients and subsequent random draws match exactly.
+        """
+        with torch.random.fork_rng(devices=[]), patch.object(DefaultDeviceType, "get_device_type", return_value="cpu"):
+            for early_stop in (True, False):
+                with self.subTest(early_stop=early_stop):
+                    reference = self._run(False, True, early_stop)
+                    actual = self._run(True, True, early_stop)
+                    for actual_group, expected_group in zip(actual[:2], reference[:2]):
+                        for value, expected in zip(actual_group, expected_group):
+                            torch.testing.assert_close(value, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(actual[2], reference[2], rtol=0, atol=0)
+                    torch.testing.assert_close(actual[3], reference[3], rtol=0, atol=0)
+                    self.assertTrue(actual[4])
+                    self.assertEqual(actual[5], 4)
+
+    def test_exclusion_respects_disabled_rng_preservation(self) -> None:
+        """Feature: Explicit opt-out from checkpoint RNG preservation.
+
+        Description: Run an excluded random region with preserve_rng_state disabled.
+        Expectation: Replay advances the ambient generator without restoring cached RNG states.
+        """
+        with torch.random.fork_rng(devices=[]), patch.object(DefaultDeviceType, "get_device_type", return_value="cpu"):
+            reference = self._run(False, False, True)
+            actual = self._run(True, False, True)
+        self.assertFalse(actual[4])
+        self.assertFalse(torch.equal(actual[3], reference[3]))
+        self.assertEqual(actual[5], 4)
 
 
 if __name__ == "__main__":
