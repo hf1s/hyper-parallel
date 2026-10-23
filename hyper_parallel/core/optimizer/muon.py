@@ -85,6 +85,7 @@ _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "post_update_fn": None,
     "zero_rms_scale_mode": "zero",
     "apply_lr_in_update": False,
+    "ns_batch_across_params": True,
 }
 
 
@@ -101,6 +102,7 @@ class _MuonAdvancedOptions:
     post_update_fn: Optional[Callable[..., None]]
     zero_rms_scale_mode: str
     apply_lr_in_update: bool
+    ns_batch_across_params: bool
 
 
 def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOptions:
@@ -196,6 +198,7 @@ class Muon(BaseDistributedOptimizer):
     """
 
     ADDITIONAL_CONFIG_KEYS = set(_MUON_ADVANCED_DEFAULTS)
+    LEGACY_PARAM_GROUP_DEFAULTS = {"ns_batch_across_params": True}
 
     def __init__(
             self,
@@ -230,9 +233,13 @@ class Muon(BaseDistributedOptimizer):
             post_update_fn: Optional callback applied after a parameter update.
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
+            ns_batch_across_params: Whether equally shaped NS inputs from different
+                parameters may share one NS call. Intrinsic matrix batches and
+                same-parameter transform pieces are preserved when False.
             hsdp_replica_count: Optional optimizer-state replica group size.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        self._validate_ns_batch_across_params(advanced.ns_batch_across_params)
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -263,6 +270,7 @@ class Muon(BaseDistributedOptimizer):
             "ns_epsilon": advanced.ns_epsilon,
             "zero_rms_scale_mode": advanced.zero_rms_scale_mode,
             "apply_lr_in_update": advanced.apply_lr_in_update,
+            "ns_batch_across_params": advanced.ns_batch_across_params,
         }
         super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
         self.reshape_fn = advanced.reshape_fn
@@ -274,6 +282,8 @@ class Muon(BaseDistributedOptimizer):
 
     def reset_optimizer_parameters(self) -> None:
         """Rebuild all parameter-identity caches from current param groups."""
+        for group in self.param_groups:
+            self._validate_ns_batch_across_params(group.get("ns_batch_across_params", True))
         self._group_dtensor_by_mesh()
         self._build_param_shard_metadata()
         deduced_count = self._auto_deduce_replica_count()
@@ -285,6 +295,32 @@ class Muon(BaseDistributedOptimizer):
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
+
+    @staticmethod
+    def _validate_ns_batch_across_params(value: Any) -> bool:
+        """Reject truthy non-booleans before changing optimizer state."""
+        if not isinstance(value, bool):
+            raise ValueError(f"ns_batch_across_params must be a bool, got {value!r}")
+        return value
+
+    @staticmethod
+    def validate_checkpoint_state_dict(state_dict: Dict[str, Any]) -> None:
+        """Validate the batching policy in raw or FQN-flattened checkpoints."""
+        for group in state_dict.get("param_groups", []):
+            if "ns_batch_across_params" in group:
+                Muon._validate_ns_batch_across_params(group["ns_batch_across_params"])
+        for key, value in state_dict.items():
+            if key.startswith("param_groups.") and key.endswith(".ns_batch_across_params"):
+                Muon._validate_ns_batch_across_params(value)
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Restore the batching policy, using True for checkpoints predating it."""
+        self.validate_checkpoint_state_dict(state_dict)
+        restored = dict(state_dict)
+        restored["param_groups"] = [
+            dict(self.LEGACY_PARAM_GROUP_DEFAULTS, **group) for group in state_dict["param_groups"]
+        ]
+        super().load_state_dict(restored)
 
     @staticmethod
     def _validate_ns_coefficients(
@@ -339,6 +375,8 @@ class Muon(BaseDistributedOptimizer):
         Returns:
             The closure loss when provided, otherwise ``None``.
         """
+        for group in self.param_groups:
+            self._validate_ns_batch_across_params(group.get("ns_batch_across_params", True))
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -947,8 +985,9 @@ class Muon(BaseDistributedOptimizer):
         """Compute native reshape/view NS updates without transform bookkeeping."""
         if not p_list:
             return {}
+        batch_across_params = self._validate_ns_batch_across_params(group.get("ns_batch_across_params", True))
         state = {"reshape_groups": defaultdict(list), "origin_shapes": {}, "working_inputs": {}, "restored": {}}
-        for param in p_list:
+        for param_index, param in enumerate(p_list):
             local_shape = getattr(param, "local_shape", None)
             if local_shape is None:
                 local_shape = to_local_if_dtensor(param.data).shape
@@ -958,9 +997,9 @@ class Muon(BaseDistributedOptimizer):
             )
             state["working_inputs"][param] = working_input
             for reshaped_input in reshaped_inputs:
-                state["reshape_groups"][self._shape_to_core_shape(tuple(reshaped_input.shape))].append(
-                    reshaped_input
-                )
+                core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
+                group_key = core_shape if batch_across_params else (param_index, core_shape)
+                state["reshape_groups"][group_key].append(reshaped_input)
         for tensor_list in state["reshape_groups"].values():
             updates = self._compute_batched_ns_outputs_for_tensors(
                 tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
@@ -999,6 +1038,8 @@ class Muon(BaseDistributedOptimizer):
         if not p_list:
             return {}
 
+        batch_across_params = self._validate_ns_batch_across_params(group.get("ns_batch_across_params", True))
+
         state: _TransformNSState = {
             "reshape_groups": defaultdict(list),
             "origin_shapes": {},
@@ -1008,7 +1049,7 @@ class Muon(BaseDistributedOptimizer):
             "restored": {},
         }
 
-        for p in p_list:
+        for param_index, p in enumerate(p_list):
             state["origin_shapes"][p] = (
                 tuple(to_local_if_dtensor(p.data).shape) if no_shard else tuple(p.shape)
             )
@@ -1018,7 +1059,9 @@ class Muon(BaseDistributedOptimizer):
             state["transform_updates"].append([None] * len(prepared[1].tensors))
 
             for tensor_index, transformed_input in enumerate(prepared[1].tensors):
-                state["reshape_groups"][self._shape_to_core_shape(tuple(transformed_input.shape))].append(
+                core_shape = self._shape_to_core_shape(tuple(transformed_input.shape))
+                group_key = core_shape if batch_across_params else (param_index, core_shape)
+                state["reshape_groups"][group_key].append(
                     (transformed_input, len(state["transform_updates"]) - 1, tensor_index)
                 )
 

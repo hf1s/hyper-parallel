@@ -217,6 +217,39 @@ class ChainedOptimizer:
 
         return merged
 
+    def _legacy_group_defaults_by_fqn(self) -> Dict[str, Dict[str, Any]]:
+        """Resolve optional leaf checkpoint fields under Torch's canonical FQNs."""
+        defaults_by_fqn = {}
+        for optimizer in self.chained_optimizers:
+            defaults = getattr(optimizer, "LEGACY_PARAM_GROUP_DEFAULTS", {})
+            if not defaults:
+                continue
+            with self._optimizer_parameter_view():
+                template = get_optimizer_state_dict(self.model, optimizer)
+            for group in template["param_groups"]:
+                for name in group["params"]:
+                    defaults_by_fqn[name] = defaults
+        return defaults_by_fqn
+
+    def _with_legacy_group_defaults(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill absent group fields before Torch unflattens optimizer checkpoints."""
+        restored = dict(state_dict)
+        defaults_by_fqn = self._legacy_group_defaults_by_fqn()
+        if not defaults_by_fqn:
+            return restored
+        if self.flatten:
+            for name, defaults in defaults_by_fqn.items():
+                for key, value in defaults.items():
+                    restored.setdefault(f"param_groups.{name}.{key}", value)
+        else:
+            restored["param_groups"] = []
+            for group in state_dict["param_groups"]:
+                defaults = {}
+                for name in group["params"]:
+                    defaults.update(defaults_by_fqn.get(name, {}))
+                restored["param_groups"].append(dict(defaults, **group))
+        return restored
+
     def _get_param_groups(self) -> List[Dict[str, Any]]:
         """Get param_groups aggregated over underlying optimizers."""
         param_groups: List[Dict[str, Any]] = []
@@ -245,6 +278,11 @@ class ChainedOptimizer:
         Args:
             state_dict: FQN-keyed optimizer state to restore.
         """
+        for optimizer in self.chained_optimizers:
+            validator = getattr(optimizer, "validate_checkpoint_state_dict", None)
+            if callable(validator):
+                validator(state_dict)
+        state_dict = self._with_legacy_group_defaults(state_dict)
         for optimizer in self.chained_optimizers:
             with self._optimizer_parameter_view():
                 set_optimizer_state_dict(

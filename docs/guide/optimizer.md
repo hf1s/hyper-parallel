@@ -45,6 +45,40 @@ optimizer = get_hyper_optimizer(
 - `adamw_params`：AdamW 优化的参数组（通常为 embedding、bias 等参数）
 - 任一参数组为空列表时，对应优化器不创建
 
+### Muon 的跨参数 Newton–Schulz 批处理策略
+
+`ns_batch_across_params` 是显式布尔选项，默认 `True`，保留按逻辑矩阵形状合并不同参数的
+Newton–Schulz（NS）调用。需要让不同原参数分别执行 NS 时，可设置为 `False`：
+
+```python
+optimizer = get_hyper_optimizer(
+    model=model,
+    muon_params=muon_param_groups,
+    adamw_params=adamw_param_groups,
+    muon_kwargs={"lr": 0.02, "ns_batch_across_params": False},
+    adamw_kwargs={"lr": 3e-4},
+)
+```
+
+训练配置通过现有 `muon_config` 传递同名字段；`muon_ns_batch_across_params` 前缀形式也受支持。
+也可以在 Muon 参数组中覆盖该值。整数 `0/1`、字符串等非布尔值会被拒绝。
+
+`False` 只隔离不同原参数；单个专家参数自带的矩阵批、卷积 reshape，以及同一参数经
+`reshape_fn` 或 `ns_transform_fn` 产生的同形状片段仍保留原有批处理。它不会拆开融合参数的
+逻辑 Q/KV 或 gate/up 边界，也不改变通信、owner、布局、动量、NS 系数、缩放、学习率和权重衰减。
+
+该策略同时适用于原生路径和 `NSInputTransform` 路径。所有 callback 的函数签名保持不变；
+设置 `False` 后，`zeropower_fn(input, steps=...)` 会收到按原参数隔离的输入，调用次数和输入批大小
+可能变化。单个参数内部仍可能传入三维或更多维矩阵批，不能把 `False` 理解为逐二维矩阵执行。
+
+浮点规约和矩阵乘法可能随批形状采用不同执行顺序；此选项提供数值策略选择，不保证任意设备或
+并行布局之间逐位相同，也不表示批处理算法本身错误。
+
+新 optimizer checkpoint 保存每组策略，加载时以保存值为准。旧 checkpoint 缺该字段时恢复为
+兼容值 `True`，即使当前构造配置为 `False`；这也适用于 FQN 展平状态及训练器 DCP 加载。
+只加载模型权重时，当前 optimizer 配置保持不变。需要对恢复后的策略进行显式调整时，应在加载
+optimizer 状态之后设置参数组字段，并记录该调整。
+
 ### 2. 参数分组示例
 
 ```python
