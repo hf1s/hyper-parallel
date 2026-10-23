@@ -151,6 +151,9 @@ class HSDPSchedulerV2:
         # so unshard / PostBackward / reshard run once per forward (aligned with PyTorch FSDP2).
         self._fsdp_group_post_pending: Optional[set] = set() if len(self.modules) > 1 else None
         self._new_cell_state()
+        # Initialization inputs may reference full parameters replaced by local shards.
+        self.source_shard_infos = None
+        self.replicate_params = None
         self._register_hooks()
 
     def _new_cell_state(self):
