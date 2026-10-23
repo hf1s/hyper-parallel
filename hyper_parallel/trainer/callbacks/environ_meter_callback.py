@@ -155,11 +155,15 @@ class EnvironMeterCallback(Callback):
             return None
         return dp_cp_mesh.get_group()
 
-    def _reduce(self, value: Any, op: str) -> float:
-        """Reduce one scalar metric, with a single-process no-op fallback."""
+    def _reduce(self, value: Any, op: str, *, all_ranks: bool = False) -> float:
+        """Reduce over DP+CP, or the whole job for resource extrema.
+
+        Whole-job reductions require every rank to invoke the callback in the same order.
+        """
         if get_world_size_safe() <= 1:
             return float(value)
-        reduced = all_reduce(value, op=op, group=self._metric_group())
+        group = None if all_ranks else self._metric_group()
+        reduced = all_reduce(value, op=op, group=group)
         return float(reduced)
 
     def _accumulate_batches(self, value: Any) -> None:
@@ -218,8 +222,8 @@ class EnvironMeterCallback(Callback):
         if get_device_type() == "cpu":
             return {}
         device = get_torch_device()
-        allocated = self._reduce(device.max_memory_allocated(), op="max")
-        reserved = self._reduce(device.max_memory_reserved(), op="max")
+        allocated = self._reduce(device.max_memory_allocated(), op="max", all_ranks=True)
+        reserved = self._reduce(device.max_memory_reserved(), op="max", all_ranks=True)
         gibibyte = 1024 ** 3
         return {
             "memory/device_max_allocated_gb": allocated / gibibyte,
@@ -308,7 +312,8 @@ class EnvironMeterCallback(Callback):
         """
         del state, kwargs
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
-        global_step_time = self._reduce(step_time, op="max")
+        # TP and PP ranks also consume time and memory, but must not duplicate data counts.
+        global_step_time = self._reduce(step_time, op="max", all_ranks=True)
         local_step_tokens = 0 if self._local_step_tokens is None else self._local_step_tokens
         global_tokens = int(self._reduce(local_step_tokens, op="sum"))
         global_samples = self._global_samples()
