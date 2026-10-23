@@ -1,0 +1,1038 @@
+{
+  "producer": "Fixed MF MFTrainOneStepCell + AdamW through native CheckpointMonitor.remove_redundancy",
+  "mindspore": "2.7.2",
+  "native_checkpoint_sha256": "e36b784a44c8336fa081d837d1b4fd471659c59b84ed7f123d69450445bc3231",
+  "scope": "Observed producer field names/dtypes/shapes; unit fixtures use downscaled synthetic arrays, not captured parameter values",
+  "metadata": {
+    "format": "ms",
+    "remove_redundancy": "False"
+  },
+  "tensors": {
+    "decoder.layers.0.hidden_states_dropout.offset": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "decoder.layers.0.hidden_states_dropout.seed": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "decoder.layers.1.hidden_states_dropout.offset": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "decoder.layers.1.hidden_states_dropout.seed": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "embedding.embedding_dropout.offset": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "embedding.embedding_dropout.seed": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "epoch_num": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "global_batch_size": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "mtp.embedding.embedding_dropout.offset": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "mtp.embedding.embedding_dropout.seed": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "mtp.layers.0.transformer_layer.hidden_states_dropout.offset": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "mtp.layers.0.transformer_layer.hidden_states_dropout.seed": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "step_num": {
+      "dtype": "I64",
+      "shape": []
+    },
+    "adam_m.decoder.final_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.decoder.layers.0.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.decoder.layers.0.mlp.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.0.mlp.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "adam_m.decoder.layers.0.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.decoder.layers.0.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "adam_m.decoder.layers.0.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.0.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "adam_m.decoder.layers.0.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.0.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.0.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "adam_m.decoder.layers.0.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "adam_m.decoder.layers.1.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.mlp.experts.weight1": {
+      "dtype": "F32",
+      "shape": [
+        1024,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.mlp.experts.weight2": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.mlp.router.weight": {
+      "dtype": "F32",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.mlp.shared_experts.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.mlp.shared_experts.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "adam_m.decoder.layers.1.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "adam_m.decoder.layers.1.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "adam_m.decoder.layers.1.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "adam_m.decoder.layers.1.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "adam_m.embedding.word_embeddings.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.eh_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "adam_m.mtp.layers.0.enorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.final_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.hnorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.mlp.experts.weight1": {
+      "dtype": "F32",
+      "shape": [
+        1024,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.mlp.experts.weight2": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.mlp.router.weight": {
+      "dtype": "F32",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "adam_m.mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "adam_m.output_layer.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "adam_v.decoder.final_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.decoder.layers.0.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.decoder.layers.0.mlp.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.0.mlp.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "adam_v.decoder.layers.0.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.decoder.layers.0.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "adam_v.decoder.layers.0.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.0.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "adam_v.decoder.layers.0.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.0.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.0.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "adam_v.decoder.layers.0.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "adam_v.decoder.layers.1.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.mlp.experts.weight1": {
+      "dtype": "F32",
+      "shape": [
+        1024,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.mlp.experts.weight2": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.mlp.router.weight": {
+      "dtype": "F32",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.mlp.shared_experts.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.mlp.shared_experts.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "adam_v.decoder.layers.1.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "adam_v.decoder.layers.1.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "adam_v.decoder.layers.1.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "adam_v.decoder.layers.1.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "adam_v.embedding.word_embeddings.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.eh_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "adam_v.mtp.layers.0.enorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.final_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.hnorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.mlp.experts.weight1": {
+      "dtype": "F32",
+      "shape": [
+        1024,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.mlp.experts.weight2": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.mlp.router.weight": {
+      "dtype": "F32",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "adam_v.mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "adam_v.output_layer.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "aux_loss": {
+      "dtype": "F32",
+      "shape": [
+        1
+      ]
+    },
+    "decoder.final_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "decoder.layers.0.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "decoder.layers.0.mlp.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "decoder.layers.0.mlp.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "decoder.layers.0.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "decoder.layers.0.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "decoder.layers.0.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "decoder.layers.0.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "decoder.layers.0.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "decoder.layers.0.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "decoder.layers.0.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "decoder.layers.0.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "decoder.layers.1.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "decoder.layers.1.mlp.experts.weight1": {
+      "dtype": "F32",
+      "shape": [
+        1024,
+        128
+      ]
+    },
+    "decoder.layers.1.mlp.experts.weight2": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "decoder.layers.1.mlp.router.expert_bias": {
+      "dtype": "F32",
+      "shape": [
+        8
+      ]
+    },
+    "decoder.layers.1.mlp.router.fi_accu": {
+      "dtype": "F32",
+      "shape": [
+        8
+      ]
+    },
+    "decoder.layers.1.mlp.router.weight": {
+      "dtype": "F32",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    "decoder.layers.1.mlp.shared_experts.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "decoder.layers.1.mlp.shared_experts.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "decoder.layers.1.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "decoder.layers.1.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "decoder.layers.1.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "decoder.layers.1.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "decoder.layers.1.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "decoder.layers.1.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "decoder.layers.1.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "decoder.layers.1.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "embedding.word_embeddings.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "lm_loss": {
+      "dtype": "F32",
+      "shape": [
+        1
+      ]
+    },
+    "loss_scale": {
+      "dtype": "F32",
+      "shape": []
+    },
+    "mtp.layers.0.eh_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "mtp.layers.0.enorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "mtp.layers.0.final_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "mtp.layers.0.hnorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.input_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.mlp.experts.weight1": {
+      "dtype": "F32",
+      "shape": [
+        1024,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.mlp.experts.weight2": {
+      "dtype": "F32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.mlp.router.expert_bias": {
+      "dtype": "F32",
+      "shape": [
+        8
+      ]
+    },
+    "mtp.layers.0.transformer_layer.mlp.router.fi_accu": {
+      "dtype": "F32",
+      "shape": [
+        8
+      ]
+    },
+    "mtp.layers.0.transformer_layer.mlp.router.weight": {
+      "dtype": "F32",
+      "shape": [
+        8,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.mlp.shared_experts.linear_fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.pre_mlp_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.self_attention.kv_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        32
+      ]
+    },
+    "mtp.layers.0.transformer_layer.self_attention.linear_kv_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        96,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.self_attention.linear_kv_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        32
+      ]
+    },
+    "mtp.layers.0.transformer_layer.self_attention.linear_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.self_attention.linear_q_down_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "mtp.layers.0.transformer_layer.self_attention.linear_q_up_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        64
+      ]
+    },
+    "mtp.layers.0.transformer_layer.self_attention.q_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        64
+      ]
+    },
+    "mtp_loss": {
+      "dtype": "F32",
+      "shape": [
+        1
+      ]
+    },
+    "output_layer.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "scale_sense": {
+      "dtype": "F32",
+      "shape": []
+    },
+    "global_step": {
+      "dtype": "I32",
+      "shape": [
+        1
+      ]
+    }
+  }
+}
