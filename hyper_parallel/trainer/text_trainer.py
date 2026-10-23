@@ -37,9 +37,17 @@ class TextTrainer:
 
     base: BaseTrainer
 
-    def __init__(self, config: TrainerConfig) -> None:
-        """Build the text Trainer in the same explicit order as VeOmni."""
-        self.base = BaseTrainer.__new__(BaseTrainer)
+    def __init__(self, config: TrainerConfig, *, base_trainer_class: type[BaseTrainer] = BaseTrainer) -> None:
+        """Build the text Trainer with an explicit, optionally specialized base.
+
+        Args:
+            config: Validated Trainer configuration.
+            base_trainer_class: BaseTrainer subclass implementing a specialized
+                runtime stage, without replacing module-global functions.
+        """
+        if not isinstance(base_trainer_class, type) or not issubclass(base_trainer_class, BaseTrainer):
+            raise ValueError("base_trainer_class must be a BaseTrainer subclass")
+        self.base = base_trainer_class.__new__(base_trainer_class)
         self.base.config = config
 
         self.base._setup()
