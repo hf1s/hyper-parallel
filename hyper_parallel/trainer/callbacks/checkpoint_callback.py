@@ -337,7 +337,7 @@ class CheckpointerCallback(Callback):
         checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
         if optimizers:
             checkpoint_state["optimizer"] = _unwrap_single(
-                [optimizer.state_dict() for optimizer in optimizers]
+                [getattr(optimizer, "state_dict_for_load", optimizer.state_dict)() for optimizer in optimizers]
             )
 
         # The skeleton gives an embedded extra_state bundle keys to be read into;

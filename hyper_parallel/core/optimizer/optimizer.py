@@ -217,6 +217,52 @@ class ChainedOptimizer:
 
         return merged
 
+    def _legacy_group_defaults_by_fqn(self) -> Dict[str, Dict[str, Any]]:
+        """Resolve each leaf's optional checkpoint fields under Torch's canonical FQNs."""
+        defaults_by_fqn = {}
+        for optimizer in self.chained_optimizers:
+            defaults = getattr(optimizer, "LEGACY_PARAM_GROUP_DEFAULTS", {})
+            if not defaults:
+                continue
+            # Torch resolves wrapper prefixes and fp32 main-parameter FQNs here.
+            with self._optimizer_parameter_view():
+                template = get_optimizer_state_dict(self.model, optimizer)
+            for group in template["param_groups"]:
+                for name in group["params"]:
+                    defaults_by_fqn[name] = defaults
+        return defaults_by_fqn
+
+    def _with_legacy_group_defaults(
+            self, state_dict: Dict[str, Any], *, overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Copy group metadata and normalize fields added since older checkpoints."""
+        restored = dict(state_dict)
+        defaults_by_fqn = self._legacy_group_defaults_by_fqn()
+        if not defaults_by_fqn:
+            return restored
+        if self.flatten:
+            for name, defaults in defaults_by_fqn.items():
+                for key, value in defaults.items():
+                    field = f"param_groups.{name}.{key}"
+                    restored[field] = value if overwrite else restored.get(field, value)
+        else:
+            restored["param_groups"] = []
+            for group in state_dict["param_groups"]:
+                defaults = {}
+                for name in group["params"]:
+                    defaults.update(defaults_by_fqn.get(name, {}))
+                normalized = dict(group, **defaults) if overwrite else dict(defaults, **group)
+                restored["param_groups"].append(normalized)
+        return restored
+
+    def state_dict_for_load(self) -> Dict[str, Any]:
+        """Build a load skeleton whose absent optional fields use legacy defaults.
+
+        Persisted values overwrite this skeleton during DCP loading. Normal
+        ``state_dict()`` and live optimizer groups retain the current recipe.
+        """
+        return self._with_legacy_group_defaults(self.state_dict(), overwrite=True)
+
     def _get_param_groups(self) -> List[Dict[str, Any]]:
         """Get param_groups aggregated over underlying optimizers."""
         param_groups: List[Dict[str, Any]] = []
@@ -245,6 +291,12 @@ class ChainedOptimizer:
         Args:
             state_dict: FQN-keyed optimizer state to restore.
         """
+        for optimizer in self.chained_optimizers:
+            validator = getattr(optimizer, "validate_checkpoint_state_dict", None)
+            if callable(validator):
+                validator(state_dict)
+        # Flattened state is unflattened before a leaf optimizer's load hook runs.
+        state_dict = self._with_legacy_group_defaults(state_dict)
         for optimizer in self.chained_optimizers:
             with self._optimizer_parameter_view():
                 set_optimizer_state_dict(

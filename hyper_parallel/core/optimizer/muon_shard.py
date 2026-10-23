@@ -207,18 +207,31 @@ def build_pad_ns_inputs(
         comm_params: List[torch.Tensor],
         param_to_ns_input: Dict[torch.Tensor, torch.Tensor],
         param_shard_metadata: Optional[Dict[torch.Tensor, ParamShardMeta]] = None,
+        dtype: Optional[torch.dtype] = None,
 ) -> List[torch.Tensor]:
-    """Build aligned local NS inputs for all communication params."""
+    """Build aligned local NS inputs for all communication params.
+
+    Args:
+        comm_params: Parameters participating in the collective.
+        param_to_ns_input: Locally available Newton-Schulz inputs.
+        param_shard_metadata: Optional local shapes for uneven parameter shards.
+        dtype: Collective dtype, including ranks without local gradients. When
+            omitted, preserve inference from local inputs or parameter storage.
+    """
     if not comm_params:
         return []
 
     ref_tensor = next(iter(param_to_ns_input.values()), None)
     default_dtype = ref_tensor.dtype if ref_tensor is not None else to_local_if_dtensor(comm_params[0].data).dtype
+    if dtype is not None:
+        default_dtype = dtype
     local_inputs: List[torch.Tensor] = []
 
     for param in comm_params:
         ns_input = param_to_ns_input.get(param)
         if ns_input is not None:
+            if dtype is not None and ns_input.dtype != dtype:
+                raise ValueError(f"NS input dtype {ns_input.dtype} does not match collective dtype {dtype}")
             local_inputs.append(ns_input)
             continue
 
