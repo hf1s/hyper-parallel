@@ -74,22 +74,63 @@ class TestJTPacked(unittest.TestCase):
             {name: p.grad for name, p in model.named_parameters() if p.grad is not None},
             gradients, rtol=0, atol=0)
 
-    def test_packed_mtp_preserves_reference_target_shift(self) -> None:
-        """Both projection paths preserve shifted labels without adding document-tail masks."""
+    def test_packed_mtp_keeps_document_inputs_and_targets(self) -> None:
+        """MTP inputs and supervision shift independently within each packed document."""
         tokens = torch.arange(1, 9).unsqueeze(0)
-        labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, -100]])
-        expected = torch.tensor([[3, 4, -100, 6, 7, 8, -100, -100]])
-        for chunked in (False, True):
-            with self.subTest(chunked=chunked):
+        for chunked, depth, ends in product((False, True), (1, 2), ((4, 8), (1, 4, 8))):
+            with self.subTest(chunked=chunked, depth=depth, ends=ends):
+                labels = tokens + 1
+                for boundary in ends:
+                    labels[:, boundary - 1] = -100
                 config = small_config()
-                config.num_nextn_predict_layers = 1
+                config.num_nextn_predict_layers = depth
                 config.enable_chunk_loss = chunked
                 model = JTDeepseekV3ForCausalLM(config)
                 method = "_projection_loss" if chunked else "_token_loss"
-                with patch.object(model, method, wraps=getattr(model, method)) as loss:
-                    model(tokens, labels, actual_seq_len=(4, 8))
-                self.assertEqual(loss.call_count, 2)
-                torch.testing.assert_close(loss.call_args_list[1].args[1], expected, rtol=0, atol=0)
+                embedded_inputs = []
+                handle = model.model.embed_tokens.register_forward_pre_hook(
+                    lambda _module, args: embedded_inputs.append(args[0].detach().clone()))
+                try:
+                    with patch.object(model, method, wraps=getattr(model, method)) as loss:
+                        model(tokens, labels, actual_seq_len=ends)
+                finally:
+                    handle.remove()
+                self.assertEqual(loss.call_count, depth + 1)
+                self.assertEqual(len(embedded_inputs), depth + 1)
+                for offset in range(1, depth + 1):
+                    expected_inputs = torch.zeros_like(tokens)
+                    expected_targets = torch.full_like(labels, -100)
+                    start = 0
+                    for boundary in ends:
+                        if boundary - start > offset:
+                            expected_inputs[:, start:boundary - offset] = tokens[:, start + offset:boundary]
+                            expected_targets[:, start:boundary - offset] = labels[:, start + offset:boundary]
+                        start = boundary
+                    torch.testing.assert_close(embedded_inputs[offset], expected_inputs, rtol=0, atol=0)
+                    torch.testing.assert_close(loss.call_args_list[offset].args[1], expected_targets, rtol=0, atol=0)
+
+    def test_packed_lm_mtp_equal_independent_documents(self) -> None:
+        """Packed losses and gradients equal token-weighted independent document runs."""
+        torch.manual_seed(8)
+        config = small_config()
+        config.moe_aux_loss_coeff = 0.0
+        config.num_nextn_predict_layers = 2
+        packed = JTDeepseekV3ForCausalLM(config)
+        separate = copy.deepcopy(packed)
+        tokens = torch.arange(1, 9).unsqueeze(0)
+        labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, -100]])
+        output = packed(tokens, labels, actual_seq_len=(4, 8)).loss
+        left = separate(tokens[:, :4], labels[:, :4]).loss
+        right = separate(tokens[:, 4:], labels[:, 4:]).loss
+        keys = ("foundation_loss/lm", "foundation_loss/mtp")
+        expected = {key: (left[key] + right[key]) / 2 for key in keys}
+        for key in keys:
+            torch.testing.assert_close(output[key], expected[key], rtol=2e-5, atol=2e-6)
+        sum(output[key] for key in keys).backward()
+        sum(expected.values()).backward()
+        torch.testing.assert_close(
+            {name: parameter.grad for name, parameter in packed.named_parameters()},
+            {name: parameter.grad for name, parameter in separate.named_parameters()}, rtol=3e-4, atol=2e-6)
 
     def test_chunked_lm_mtp_preserves_packed_losses_and_gradients(self) -> None:
         """Feature: Chunk loss for packed LM and MTP objectives.

@@ -818,6 +818,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                 or sequence_start < 0 or sequence_start + sequence_length > ends[-1]):
             raise ValueError("JT cumulative document ends must increase and cover the local token interval")
         indices = torch.arange(sequence_start, sequence_start + sequence_length, device=input_ids.device)
+        sequence_end_mask = None
+        if len(ends) > 1:
+            boundaries = indices.new_tensor((0, *ends))
+            documents = torch.bucketize(indices, boundaries[1:], right=True)
+            sequence_end_mask = (indices + 1 == boundaries[documents + 1]).unsqueeze(0)
         absolute_positions = indices.unsqueeze(0)
         if position_ids is not None and position_ids.shape != input_ids.shape:
             raise ValueError("JT position_ids must match input_ids")
@@ -842,20 +847,23 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         normalized = self.model.norm(hidden)
         lm_loss = (self._projection_loss(normalized, targets) if self.enable_chunk_loss
                    else self._token_loss(self.lm_head(normalized), labels, loss_mask))
-        # Match the reference objective: shift across the pack and retain the supplied label mask.
+        # Future-token inputs and supervision must stay inside their attention-isolated document.
         mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens,
                               head=None if self.enable_chunk_loss else self.lm_head,
-                              decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs)
+                              decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs,
+                              sequence_end_mask=sequence_end_mask)
         for layer in self.mtp.layers:
             auxiliary = auxiliary + layer.transformer_layer.mlp.pop_auxiliary_loss()
         shift_targets = partial(self.shift_mtp_inputs, pad_value=-100)
         if self.enable_chunk_loss:
             mtp_loss = torch.zeros_like(lm_loss)
             depths = len(mtp_output.prediction_hidden_states)
-            targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets)
+            targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets,
+                                                sequence_end_mask=sequence_end_mask)
             for prediction, future_targets in zip(mtp_output.prediction_hidden_states, targets_by_depth):
                 mtp_loss = mtp_loss + self._projection_loss(prediction, future_targets) * (cfg.mtp_loss_factor / depths)
         else:
             mtp_loss = calculate_mtp_loss(mtp_output.logits, targets, self._mtp_token_loss, vocab_size=cfg.vocab_size,
-                                          loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets)
+                                          loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets,
+                                          sequence_end_mask=sequence_end_mask)
         return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}
