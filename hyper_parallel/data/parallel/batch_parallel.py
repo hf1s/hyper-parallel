@@ -217,6 +217,8 @@ class CPBatchSharder:
             "labels": canonical_batch["labels"],
         }
 
+        if "attention_token_count" in canonical_batch:
+            cp_batch["attention_token_count"] = canonical_batch["attention_token_count"]
         cp_size = self.parallel_context.cp_world_size
         if cp_size <= 1:
             return cp_batch
@@ -226,8 +228,8 @@ class CPBatchSharder:
             raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size})")
 
         cp_rank = self.parallel_context.cp_rank
-        for field, value in cp_batch.items():
-            local_value = torch.chunk(value, cp_size, dim=1)[cp_rank]
+        for field in ("input_ids", "labels"):
+            local_value = torch.chunk(cp_batch[field], cp_size, dim=1)[cp_rank]
             cp_batch[field] = local_value.contiguous()
 
         return cp_batch
@@ -332,24 +334,26 @@ class TPBatchBroadcaster:
             batch_size, seq_len = parallel_batch["input_ids"].shape
             num_boundaries = 0 if local_cu_seq_lens is None else local_cu_seq_lens.numel()
             batch_meta = torch.tensor(
-                [batch_size, seq_len, num_boundaries],
+                [batch_size, seq_len, num_boundaries, int(cp_local_batch.get("attention_token_count", -1))],
                 dtype=torch.int64,
                 device=self.device,
             )
         else:
-            batch_meta = torch.empty((3,), dtype=torch.int64, device=self.device)
+            batch_meta = torch.empty((4,), dtype=torch.int64, device=self.device)
 
         tp_group = self.parallel_context.tp_group
         dist.broadcast(batch_meta, group=tp_group, group_src=0)
 
         # Non-source TP ranks allocate the same device shapes and dtypes.
         if tp_rank != 0:
-            batch_size, seq_len, num_boundaries = [int(value) for value in batch_meta.tolist()]
+            batch_size, seq_len, num_boundaries, attention_tokens = [int(value) for value in batch_meta.tolist()]
             shape = (batch_size, seq_len)
             parallel_batch = {
                 "input_ids": torch.empty(shape, dtype=torch.int64, device=self.device),
                 "labels": torch.empty(shape, dtype=torch.int64, device=self.device),
             }
+            if attention_tokens >= 0:
+                parallel_batch["attention_token_count"] = batch_meta[3:4]
             if num_boundaries > 0:
                 local_cu_seq_lens = torch.empty((num_boundaries,), dtype=torch.int32, device=self.device)
 

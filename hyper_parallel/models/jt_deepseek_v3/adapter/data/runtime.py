@@ -25,7 +25,7 @@ class JTSequenceRuntime(RuntimeInputAdapter):
 
     def runtime_input_fields(self) -> tuple[str, ...]:
         """Declare the model-owned cumulative-length input."""
-        return ("actual_seq_len",)
+        return ("actual_seq_len", "attention_seq_len")
 
     def build_runtime_inputs(self, *, batch: Mapping[str, Any],
                              context: RuntimeInputContext) -> Mapping[str, Any]:
@@ -44,4 +44,13 @@ class JTSequenceRuntime(RuntimeInputAdapter):
                 or values[-1] != global_length
                 or any(left >= right for left, right in zip(values, values[1:]))):
             raise ValueError("JT packed boundaries must cover one global batch-one sequence")
-        return {"actual_seq_len": values[1:]}
+        inputs = {"actual_seq_len": values[1:]}
+        if "attention_token_count" in batch:
+            count = int(batch["attention_token_count"])
+            if count == global_length:
+                inputs["attention_seq_len"] = values[1:]
+            elif len(values) >= 3 and count == values[-2]:
+                inputs["attention_seq_len"] = values[1:-1]
+            else:
+                raise ValueError("Attention tokens must end at the document boundary before trailing padding")
+        return inputs

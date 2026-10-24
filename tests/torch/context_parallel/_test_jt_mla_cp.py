@@ -104,11 +104,12 @@ def _build_pair(tp, sp, strategy):
     return models, mesh
 
 
-def _backward(model, optimizer, mesh, inputs, labels, sequence_ends=None):
+def _backward(model, optimizer, mesh, inputs, labels, sequence_ends=None, attention_ends=None):
     optimizer.zero_grad()
     loss_context = loss_parallel(mesh=mesh.device_mesh["tp"]) if mesh.loss_parallel else nullcontext()
     with SkipDTensorDispatch(), loss_context:
-        output = model(input_ids=inputs, shift_labels=labels, actual_seq_len=sequence_ends)
+        output = model(input_ids=inputs, shift_labels=labels, actual_seq_len=sequence_ends,
+                       attention_seq_len=attention_ends)
         assert all(loss.dtype == torch.float32 for loss in output.loss.values())
         count = labels.ge(0).sum()
         if mesh.sequence_parallel:
@@ -156,16 +157,18 @@ def _training_case(tp, sp, strategy):
         # A one-row offset slice is already contiguous and still aliases input IDs.
         inputs, labels = tokens[:, :-1].contiguous(), tokens[:, 1:].clone()
         labels[:, 17::29] = -100
-        sequence_ends = None
+        sequence_ends = attention_ends = None
         if _step == 1:
             # Boundaries cross shards and coincide with a shard edge; supervision exists only in the last shard.
-            sequence_ends = (37, 128, 177, 256)
+            sequence_ends = (37, 128, 177, 239, 256)
+            attention_ends = sequence_ends[:-1]
             labels[:, :192] = -100
+            labels[:, 239:] = -100
             labels[:, [end - 1 for end in sequence_ends]] = -100
         assert inputs.min() >= 0
-        expected = _backward(*models[0], inputs, labels, sequence_ends)
+        expected = _backward(*models[0], inputs, labels, sequence_ends, attention_ends)
         actual = _backward(*models[1], inputs.chunk(mesh.cp_size, 1)[rank].contiguous(),
-                           labels.chunk(mesh.cp_size, 1)[rank].contiguous(), sequence_ends)
+                           labels.chunk(mesh.cp_size, 1)[rank].contiguous(), sequence_ends, attention_ends)
         if dist.get_rank() == 0:
             print({"strategy": strategy, "tp": tp, "cp": mesh.cp_size, "sp": sp, "step": _step + 1,
                    "reference": {key: value.item() for key, value in expected.items()},

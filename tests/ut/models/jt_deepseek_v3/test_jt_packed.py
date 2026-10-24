@@ -220,3 +220,24 @@ class TestJTPacked(unittest.TestCase):
                 config = small_config()
                 setattr(config, option, value)
                 JTDeepseekV3ForCausalLM(config)
+
+
+    def test_attention_padding_preserves_real_lm_mtp_losses_and_gradients(self) -> None:
+        """Skipping Attention padding matches a cropped reference for both MTP depths."""
+        torch.manual_seed(39)
+        config = small_config()
+        config.moe_aux_loss_coeff = 0.0
+        config.num_nextn_predict_layers = 2
+        model = JTDeepseekV3ForCausalLM(config)
+        reference = copy.deepcopy(model)
+        inputs = torch.arange(1, 13).unsqueeze(0)
+        labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, -100, -100, -100, -100, -100]])
+        actual = model(inputs, labels, actual_seq_len=(4, 8, 12), attention_seq_len=(4, 8)).loss
+        expected = reference(inputs[:, :8], labels[:, :8], actual_seq_len=(4, 8)).loss
+        for key in ("foundation_loss/lm", "foundation_loss/mtp"):
+            torch.testing.assert_close(actual[key], expected[key], rtol=2e-5, atol=2e-6)
+        sum(actual.values()).backward()
+        sum(expected.values()).backward()
+        torch.testing.assert_close(
+            {name: parameter.grad for name, parameter in model.named_parameters()},
+            {name: parameter.grad for name, parameter in reference.named_parameters()}, rtol=3e-4, atol=2e-6)

@@ -128,12 +128,12 @@ def _expanded_overlap_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAConte
 
 def _observed_attention(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
                         query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                        sequence_ends: tuple[int, ...]) -> torch.Tensor:
+                        sequence_ends: tuple[int, ...], attention_ends: tuple[int, ...] | None = None) -> torch.Tensor:
     """Keep statistics in persistent TP-head coordinates for the existing clip reducer."""
     observer = SimpleNamespace(max_logits_val=None, is_causal=True)
     output, _ = module.attention_interface(
         observer, query, key, value, None,
-        dropout=0.0, scaling=module.scaling, actual_seq_len=sequence_ends,
+        dropout=0.0, scaling=module.scaling, actual_seq_len=sequence_ends, attention_seq_len=attention_ends,
     )
     with torch.no_grad():
         maximum = observer.max_logits_val
@@ -191,7 +191,8 @@ def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: A
 
     @wraps(original)
     def forward(hidden_states: torch.Tensor, position_embeddings: Any = None, attention_mask: Any = None,
-                past_key_values: Any = None, actual_seq_len: Any = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
+                past_key_values: Any = None, actual_seq_len: Any = None,
+                attention_seq_len: tuple[int, ...] | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
         """Compute contiguous causal shards using the model's original projection children."""
         if attention_mask is not None or past_key_values is not None or position_embeddings is None:
             raise ValueError("JT MLA CP requires explicit RoPE positions, no mask and no KV cache")
@@ -225,7 +226,8 @@ def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: A
         query = query.transpose(1, 2).contiguous().transpose(1, 2)
         key = key.transpose(1, 2).contiguous().transpose(1, 2)
         value = value.transpose(1, 2).contiguous().transpose(1, 2)
-        output = runtime.restore(_observed_attention(target_module, runtime, query, key, value, sequence_ends))
+        output = runtime.restore(_observed_attention(
+            target_module, runtime, query, key, value, sequence_ends, attention_seq_len))
         return target_module.o_proj(output.reshape(1, local_sequence, -1).contiguous()), None
 
     requests = [_ForwardRewriteRequest(target_module, forward, companion_attrs={"mla_cp_runtime": runtime})]
