@@ -32,16 +32,25 @@ class JTSequenceRuntime(RuntimeInputAdapter):
         """Convert global leading-zero boundaries once at the data/model boundary.
 
         Args:
-            batch: Local tokens and global cumulative document boundaries.
-            context: Local sequence shape and CP degree from the public data path.
+            batch: Local tokens and global cumulative document boundaries of
+                the flattened rows.
+            context: Local row shape and CP degree from the public data path.
         """
         boundaries = batch.get("cu_seq_lens")
         if boundaries is None:
             return {}
         values = tuple(int(value) for value in boundaries.tolist())
-        global_length = context.local_input_shape[1] * context.parallel_sizes["cp"]
-        if (context.local_input_shape[0] != 1 or len(values) < 2 or values[0] != 0
+        batch_size, local_length = context.local_input_shape
+        cp_size = context.parallel_sizes["cp"]
+        if batch_size > 1 and cp_size > 1:
+            # CP slices one global stream; rows would interleave non-contiguous
+            # intervals, so the varlen metadata could no longer describe them.
+            raise ValueError("JT packed rows require cp_size == 1")
+        global_length = batch_size * local_length * cp_size
+        if (batch_size < 1 or len(values) < 2 or values[0] != 0
                 or values[-1] != global_length
                 or any(left >= right for left, right in zip(values, values[1:]))):
-            raise ValueError("JT packed boundaries must cover one global batch-one sequence")
+            raise ValueError(
+                "JT packed boundaries must cover the flattened global batch: "
+                f"expected end {global_length}, got {values[-1] if values else None}")
         return {"actual_seq_len": values[1:]}

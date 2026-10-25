@@ -476,3 +476,11 @@ The packing collator preserves internal boundaries before alignment padding.
 wholly unsupervised records offline, or use the existing source-filtering path.
 Dataset creation and sequence-length changes belong to
 external offline preparation; no Arrow-to-indexed conversion is required.
+
+`micro_batch_size > 1` means independent rows, not a longer pack. Build the
+collator with `pack_across_samples=False` (or pass the flag through
+`build_online_text_collate_fn`): every sample must share one token count, each
+row keeps its own document ends, and alignment padding becomes one synthetic
+segment per row. `cu_seq_lens` then spans the flattened rows, so the JT runtime
+accepts it only with `cp_size == 1`; keep the default packing for context
+parallelism.
