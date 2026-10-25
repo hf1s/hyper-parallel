@@ -14,6 +14,8 @@
 # ============================================================================
 """MoE auxiliary (load-balancing) loss objectives."""
 
+from __future__ import annotations
+
 from typing import Any, Optional
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
@@ -56,6 +58,8 @@ def calculate_seq_aux_loss(
     *,
     coeff: float,
     sequence_partition_group: Optional[Any] = None,
+    sequence_ids: torch.Tensor | None = None,
+    num_sequences: int | None = None,
 ) -> torch.Tensor:
     """DeepSeek-V3 complementary sequence-wise aux loss ``coeff * E * sum_i(f_i * P_i)``.
 
@@ -83,10 +87,16 @@ def calculate_seq_aux_loss(
         coeff: Aux loss coefficient.
         sequence_partition_group: Optional process group whose ranks hold different
             token shards of the same sequences; ``None`` keeps the statistics local.
+        sequence_ids: Optional original-sample IDs per token, with -1 excluding padding.
+            Allows variable lengths and uneven partitions without padded score tensors.
+        num_sequences: Global number of samples when ``sequence_ids`` is supplied.
 
     Returns:
         The 0-d aux loss.
     """
+    if sequence_ids is not None:
+        return _grouped_sequence_aux(scores, selected_experts, sequence_ids, num_sequences,
+                                     coeff, sequence_partition_group)
     num_experts = scores.shape[-1]
     num_sequences = scores.shape[:-2].numel()
     slots = selected_experts.reshape(num_sequences, -1)
@@ -103,6 +113,32 @@ def calculate_seq_aux_loss(
     affinity = normalized.reshape(num_sequences, -1, num_experts).mean(-2)
     loss = (affinity * load).sum(-1).mean() * num_experts * coeff
     return _replicated_group_mean(loss, sequence_partition_group)
+
+
+def _grouped_sequence_aux(scores: torch.Tensor, selected: torch.Tensor, sequence_ids: torch.Tensor,
+                          num_sequences: int, coeff: float, group: Any) -> torch.Tensor:
+    """Accumulate sample statistics without giving alignment tokens any routing weight."""
+    if sequence_ids.shape != scores.shape[:-1] or not isinstance(num_sequences, int) or num_sequences < 1:
+        raise ValueError("Grouped sequence aux requires token-aligned IDs and a positive sample count")
+    experts, top_k = scores.shape[-1], selected.shape[-1]
+    ids = sequence_ids.flatten()
+    real = ids.ge(0)
+    ids = ids.clamp_min(0)
+    slots = (ids.unsqueeze(-1) * experts + selected.reshape(-1, top_k)).flatten()
+    weights = real.unsqueeze(-1).expand(-1, top_k).flatten().float()
+    counts = scores.new_zeros(num_sequences * experts).scatter_add_(0, slots, weights)
+    lengths = scores.new_zeros(num_sequences).scatter_add_(0, ids, real.float())
+    if group is not None:
+        dist.all_reduce(counts, group=group)
+        dist.all_reduce(lengths, group=group)
+    normalized = scores / (scores.sum(-1, keepdim=True) + 1e-20)
+    affinities = scores.new_zeros(num_sequences, experts).index_add_(
+        0, ids, normalized.reshape(-1, experts) * real.unsqueeze(-1))
+    denominator = lengths.clamp_min(1).unsqueeze(-1)
+    load = counts.view(num_sequences, experts) / (denominator * top_k)
+    local_loss = (affinities / denominator * load).sum() * (experts * coeff / num_sequences)
+    degree = 1 if group is None else dist.get_world_size(group)
+    return _replicated_group_mean(local_loss * degree, group)
 
 
 __all__ = ["calculate_seq_aux_loss"]

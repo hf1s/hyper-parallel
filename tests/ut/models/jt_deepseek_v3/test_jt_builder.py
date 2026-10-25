@@ -92,7 +92,7 @@ class TestJTBuilder(unittest.TestCase):
             with self.subTest(recipe=filename):
                 document = yaml.safe_load((root / "examples/training_demo/jt_deepseek_v3" / filename).read_text())
                 recipe = resolve_config(document)
-                self.assertFalse(document["dataloader"]["get_batch"]["reset_position_ids"])
+                self.assertTrue(document["dataloader"]["get_batch"]["reset_position_ids"])
                 self.assertNotIn("use_fused_norm", document["model"]["config"])
                 self.setup.module_replacements = entries_to_module_replacements(recipe.plan_overrides)
                 model = self.build()
@@ -149,7 +149,7 @@ class TestJTBuilder(unittest.TestCase):
         with patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
                    side_effect=_cpu_grouped_swiglu):
             output = model(tokens, (tokens + 1) % self.config["vocab_size"])
-        self.assertEqual(set(output.loss), {"foundation_loss/lm", "foundation_loss/mtp", "foundation_loss/aux"})
+        self.assertEqual(set(output.loss), {"foundation_loss/lm", "foundation_loss/mtp_1", "foundation_loss/aux"})
         loss = sum(output.loss.values())
         self.assertTrue(torch.isfinite(loss))
         loss.backward()

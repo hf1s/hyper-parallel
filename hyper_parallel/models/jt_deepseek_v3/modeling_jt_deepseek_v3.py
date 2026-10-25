@@ -37,7 +37,7 @@ from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
 )
 
 from hyper_parallel.components.functional import moe_token_unpermute
-from hyper_parallel.components.losses import calculate_mtp_loss, calculate_seq_aux_loss
+from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.losses.mtp import iter_mtp_targets
 from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP, shift_mtp_sequence
@@ -50,6 +50,7 @@ from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_single
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.models.replacement import module_replacement
+from hyper_parallel.models.jt_deepseek_v3.adapter.data.packing import JTPackedSequence
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
 
@@ -158,6 +159,9 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         The attention output, ``[batch, sequence, heads, v_head_dim]``, and ``None``.
     """
     batch_size, _, query_length, head_dim = query.shape
+    query_token_mask = kwargs.pop("query_token_mask", None)
+    if query_token_mask is not None and query_token_mask.shape != (batch_size, query_length):
+        raise ValueError("JT QK observation mask must match the physical query tokens")
     query_lengths, key_lengths = resolve_packed_sequence_lengths(
         kwargs, batch_size * query_length, key.shape[0] * key.shape[2])
     pre_tokens, next_tokens, sparse_mode, window, causal = _attention_options(module, kwargs)
@@ -174,7 +178,15 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
         softmax_layout="TND" if layout == "TND" else "")
     with torch.no_grad():
         # TND kernels otherwise return statistics in NTD order.
-        maximum = result[1].amax(dim=(0, 2) if layout == "TND" else (0, 2, 3))
+        statistics = result[1]
+        if query_token_mask is not None:
+            valid_queries = (query_token_mask.reshape(-1, 1) if layout == "TND"
+                             else query_token_mask[:, None, :])
+            # Reduce the kernel's repeated statistics first, avoiding another full-size copy.
+            statistics = statistics.amax(dim=-1).masked_fill(~valid_queries, float("-inf"))
+            maximum = statistics.amax(dim=0 if layout == "TND" else (0, 2)).clamp_min(0)
+        else:
+            maximum = statistics.amax(dim=(0, 2) if layout == "TND" else (0, 2, 3)).clamp_min(0)
         if module.max_logits_val is None:
             module.max_logits_val = torch.zeros_like(maximum)
         module.max_logits_val.copy_(torch.maximum(module.max_logits_val, maximum))
@@ -363,8 +375,13 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         else:
             lengths, _ = resolve_packed_sequence_lengths(kwargs, batch * sequence, batch * sequence)
             if lengths is not None:
-                if batch != 1 or attention_mask is not None:
-                    raise ValueError("JT packed attention requires batch one and no explicit mask")
+                if attention_mask is not None:
+                    raise ValueError("JT packed attention requires no explicit mask")
+                # Match the NPU TND token order while retaining per-document SDPA calls.
+                query, key, value = [
+                    states.transpose(1, 2).flatten(0, 1).transpose(0, 1).unsqueeze(0)
+                    for states in (query, key, value)
+                ]
                 starts = (0, *lengths[:-1])
                 output = torch.cat([
                     # Pylint cannot infer this Torch C-extension callable.
@@ -373,10 +390,11 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
                         is_causal=True, scale=self.scaling)
                     for begin, end in zip(starts, lengths)
                 ], dim=2)
+                output = output.transpose(1, 2).reshape(batch, sequence, self.num_heads, self.v_head_dim)
             else:
                 output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask,
                                                         is_causal=attention_mask is None, scale=self.scaling)
-            output = output.transpose(1, 2)
+                output = output.transpose(1, 2)
         return self.o_proj(output.reshape(batch, sequence, -1)), None
 
 
@@ -440,37 +458,49 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.auxiliary_loss = None
         # Routed-token counts since the last bias update; the optimizer hook sums them over the batch.
         self.tokens_per_expert = None
+        self.routing_sequence_ids = None
+        self.routing_num_sequences = None
 
     def route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Select experts for the real tokens, record the auxiliary loss and count routed tokens.
 
         Args:
-            hidden: Hidden states led by ``padding`` pad tokens, ``[1, padding + tokens, hidden]``.
+            hidden: Hidden states led by ``padding`` pad tokens per row,
+                ``[batch, padding + tokens, hidden]``.
 
         Returns:
-            Expert indices and routing weights, ``[padding + tokens, top_k]``; the pad
+            Expert indices and routing weights, ``[batch * (padding + tokens), top_k]``; the pad
             tokens cover every expert with zero weight.
         """
         padding, config = self.padding, self.config
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
-        scores = self.gate.pop_router_logits().sigmoid()
+        scores = self.gate.pop_router_logits().sigmoid().reshape(*hidden.shape[:2], -1)
         # The sequence objective measures raw affinities, independently of dispatch bias and group filtering.
         auxiliary_indices = scores.topk(indices.shape[-1], dim=-1, sorted=False).indices
-        auxiliary_loss = self.routing_statistics(auxiliary_indices, scores)
+        auxiliary_loss = self.routing_statistics(auxiliary_indices, scores,
+                                                 sequence_ids=self.routing_sequence_ids,
+                                                 num_sequences=self.routing_num_sequences)
         # Replay must keep the same tensor operations without retaining its graph on the module.
         if not is_recomputing():
             self.auxiliary_loss = auxiliary_loss
         flat_indices = indices.reshape(-1)
         # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
+        real_slots = (flat_indices.new_ones(flat_indices.shape, dtype=torch.float32)
+                      if self.routing_sequence_ids is None else
+                      self.routing_sequence_ids.ge(0).unsqueeze(-1).expand_as(auxiliary_indices).reshape(-1).float())
         counts = flat_indices.new_zeros(config.n_routed_experts, dtype=torch.float32).scatter_add_(
-            0, flat_indices, flat_indices.new_ones(flat_indices.shape, dtype=torch.float32))
+            0, flat_indices, real_slots)
         self.tokens_per_expert = counts if self.tokens_per_expert is None else self.tokens_per_expert + counts
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
-            indices = torch.cat((pad_ids, indices))
-            selected = torch.cat((selected.new_zeros(padding, selected.shape[-1]), selected))
+            batch, tokens = hidden.shape[:2]
+            indices = torch.cat((pad_ids.expand(batch, -1, -1), indices.reshape(batch, tokens, -1)), dim=1)
+            selected = torch.cat((selected.new_zeros(batch, padding, selected.shape[-1]),
+                                  selected.reshape(batch, tokens, -1)), dim=1)
+            indices = indices.flatten(0, 1)
+            selected = selected.flatten(0, 1)
         return indices, selected
 
     def pop_auxiliary_loss(self) -> torch.Tensor:
@@ -487,15 +517,20 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             raise RuntimeError("No auxiliary loss is available; run the MoE forward before consuming it")
         return loss
 
-    def routing_statistics(self, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+    def routing_statistics(self, indices: torch.Tensor, scores: torch.Tensor, *,
+                           sequence_ids: torch.Tensor | None = None,
+                           num_sequences: int | None = None) -> torch.Tensor:
         """Compute the sequence objective separately from step-level router counts.
 
         Args:
             indices: Unbiased affinity TopK indices for the real, unpadded tokens.
             scores: Router affinities before top-k normalization.
+            sequence_ids: Original sample IDs, excluding padding with -1.
+            num_sequences: Number of original samples in the packed batch.
         """
         return calculate_seq_aux_loss(scores, indices, coeff=self.config.moe_aux_loss_coeff,
-                                      sequence_partition_group=self.auxiliary_loss_group)
+                                      sequence_partition_group=self.auxiliary_loss_group,
+                                      sequence_ids=sequence_ids, num_sequences=num_sequences)
 
     @torch.no_grad()
     def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
@@ -526,7 +561,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         index_add_; enabling EP can therefore change floating-point results.
 
         Args:
-            hidden: Pad-prefixed hidden states, ``[1, padding + tokens, hidden]``.
+            hidden: Pad-prefixed hidden states, ``[batch, padding + tokens, hidden]``.
 
         Returns:
             The weighted routed-expert output, shaped like ``hidden``.
@@ -560,19 +595,30 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         del owner, hidden
         return routed
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *, sequence_ids: torch.Tensor | None = None,
+                num_sequences: int | None = None, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Run the routed experts on pad-prefixed tokens and add the shared experts.
 
         Args:
-            hidden_states: Hidden states, ``[1, tokens, hidden]``.
+            hidden_states: Hidden states, ``[batch, tokens, hidden]``.
+            sequence_ids: Original sample IDs per token, -1 for padding.
+            num_sequences: Global number of original samples.
+            token_mask: Real future-token positions, including the current MTP depth.
 
         Returns:
             The MoE output, shaped like ``hidden_states``.
         """
         hidden = hidden_states
         if self.padding:
-            hidden = torch.cat((hidden.new_zeros(1, self.padding, hidden.shape[-1]), hidden), dim=1)
-        routed = self.ep_compute(hidden)
+            hidden = torch.cat((hidden.new_zeros(hidden.shape[0], self.padding, hidden.shape[-1]), hidden), dim=1)
+        self.routing_sequence_ids = (sequence_ids if token_mask is None or sequence_ids is None
+                                     else sequence_ids.masked_fill(~token_mask, -1))
+        self.routing_num_sequences = num_sequences
+        try:
+            routed = self.ep_compute(hidden)
+        finally:
+            self.routing_sequence_ids = None
+            self.routing_num_sequences = None
         return routed[:, self.padding:] + self.shared_experts(hidden_states)
 
 
@@ -596,7 +642,9 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: Any = None,
                 position_ids: Any = None, past_key_values: Any = None, use_cache: bool = False,
-                position_embeddings: Any = None, **kwargs: Any) -> torch.Tensor:
+                position_embeddings: Any = None, sequence_ids: torch.Tensor | None = None,
+                num_sequences: int | None = None, token_mask: torch.Tensor | None = None,
+                **kwargs: Any) -> torch.Tensor:
         """Apply the attention and MLP sublayers, each with a residual connection.
 
         Args:
@@ -606,6 +654,9 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
             past_key_values: Must be ``None``; cached decoding is unsupported.
             use_cache: Must be ``False``.
             position_embeddings: Rotary ``(cos, sin)`` tables.
+            sequence_ids: Original-sample routing groups.
+            num_sequences: Number of original samples.
+            token_mask: Real positions for routing statistics.
             **kwargs: Attention kernel options.
 
         Returns:
@@ -622,11 +673,14 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
+            query_token_mask=token_mask,
             **kwargs,
         )
         hidden_states = residual + branch
         residual = hidden_states
-        branch = self.mlp(self.post_attention_layernorm(residual))
+        mlp_inputs = self.post_attention_layernorm(residual)
+        branch = (self.mlp(mlp_inputs, sequence_ids=sequence_ids, num_sequences=num_sequences, token_mask=token_mask)
+                  if hasattr(self.mlp, "pop_auxiliary_loss") else self.mlp(mlp_inputs))
         return residual + branch
 
 
@@ -718,11 +772,12 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
     def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None, *,
                 labels: torch.Tensor | None = None, position_ids: torch.Tensor | None = None,
                 attention_mask: torch.Tensor | None = None, use_cache: bool = False,
-                actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0) -> JTDeepseekV3Output:
+                actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0,
+                sample_ranges: tuple[tuple[int, int], ...] | None = None) -> JTDeepseekV3Output:
         """Compute the JT training losses of one batch.
 
         Args:
-            input_ids: Token IDs, ``[1, sequence]``.
+            input_ids: Token IDs, ``[batch, sequence]``; CP requires batch one.
             shift_labels: Targets already shifted by one token; negative targets are ignored.
             labels: Unused; ``shift_labels`` carries the supervision.
             position_ids: Sequence positions for RoPE.
@@ -730,10 +785,10 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             use_cache: Must be ``False``.
             actual_seq_len: Global cumulative document ends, without a leading zero.
             sequence_start: Global offset of the local input interval.
+            sample_ranges: Original sample intervals excluding alignment padding.
 
         Returns:
-            Output whose ``loss`` maps ``foundation_loss/lm``, ``foundation_loss/mtp`` and
-            ``foundation_loss/aux`` to 0-d losses.
+            Output with LM, per-depth MTP and sample-mean auxiliary losses.
 
         Raises:
             ValueError: If ``attention_mask`` is given, ``shift_labels`` is missing or cached
@@ -748,11 +803,12 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT does not support cached decoding")
         # Same rule as the shared text batch's loss mask; JT data folds its 0/1 mask into the labels.
         losses = self.compute_jt_losses(input_ids, shift_labels, shift_labels >= 0, position_ids=position_ids,
-                                        actual_seq_len=actual_seq_len, sequence_start=sequence_start)
-        # ``<token-domain>_loss[/<name>]`` keys: every JT objective is weighted by foundation tokens.
+                                        actual_seq_len=actual_seq_len, sequence_start=sequence_start,
+                                        sample_ranges=sample_ranges)
         return JTDeepseekV3Output(loss={
             "foundation_loss/lm": losses["lm_loss"],
-            "foundation_loss/mtp": losses["mtp_loss"],
+            **{f"foundation_loss/mtp_{depth}": losses[f"mtp_loss/{depth}"]
+               for depth in range(1, self.config.num_nextn_predict_layers + 1)},
             "foundation_loss/aux": losses["aux_loss"],
         })
 
@@ -781,48 +837,48 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         """Shift future inputs or targets; adapters may supply partition boundary values."""
         return shift_mtp_sequence(value, pad_value=pad_value)
 
-    def _mtp_token_loss(self, *, logits: torch.Tensor, shift_labels: torch.Tensor,
-                        **kwargs: Any) -> torch.Tensor:
-        """Use the same objective normalization for LM and each future prediction depth."""
-        del kwargs
-        return self._token_loss(logits, shift_labels, shift_labels >= 0)
-
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                           loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None,
-                          actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0
+                          actual_seq_len: tuple[int, ...] | None = None, sequence_start: int = 0,
+                          sample_ranges: tuple[tuple[int, int], ...] | None = None,
                           ) -> dict[str, torch.Tensor]:
         """Compute the LM, MTP and router auxiliary losses on pre-shifted labels.
 
+        Every row of the batch is an independent sequence; rows must share one
+        token count so their positions, chunks and MTP shifts stay aligned.
+
         Args:
-            input_ids: Token IDs, ``[1, sequence]``.
+            input_ids: Token IDs, ``[batch, sequence]``.
             labels: Targets already shifted by one token.
             loss_mask: Mask of the supervised targets.
-            position_ids: Compatibility input from the batch processor; JT derives continuous positions locally.
-            actual_seq_len: Global cumulative ends of independent documents.
-            sequence_start: Global offset of the local input interval.
+            position_ids: Optional explicit RoPE positions; defaults to per-document positions.
+            actual_seq_len: Flattened global cumulative ends of independent documents across rows.
+            sequence_start: Global offset of the local input interval inside one row.
+            sample_ranges: Original-sample intervals; gaps contain alignment tokens.
 
         Returns:
             ``lm_loss``, ``mtp_loss`` and ``aux_loss`` as 0-d tensors.
 
         Raises:
-            ValueError: If the inputs are not one sequence with matching shapes.
+            ValueError: If the inputs are not shape-compatible rows with matching boundaries.
         """
         cfg = self.config
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise ValueError("JT sequence loss currently requires a two-dimensional batch-one input")
-        sequence_length = input_ids.shape[1]
+        if input_ids.ndim != 2 or input_ids.numel() == 0:
+            raise ValueError("JT sequence loss requires a nonempty two-dimensional [batch, sequence] input")
+        batch_size, sequence_length = input_ids.shape
         if labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
             raise ValueError("Tokens, pre-shifted labels and loss mask must have identical shapes")
-        ends = (sequence_length,) if actual_seq_len is None else tuple(actual_seq_len)
-        if (not ends or ends[0] <= 0 or any(left >= right for left, right in zip(ends, ends[1:]))
-                or sequence_start < 0 or sequence_start + sequence_length > ends[-1]):
-            raise ValueError("JT cumulative document ends must increase and cover the local token interval")
-        indices = torch.arange(sequence_start, sequence_start + sequence_length, device=input_ids.device)
-        absolute_positions = indices.unsqueeze(0)
+        if actual_seq_len is None:
+            if batch_size != 1:
+                raise ValueError("JT packed rows require explicit cumulative document ends")
+            ends = (sequence_length,)
+        else:
+            ends = tuple(actual_seq_len)
+        sequence = JTPackedSequence(input_ids, ends, sample_ranges=sample_ranges, sequence_start=sequence_start)
         if position_ids is not None and position_ids.shape != input_ids.shape:
             raise ValueError("JT position_ids must match input_ids")
-        # Derive continuous positions locally, including the offset of a CP slice.
-        position_ids = absolute_positions
+        if position_ids is None:
+            position_ids = sequence.position_ids
         # NumPy FP32 inverse frequencies match MindFormers bitwise; torch.pow rounds some entries differently.
         dim = cfg.qk_rope_head_dim
         inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
@@ -831,31 +887,33 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         frequency = torch.cat((frequency, frequency), dim=-1)
         hidden = self.model.embed_tokens(input_ids)
         # FP32 tables; JTDeepseekV3RotaryEmbedding rotates in FP32 and rounds to the activation dtype once.
-        attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()), "actual_seq_len": ends}
+        attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()), "actual_seq_len": ends,
+                            "sequence_ids": sequence.sample_ids, "num_sequences": sequence.num_samples}
         auxiliary = torch.zeros((), device=hidden.device, dtype=torch.float32)
         for layer in self.model.layers:
-            hidden = layer(hidden, **attention_kwargs)
+            hidden = layer(hidden, token_mask=sequence.token_mask, **attention_kwargs)
             if hasattr(layer.mlp, "pop_auxiliary_loss"):
                 auxiliary = auxiliary + layer.mlp.pop_auxiliary_loss()
-        valid = (loss_mask != 0) & (labels >= 0)
+        valid = (loss_mask != 0) & (labels >= 0) & sequence.token_mask
         targets = labels.masked_fill(~valid, -100)
         normalized = self.model.norm(hidden)
         lm_loss = (self._projection_loss(normalized, targets) if self.enable_chunk_loss
-                   else self._token_loss(self.lm_head(normalized), labels, loss_mask))
-        # Match the reference objective: shift across the pack and retain the supplied label mask.
+                   else self._token_loss(self.lm_head(normalized), targets, valid))
         mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens,
                               head=None if self.enable_chunk_loss else self.lm_head,
-                              decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs)
+                              decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs,
+                              sequence_end_mask=sequence.sequence_end_mask, token_mask=sequence.token_mask)
         for layer in self.mtp.layers:
             auxiliary = auxiliary + layer.transformer_layer.mlp.pop_auxiliary_loss()
         shift_targets = partial(self.shift_mtp_inputs, pad_value=-100)
-        if self.enable_chunk_loss:
-            mtp_loss = torch.zeros_like(lm_loss)
-            depths = len(mtp_output.prediction_hidden_states)
-            targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets)
-            for prediction, future_targets in zip(mtp_output.prediction_hidden_states, targets_by_depth):
-                mtp_loss = mtp_loss + self._projection_loss(prediction, future_targets) * (cfg.mtp_loss_factor / depths)
-        else:
-            mtp_loss = calculate_mtp_loss(mtp_output.logits, targets, self._mtp_token_loss, vocab_size=cfg.vocab_size,
-                                          loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets)
-        return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}
+        predictions = mtp_output.prediction_hidden_states if self.enable_chunk_loss else mtp_output.logits
+        depths = len(predictions)
+        depth_losses = {}
+        targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets,
+                                            sequence_end_mask=sequence.sequence_end_mask)
+        for depth, (prediction, future_targets) in enumerate(zip(predictions, targets_by_depth), start=1):
+            depth_loss = (self._projection_loss(prediction, future_targets) if self.enable_chunk_loss else
+                          self._token_loss(prediction, future_targets, future_targets.ge(0)))
+            depth_losses[f"mtp_loss/{depth}"] = depth_loss * (cfg.mtp_loss_factor / depths)
+        mtp_loss = sum(depth_losses.values(), torch.zeros_like(lm_loss))
+        return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary, **depth_losses}

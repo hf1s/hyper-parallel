@@ -16,13 +16,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
 import torch
 
-from hyper_parallel.data.batching.build_collate_fn import TextPackingCollator
+from hyper_parallel.data.batching.build_collate_fn import TextPackingCollator, build_online_text_collate_fn
 from hyper_parallel.data.text.text_transform import PreTokenizedSFTTransform
+from hyper_parallel.trainer.config.target import Target
 from tests.common.mark_utils import arg_mark
 
 
@@ -99,3 +101,31 @@ class TestPreTokenizedSFTTransform(unittest.TestCase):
         for ends in ([0, 3, 2], [0, 2], [0., 3.]):
             with self.subTest(ends=ends), self.assertRaises(ValueError):
                 TextPackingCollator()([dict(samples[0], cu_seq_lens=ends)])
+
+    def test_row_collator_preserves_documents_and_runtime_alignment(self) -> None:
+        """Trainer opt-in keeps each sample and its alignment tail in an independent row."""
+        samples = PreTokenizedSFTTransform()(
+            {"input_ids": [1, 2, 3, 4, 5], "labels": [2, -100, 4, 5, -100], "cu_seqlens": [0, 2, 5]})
+        samples.append({"input_ids": torch.tensor([6, 7, 8, 9, 10]),
+                        "labels": torch.tensor([7, 8, 9, 10, -100])})
+        target = Target(build_online_text_collate_fn,
+                        target_path="hyper_parallel.data.batching.build_online_text_collate_fn",
+                        pack_across_samples=False)
+        collator = target.build(mesh_context=SimpleNamespace(cp_size=1, tp_size=4, sequence_parallel=True))
+
+        batch = collator(samples)
+
+        torch.testing.assert_close(batch["input_ids"], torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0],
+                                                                    [6, 7, 8, 9, 10, 0, 0, 0]]))
+        torch.testing.assert_close(batch["labels"], torch.tensor([[2, -100, 4, 5, -100, -100, -100, -100],
+                                                                 [7, 8, 9, 10, -100, -100, -100, -100]]))
+        torch.testing.assert_close(batch["cu_seq_lens"], torch.tensor([0, 2, 5, 8, 13, 16], dtype=torch.int32))
+        self.assertEqual(batch["sample_ranges"].tolist(), [[0, 5], [8, 13]])
+        packed = build_online_text_collate_fn()(samples)
+        self.assertEqual(packed["sample_ranges"].tolist(), [[0, 5], [5, 10]])
+
+    def test_row_collator_rejects_unequal_sample_lengths(self) -> None:
+        """Opting into fixed rows cannot silently concatenate unequal prepared samples."""
+        samples = [{"input_ids": torch.arange(length), "labels": torch.arange(length)} for length in (4, 3)]
+        with self.assertRaisesRegex(ValueError, "equal sample lengths"):
+            build_online_text_collate_fn(pack_across_samples=False)(samples)

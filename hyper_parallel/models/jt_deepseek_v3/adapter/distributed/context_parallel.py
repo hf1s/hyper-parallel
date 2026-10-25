@@ -128,12 +128,12 @@ def _expanded_overlap_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAConte
 
 def _observed_attention(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
                         query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                        sequence_ends: tuple[int, ...]) -> torch.Tensor:
+                        sequence_ends: tuple[int, ...], query_token_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Keep statistics in persistent TP-head coordinates for the existing clip reducer."""
     observer = SimpleNamespace(max_logits_val=None, is_causal=True)
     output, _ = module.attention_interface(
         observer, query, key, value, None,
-        dropout=0.0, scaling=module.scaling, actual_seq_len=sequence_ends,
+        dropout=0.0, scaling=module.scaling, actual_seq_len=sequence_ends, query_token_mask=query_token_mask,
     )
     with torch.no_grad():
         maximum = observer.max_logits_val
@@ -191,7 +191,8 @@ def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: A
 
     @wraps(original)
     def forward(hidden_states: torch.Tensor, position_embeddings: Any = None, attention_mask: Any = None,
-                past_key_values: Any = None, actual_seq_len: Any = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
+                past_key_values: Any = None, actual_seq_len: Any = None,
+                query_token_mask: torch.Tensor | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
         """Compute contiguous causal shards using the model's original projection children."""
         if attention_mask is not None or past_key_values is not None or position_embeddings is None:
             raise ValueError("JT MLA CP requires explicit RoPE positions, no mask and no KV cache")
@@ -221,11 +222,16 @@ def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: A
                                              overlap=overlap)
         if query.shape[2] != global_sequence:
             raise ValueError("JT MLA SP projection and RoPE sequence lengths disagree")
+        if query_token_mask is not None:
+            masks = [torch.empty_like(query_token_mask) for _ in range(runtime.degree)]
+            dist.all_gather(masks, query_token_mask.contiguous(), group=runtime.mesh.get_group())
+            query_token_mask = torch.cat(masks, dim=1)
         # This frame owns QKV: replacing the views here releases their old storage before FA.
         query = query.transpose(1, 2).contiguous().transpose(1, 2)
         key = key.transpose(1, 2).contiguous().transpose(1, 2)
         value = value.transpose(1, 2).contiguous().transpose(1, 2)
-        output = runtime.restore(_observed_attention(target_module, runtime, query, key, value, sequence_ends))
+        output = runtime.restore(_observed_attention(target_module, runtime, query, key, value, sequence_ends,
+                                                     query_token_mask))
         return target_module.o_proj(output.reshape(1, local_sequence, -1).contiguous()), None
 
     requests = [_ForwardRewriteRequest(target_module, forward, companion_attrs={"mla_cp_runtime": runtime})]
@@ -257,10 +263,6 @@ class _JTTrainingContext:
         labels = kwargs.get("shift_labels", args[1] if len(args) > 1 else None)
         if tokens is None or labels is None or tokens.shape != labels.shape:
             raise ValueError("JT CP requires aligned input_ids and pre-shifted labels")
-        count = labels.ge(0).sum()
-        dist.all_reduce(count, op=dist.ReduceOp.SUM, group=self.cp_group)
-        if count.item() == 0:
-            raise ValueError("JT CP requires supervision somewhere in the global sequence")
         kwargs = dict(kwargs)
         kwargs["sequence_start"] = self.rank * tokens.shape[1]
         global_sequence = self.degree * tokens.shape[1]
@@ -276,7 +278,7 @@ class _JTTrainingContext:
         names = tuple(output.loss)
         losses = differentiable_all_reduce(torch.stack([output.loss[name] for name in names]),
                                             "sum", self.cp_group)
-        # Trainer weights replicas by foundation counts; autograd redistributes those weights
+        # Trainer weights replicas by each objective's counts; autograd redistributes those weights
         # before FSDP averages parameter gradients, including ranks with zero local labels.
         output.loss = dict(zip(names, losses.unbind()))
         return output
@@ -312,15 +314,16 @@ class _JTTrainingContext:
         Returns:
             This shard's contribution to the global token mean, including differentiable zero.
         """
-        # Trainer weights JT objectives by foundation tokens, but each MTP depth has its own target count.
-        # Normalize this CP objective here, outside each chunk's checkpoint recomputation.
+        # Normalize each CP objective outside chunk checkpoint recomputation. The
+        # replicated result lets Trainer use target-owner counts for every depth.
         local_count = targets.ne(-100).sum().float()
         global_count = local_count.clone()
         dist.all_reduce(global_count, op=dist.ReduceOp.SUM, group=self.cp_group)
         return local_loss(hidden, targets) * (local_count / global_count.clamp_min(1))
 
     def routing_statistics(self, module: JTDeepseekV3MoE, indices: torch.Tensor,
-                           scores: torch.Tensor) -> torch.Tensor:
+                           scores: torch.Tensor, *, sequence_ids: torch.Tensor | None = None,
+                           num_sequences: int | None = None) -> torch.Tensor:
         """Reuse the public sequence objective without duplicating the root CP sum.
 
         The public loss already differentiates each rank's share of the sequence.
@@ -328,7 +331,8 @@ class _JTTrainingContext:
         sum and existing Trainer weighting still redistribute supervision weights.
         """
         auxiliary = calculate_seq_aux_loss(scores, indices, coeff=module.config.moe_aux_loss_coeff,
-                                            sequence_partition_group=self.statistics_group)
+                                            sequence_partition_group=self.statistics_group,
+                                            sequence_ids=sequence_ids, num_sequences=num_sequences)
         return auxiliary + auxiliary.detach() * (1 / self.degree - 1)
 
 

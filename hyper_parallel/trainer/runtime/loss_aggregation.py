@@ -13,7 +13,7 @@
 # limitations under the License.
 """Loss token counting for trainer-side aggregation."""
 
-from typing import Union
+from typing import Any, Union
 
 import torch
 
@@ -21,10 +21,14 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 
 
 def count_loss_token(
-    batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
+    batches: Union[list[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, torch.Tensor]:
     # FIXME: VeOmni version -> AutoModels version
-    """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
+    """Count token domains and explicit per-objective denominators for a batch or optimizer step.
+
+    Optional ``loss_token_counts`` entries are summed by complete loss name;
+    they may count future targets or samples rather than foundation tokens.
+    """
     if isinstance(batches, dict):
         batches = [batches]
     token_len: dict[str, torch.Tensor] = {}
@@ -55,6 +59,13 @@ def count_loss_token(
             if "foundation_tokens" in token_len:
                 foundation_tokens = token_len["foundation_tokens"] + foundation_tokens
             token_len["foundation_tokens"] = foundation_tokens  # text tokens
+            for name, count in obj.get("loss_token_counts", {}).items():
+                if not isinstance(name, str) or "_loss" not in name:
+                    raise ValueError("loss_token_counts keys must be complete loss names")
+                if (not torch.is_tensor(count) or count.ndim != 0 or count.dtype == torch.bool
+                        or count.is_complex()):
+                    raise ValueError("loss_token_counts values must be scalar numeric tensors")
+                token_len[name] = token_len.get(name, count.new_zeros(())) + count
 
             for key in obj.keys():
                 if key.endswith("_labels") and key != "shift_labels":

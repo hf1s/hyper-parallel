@@ -94,6 +94,17 @@ class TestSequenceAuxLoss(unittest.TestCase):
         merged = sequence_aux_oracle(scores.reshape(12, 4), selected.reshape(12, 2), 0.1)
         self.assertFalse(torch.allclose(result, merged))
 
+        ragged = scores.detach().flatten(0, 1).requires_grad_()
+        ids = torch.tensor([0, 0, -1, -1, -1, -1, 1, 1, 1, 1, 1, -1])
+        reference = (sequence_aux_oracle(ragged[:2], selected[0, :2], 0.1)
+                     + sequence_aux_oracle(ragged[6:11], selected[1, :5], 0.1)) / 2
+        expected_gradient, = torch.autograd.grad(reference, ragged)
+        result = calculate_seq_aux_loss(ragged, selected.flatten(0, 1), coeff=0.1,
+                                       sequence_ids=ids, num_sequences=2)
+        result.backward()
+        torch.testing.assert_close(result, reference)
+        torch.testing.assert_close(ragged.grad, expected_gradient)
+
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_partitioned_sequence_matches_complete_sequence(self):
         """Feature: Sequence-parallel aux loss.

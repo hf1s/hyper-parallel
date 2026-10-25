@@ -107,14 +107,21 @@ class TestMeanGlobalLoss(unittest.TestCase):
     @patch("hyper_parallel.trainer.runtime.metrics.all_reduce", side_effect=lambda value, **_: value)
     def test_named_losses_use_their_own_counts(self, _reduce) -> None:
         """Objectives with different valid-token masks retain independent weights."""
-        losses = {name: torch.tensor(2.0, requires_grad=True) for name in ("foundation_loss", "image_decoder_loss")}
-        current = {"foundation_tokens": torch.tensor(2), "image_decoder_tokens": torch.tensor(3)}
-        total = {"foundation_tokens": torch.tensor(8), "image_decoder_tokens": torch.tensor(6)}
+        names = ("foundation_loss", "image_decoder_loss", "foundation_loss/future", "foundation_loss/router")
+        losses = {name: torch.tensor(2.0, requires_grad=True) for name in names}
+        current = {"foundation_tokens": torch.tensor(2), "image_decoder_tokens": torch.tensor(3),
+                   "foundation_loss/future": torch.tensor(1), "foundation_loss/router": torch.tensor(1.)}
+        total = {"foundation_tokens": torch.tensor(8), "image_decoder_tokens": torch.tensor(6),
+                 "foundation_loss/future": torch.tensor(8), "foundation_loss/router": torch.tensor(2.)}
         outputs = mean_global_loss(losses, current, total, self.mesh)
         sum(outputs.values()).backward()
-        for name, expected in (("foundation_loss", 0.25), ("image_decoder_loss", 0.5)):
+        for name, expected in zip(names, (0.25, 0.5, 0.125, 0.5)):
             torch.testing.assert_close(losses[name].grad, torch.tensor(expected))
             torch.testing.assert_close(outputs[name], torch.tensor(2 * expected))
+        for invalid in (-1., float("nan"), float("inf"), 1j):
+            with self.subTest(count=invalid), self.assertRaisesRegex(ValueError, "finite and nonnegative"):
+                bad_counts = {"foundation_loss/router": torch.tensor(invalid)}
+                mean_global_loss({"foundation_loss/router": torch.tensor(1.)}, bad_counts, bad_counts, self.mesh)
 
     @patch("hyper_parallel.trainer.runtime.metrics.all_reduce", return_value=0.0)
     def test_empty_objective_stays_finite(self, _reduce) -> None:

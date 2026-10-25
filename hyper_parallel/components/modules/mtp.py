@@ -105,7 +105,8 @@ class MultiTokenPrediction(nn.Module):
                 embedding: nn.Module, head: nn.Module | None,
                 decoder_kwargs: Mapping[str, Any] | None = None,
                 shift_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
-                sequence_end_mask: torch.Tensor | None = None) -> MultiTokenPredictionOutput:
+                sequence_end_mask: torch.Tensor | None = None,
+                token_mask: torch.Tensor | None = None) -> MultiTokenPredictionOutput:
         """Shift future tokens and run the depths in order, returning each depth's logits.
 
         Args:
@@ -116,6 +117,7 @@ class MultiTokenPrediction(nn.Module):
             decoder_kwargs: Causal attention/position arguments for every decoder.
             shift_fn: One-token left shift, including partition halos when needed.
             sequence_end_mask: Document-tail positions whose future embeddings must be zero.
+            token_mask: Optional real-token mask, shifted per depth and forwarded to decoders.
 
         Note:
             The default shift treats each row as one unpartitioned sequence. A custom
@@ -135,6 +137,11 @@ class MultiTokenPrediction(nn.Module):
             input_ids = shift_fn(input_ids)
             if sequence_end_mask is not None:
                 input_ids = input_ids.masked_fill(sequence_end_mask, 0)
+            if token_mask is not None:
+                token_mask = shift_fn(token_mask)
+                if sequence_end_mask is not None:
+                    token_mask = token_mask & ~sequence_end_mask
+                decoder_kwargs = {**decoder_kwargs, "token_mask": token_mask}
             hidden = layer(hidden, embedding(input_ids), **decoder_kwargs)
             if head is None:
                 prediction_hidden_states.append(hidden)

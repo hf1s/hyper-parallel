@@ -209,7 +209,7 @@ class TestCompleteModel(unittest.TestCase):
         output = model(tokens, (tokens + 1) % 32)
         self.assertEqual(
             set(output.loss),
-            {"foundation_loss/lm", "foundation_loss/mtp", "foundation_loss/aux"},
+            {"foundation_loss/lm", "foundation_loss/mtp_1", "foundation_loss/aux"},
         )
         total_loss = sum(output.loss.values())
         self.assertTrue(torch.isfinite(total_loss))
@@ -459,7 +459,7 @@ class TestCompleteModel(unittest.TestCase):
         torch.testing.assert_close(output.loss["foundation_loss/lm"], F.cross_entropy(lm_logits[mask], targets[mask]))
         # The single MTP depth predicts each next target, scaled by the MTP loss factor.
         expected_mtp = F.cross_entropy(mtp_logits[:-1][mask[1:]], targets[1:][mask[1:]]) * model.config.mtp_loss_factor
-        torch.testing.assert_close(output.loss["foundation_loss/mtp"], expected_mtp)
+        torch.testing.assert_close(output.loss["foundation_loss/mtp_1"], expected_mtp)
         with self.assertRaisesRegex(ValueError, "attention_mask=None"):
             model(**(model_inputs | {"attention_mask": torch.ones_like(tokens)}))
         with self.assertRaisesRegex(ValueError, "explicit shift_labels"):
@@ -479,7 +479,8 @@ class TestCompleteModel(unittest.TestCase):
         tokens = torch.arange(8).unsqueeze(0)
         losses = model(tokens, torch.full_like(tokens, -100)).loss
         self.assertEqual(losses["foundation_loss/lm"].item(), 0.0)
-        self.assertEqual(losses["foundation_loss/mtp"].item(), 0.0)
+        self.assertEqual(losses["foundation_loss/mtp_1"].item(), 0.0)
+        self.assertEqual(losses["foundation_loss/mtp_2"].item(), 0.0)
         sum(losses.values()).backward()
         for name, parameter in model.named_parameters():
             if parameter.grad is not None:

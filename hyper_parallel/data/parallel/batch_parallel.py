@@ -216,6 +216,8 @@ class CPBatchSharder:
             "input_ids": input_ids,
             "labels": canonical_batch["labels"],
         }
+        if "sample_ranges" in canonical_batch:
+            cp_batch["sample_ranges"] = canonical_batch["sample_ranges"]
 
         cp_size = self.parallel_context.cp_world_size
         if cp_size <= 1:
@@ -226,7 +228,8 @@ class CPBatchSharder:
             raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size})")
 
         cp_rank = self.parallel_context.cp_rank
-        for field, value in cp_batch.items():
+        for field in ("input_ids", "labels"):
+            value = cp_batch[field]
             local_value = torch.chunk(value, cp_size, dim=1)[cp_rank]
             cp_batch[field] = local_value.contiguous()
 
@@ -332,19 +335,20 @@ class TPBatchBroadcaster:
             batch_size, seq_len = parallel_batch["input_ids"].shape
             num_boundaries = 0 if local_cu_seq_lens is None else local_cu_seq_lens.numel()
             batch_meta = torch.tensor(
-                [batch_size, seq_len, num_boundaries],
+                [batch_size, seq_len, num_boundaries,
+                 parallel_batch["sample_ranges"].shape[0] if "sample_ranges" in parallel_batch else 0],
                 dtype=torch.int64,
                 device=self.device,
             )
         else:
-            batch_meta = torch.empty((3,), dtype=torch.int64, device=self.device)
+            batch_meta = torch.empty((4,), dtype=torch.int64, device=self.device)
 
         tp_group = self.parallel_context.tp_group
         dist.broadcast(batch_meta, group=tp_group, group_src=0)
 
         # Non-source TP ranks allocate the same device shapes and dtypes.
         if tp_rank != 0:
-            batch_size, seq_len, num_boundaries = [int(value) for value in batch_meta.tolist()]
+            batch_size, seq_len, num_boundaries, num_samples = [int(value) for value in batch_meta.tolist()]
             shape = (batch_size, seq_len)
             parallel_batch = {
                 "input_ids": torch.empty(shape, dtype=torch.int64, device=self.device),
@@ -352,6 +356,8 @@ class TPBatchBroadcaster:
             }
             if num_boundaries > 0:
                 local_cu_seq_lens = torch.empty((num_boundaries,), dtype=torch.int32, device=self.device)
+            if num_samples > 0:
+                parallel_batch["sample_ranges"] = torch.empty((num_samples, 2), dtype=torch.int64, device=self.device)
 
         # Broadcast only model fields that cannot be regenerated locally.
         for field in ("input_ids", "labels"):
@@ -363,6 +369,8 @@ class TPBatchBroadcaster:
         # Packed boundaries remain global across CP ranks and variable in size.
         if local_cu_seq_lens is not None:
             dist.broadcast(local_cu_seq_lens, group=tp_group, group_src=0)
+        if "sample_ranges" in parallel_batch:
+            dist.broadcast(parallel_batch["sample_ranges"], group=tp_group, group_src=0)
 
         parallel_batch["cu_seq_lens"] = local_cu_seq_lens
 
