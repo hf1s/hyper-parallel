@@ -47,66 +47,107 @@ class TextPackingCollator:
     Existing per-sample ``cu_seq_lens`` are preserved when packing again.
     ``input_ids`` and pre-shifted ``labels`` are concatenated here. Unified
     ``get_batch`` constructs loss, position, mask, and CP runtime fields.
+    ``pack_across_samples`` defaults to the historical single-sequence layout;
+    disabling it stacks equal-length samples into independent batch rows and
+    keeps every row's document ends.
     """
 
     sequence_parallel_size: int = 1
+    pack_across_samples: bool = True
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        """Pack samples into one ``[1, packed_length]`` forward-backward batch.
+        """Pack samples into one packed sequence or one packed batch of rows.
+
+        ``pack_across_samples`` keeps the historical ``[1, packed_length]``
+        layout, where every sample becomes one or more packed documents.
+        Disabling it emits ``[batch, padded_length]`` with one independent
+        sample per row, which is what ``micro_batch_size > 1`` means for a
+        model that requires a fixed row width.
 
         Args:
             model_samples: Online samples selected for one forward-backward step.
 
         Returns:
-            Packed ``input_ids`` and ``labels`` plus int32 ``cu_seq_lens``.
+            Packed ``input_ids`` and ``labels`` plus int32 ``cu_seq_lens`` whose
+            entries are cumulative ends of the flattened row stream.
 
         Raises:
-            ValueError: If no samples are provided.
+            ValueError: If no samples are provided, boundaries are malformed,
+                or batch rows do not share one token count.
         """
         if not model_samples:
             raise ValueError("model_samples must contain at least one Online sample")
+        if self.pack_across_samples:
+            return self._pack_one_sequence(model_samples)
+        return self._pack_batch_rows(model_samples)
 
+    @staticmethod
+    def _sample_ends(sample: Mapping[str, Any], offset: int) -> torch.Tensor:
+        """Validate one sample's document ends and move them to packed coordinates."""
+        tokens = sample["input_ids"]
+        boundaries = torch.as_tensor(sample.get("cu_seq_lens", [0, tokens.numel()]), device=tokens.device)
+        if (boundaries.dtype not in (torch.int32, torch.int64) or boundaries.ndim != 1
+                or boundaries.numel() < 2 or boundaries[0] != 0 or boundaries[-1] != tokens.numel()
+                or torch.any(boundaries[1:] <= boundaries[:-1])):
+            raise ValueError("Sample boundaries must strictly increase from zero to its token count")
+        return boundaries[1:].to(torch.int64) + offset
+
+    def _pack_one_sequence(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        """Concatenate every sample into the historical single packed sequence."""
         packed_batch = {}
         for field in ("input_ids", "labels"):
-            values = [model_sample[field] for model_sample in model_samples]
-            packed_batch[field] = torch.cat(values, dim=-1).unsqueeze(0)
+            packed_batch[field] = torch.cat([sample[field] for sample in model_samples], dim=-1).unsqueeze(0)
 
-        input_ids = packed_batch.get("input_ids")
-        if input_ids is None or packed_batch.get("labels") is None:
-            raise ValueError("packed batch requires input_ids and labels")
-
-        packed_seq_len = input_ids.shape[-1]
-        pad_len = (-packed_seq_len) % self.sequence_parallel_size
+        pad_len = (-packed_batch["input_ids"].shape[-1]) % self.sequence_parallel_size
         if pad_len:
-            input_padding = input_ids.new_zeros((1, pad_len))
-            label_padding = packed_batch["labels"].new_full((1, pad_len), IGNORE_INDEX)
-            packed_batch["input_ids"] = torch.cat((input_ids, input_padding), dim=-1)
-            packed_batch["labels"] = torch.cat((packed_batch["labels"], label_padding), dim=-1)
+            packed_batch["input_ids"] = torch.cat(
+                (packed_batch["input_ids"], packed_batch["input_ids"].new_zeros((1, pad_len))), dim=-1)
+            packed_batch["labels"] = torch.cat(
+                (packed_batch["labels"], packed_batch["labels"].new_full((1, pad_len), IGNORE_INDEX)), dim=-1)
 
         sample_ends = []
         offset = 0
         for sample in model_samples:
-            tokens = sample["input_ids"]
-            boundaries = torch.as_tensor(sample.get("cu_seq_lens", [0, tokens.numel()]), device=tokens.device)
-            if (boundaries.dtype not in (torch.int32, torch.int64) or boundaries.ndim != 1
-                    or boundaries.numel() < 2 or boundaries[0] != 0 or boundaries[-1] != tokens.numel()
-                    or torch.any(boundaries[1:] <= boundaries[:-1])):
-                raise ValueError("Sample boundaries must strictly increase from zero to its token count")
-            sample_ends.append(boundaries[1:].to(torch.int64) + offset)
-            offset += tokens.numel()
+            sample_ends.append(self._sample_ends(sample, offset))
+            offset += sample["input_ids"].numel()
         seq_ends = torch.cat(sample_ends)
-        zero = seq_ends.new_zeros(1)
         if pad_len:
             # Represent the alignment tail as one synthetic packed sequence so
             # attention metadata covers every physical Q/KV token. Its labels
             # remain IGNORE_INDEX and therefore do not contribute to the loss.
-            padded_end = seq_ends[-1:] + pad_len
-            seq_ends = torch.cat((seq_ends, padded_end))
-        cu_seq_lens = torch.cat((zero, seq_ends))
-        cu_seq_lens = cu_seq_lens.to(torch.int32)
-        packed_batch["cu_seq_lens"] = cu_seq_lens
-
+            seq_ends = torch.cat((seq_ends, seq_ends[-1:] + pad_len))
+        packed_batch["cu_seq_lens"] = torch.cat((seq_ends.new_zeros(1), seq_ends)).to(torch.int32)
         return packed_batch
+
+    def _pack_batch_rows(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        """Stack equal-length samples into independent rows of one batch."""
+        lengths = {int(sample["input_ids"].numel()) for sample in model_samples}
+        if len(lengths) != 1:
+            raise ValueError("Batch rows require equal sample lengths; pack the samples instead")
+        length = lengths.pop()
+        row_stride = length + (-length) % self.sequence_parallel_size
+        pad_len = row_stride - length
+
+        input_ids = torch.stack([sample["input_ids"] for sample in model_samples], dim=0)
+        labels = torch.stack([sample["labels"] for sample in model_samples], dim=0)
+        if pad_len:
+            input_ids = torch.cat((input_ids, input_ids.new_zeros((input_ids.shape[0], pad_len))), dim=-1)
+            labels = torch.cat((labels, labels.new_full((labels.shape[0], pad_len), IGNORE_INDEX)), dim=-1)
+
+        sample_ends = []
+        for row, sample in enumerate(model_samples):
+            offset = row * row_stride
+            sample_ends.append(self._sample_ends(sample, offset))
+            if pad_len:
+                # Every row owns its alignment tail as a separate document, so the
+                # flattened varlen metadata still covers each physical token.
+                sample_ends.append(input_ids.new_tensor([offset + row_stride]))
+        seq_ends = torch.cat(sample_ends)
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "cu_seq_lens": torch.cat((seq_ends.new_zeros(1), seq_ends)).to(torch.int32),
+        }
 
 
 class OmniCollator:
@@ -157,7 +198,8 @@ def build_omni_collate_fn() -> OmniCollator:
     return collate_fn
 
 
-def build_online_text_collate_fn(mesh_context: Any | None = None) -> TextPackingCollator:
+def build_online_text_collate_fn(mesh_context: Any | None = None,
+                                 pack_across_samples: bool = True) -> TextPackingCollator:
     """Build Online text collation shared by fixed N and dynamic K batching.
 
     Packing concatenates ``input_ids`` and ``labels`` and emits ``cu_seq_lens``.
@@ -169,11 +211,16 @@ def build_online_text_collate_fn(mesh_context: Any | None = None) -> TextPacking
 
     Args:
         mesh_context: Runtime TP/CP topology injected by the Trainer.
+        pack_across_samples: Keep the historical single packed sequence when
+            true; stack equal-length samples into independent rows otherwise.
 
     Returns:
         A collator producing one forward-backward batch.
     """
     sequence_parallel_size = _get_sequence_parallel_size(mesh_context)
-    collate_fn = TextPackingCollator(sequence_parallel_size=sequence_parallel_size)
+    collate_fn = TextPackingCollator(
+        sequence_parallel_size=sequence_parallel_size,
+        pack_across_samples=pack_across_samples,
+    )
 
     return collate_fn

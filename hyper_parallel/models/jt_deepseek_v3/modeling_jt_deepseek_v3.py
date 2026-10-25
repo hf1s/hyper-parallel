@@ -793,30 +793,43 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                           ) -> dict[str, torch.Tensor]:
         """Compute the LM, MTP and router auxiliary losses on pre-shifted labels.
 
+        Every row of the batch is an independent sequence; rows must share one
+        token count so their positions, chunks and MTP shifts stay aligned.
+
         Args:
-            input_ids: Token IDs, ``[1, sequence]``.
+            input_ids: Token IDs, ``[batch, sequence]``.
             labels: Targets already shifted by one token.
             loss_mask: Mask of the supervised targets.
             position_ids: Compatibility input from the batch processor; JT derives continuous positions locally.
-            actual_seq_len: Global cumulative ends of independent documents.
-            sequence_start: Global offset of the local input interval.
+            actual_seq_len: Flattened global cumulative ends of independent documents across rows.
+            sequence_start: Global offset of the local input interval inside one row.
 
         Returns:
             ``lm_loss``, ``mtp_loss`` and ``aux_loss`` as 0-d tensors.
 
         Raises:
-            ValueError: If the inputs are not one sequence with matching shapes.
+            ValueError: If the inputs are not shape-compatible rows with matching boundaries.
         """
         cfg = self.config
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise ValueError("JT sequence loss currently requires a two-dimensional batch-one input")
-        sequence_length = input_ids.shape[1]
+        if input_ids.ndim != 2 or input_ids.shape[0] < 1:
+            raise ValueError("JT sequence loss requires a nonempty two-dimensional [batch, sequence] input")
+        batch_size, sequence_length = input_ids.shape
         if labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
             raise ValueError("Tokens, pre-shifted labels and loss mask must have identical shapes")
-        ends = (sequence_length,) if actual_seq_len is None else tuple(actual_seq_len)
+        if actual_seq_len is None:
+            if batch_size != 1:
+                raise ValueError("JT packed rows require explicit cumulative document ends")
+            ends = (sequence_length,)
+        else:
+            ends = tuple(actual_seq_len)
         if (not ends or ends[0] <= 0 or any(left >= right for left, right in zip(ends, ends[1:]))
-                or sequence_start < 0 or sequence_start + sequence_length > ends[-1]):
-            raise ValueError("JT cumulative document ends must increase and cover the local token interval")
+                or sequence_start < 0 or sequence_start + sequence_length > ends[-1]
+                or batch_size * sequence_length > ends[-1]):
+            raise ValueError(
+                "JT cumulative document ends must increase and cover the flattened local token interval")
+        if batch_size > 1 and ends[-1] != batch_size * sequence_length:
+            raise ValueError(
+                "JT packed rows require cp_size == 1 and boundaries that end at the flattened batch length")
         indices = torch.arange(sequence_start, sequence_start + sequence_length, device=input_ids.device)
         absolute_positions = indices.unsqueeze(0)
         if position_ids is not None and position_ids.shape != input_ids.shape:
