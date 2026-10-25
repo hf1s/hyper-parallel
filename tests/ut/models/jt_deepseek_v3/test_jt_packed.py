@@ -17,6 +17,7 @@
 import copy
 from functools import partial
 from itertools import product
+from types import SimpleNamespace
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -26,7 +27,9 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
+from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
+from hyper_parallel.models.jt_deepseek_v3.adapter.data.runtime import JTSequenceRuntime
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import _JTTrainingContext
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM, JTDeepseekV3MoE,
@@ -54,6 +57,75 @@ class TestJTPacked(unittest.TestCase):
         self.enterContext(patch(
             "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
             side_effect=reference_grouped_swiglu))
+
+    def test_batch_positions_reach_main_and_mtp_rotary(self) -> None:
+        """Both reset policies from the public batch must reach every main and MTP decoder."""
+        model = JTDeepseekV3ForCausalLM(small_config())
+        tokens = torch.arange(8).unsqueeze(0)
+        labels = torch.tensor([[1, 2, -100, 4, 5, 6, 7, -100]])
+        mesh = SimpleNamespace(cp_size=1, pp_size=1, tp_size=1, dp_size=1, dp_rank=0, device_mesh=None)
+        observed = []
+
+        def capture(_module: torch.nn.Module, _args: tuple, kwargs: dict) -> None:
+            """Observe the tables consumed by each main and MTP attention."""
+            observed.append(kwargs["position_embeddings"])
+
+        decoders = list(model.model.layers) + [layer.transformer_layer for layer in model.mtp.layers]
+        for decoder in decoders:
+            handle = decoder.self_attn.register_forward_pre_hook(capture, with_kwargs=True)
+            self.addCleanup(handle.remove)
+        for reset in (False, True):
+            with self.subTest(reset_position_ids=reset):
+                batch = TextParallelBatch(mesh, torch.device("cpu"), None, {}, False,
+                                          source_type="online", attention_mode="compressed",
+                                          reset_position_ids=reset, runtime_input_adapter=JTSequenceRuntime())
+                inputs, _ = batch(iter([{"input_ids": tokens, "labels": labels,
+                                         "cu_seq_lens": torch.tensor([0, 3, 8], dtype=torch.int32)}]))
+                positions = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]) if reset else tokens
+                torch.testing.assert_close(inputs["position_ids"], positions, rtol=0, atol=0)
+                angles = positions.float().unsqueeze(-1) * torch.tensor([1.0, 0.01])
+                angles = torch.cat((angles, angles), dim=-1)
+                observed.clear()
+                model(**inputs)
+                self.assertEqual(len(observed), len(decoders))
+                for cos, sin in observed:
+                    self.assertEqual(cos.dtype, torch.float32)
+                    torch.testing.assert_close(cos, angles.cos(), rtol=0, atol=0)
+                    torch.testing.assert_close(sin, angles.sin(), rtol=0, atol=0)
+
+    def test_position_fallback_preserves_default_losses_and_explicit_values(self) -> None:
+        """Missing positions preserve default losses; arbitrary supplied positions reach RoPE unchanged."""
+        model = JTDeepseekV3ForCausalLM(small_config())
+        tokens = torch.tensor([[0, 1, 2, 3]])
+        labels = torch.tensor([[5, 6, 7, -100]])
+        observed = []
+
+        def capture(_module: torch.nn.Module, _args: tuple, kwargs: dict) -> None:
+            """Record selected tables without changing the attention computation."""
+            observed.append(kwargs["position_embeddings"])
+
+        handle = model.model.layers[0].self_attn.register_forward_pre_hook(capture, with_kwargs=True)
+        self.addCleanup(handle.remove)
+        fallback = model(tokens, labels).loss
+        sum(fallback.values()).backward()
+        gradients = {name: parameter.grad.clone() for name, parameter in model.named_parameters()
+                     if parameter.grad is not None}
+        model.zero_grad(set_to_none=True)
+        explicit = model(tokens, labels, position_ids=tokens).loss
+        torch.testing.assert_close(explicit, fallback, rtol=0, atol=0)
+        sum(explicit.values()).backward()
+        torch.testing.assert_close(
+            {name: parameter.grad for name, parameter in model.named_parameters() if parameter.grad is not None},
+            gradients, rtol=0, atol=0)
+        supplied = torch.tensor([[1, 4, 2, 7]])
+        model(tokens, labels, position_ids=supplied)
+        for (cos, sin), positions in zip(observed, (tokens, tokens, supplied)):
+            angles = positions.float().unsqueeze(-1) * torch.tensor([1.0, 0.01])
+            angles = torch.cat((angles, angles), dim=-1)
+            torch.testing.assert_close(cos, angles.cos(), rtol=0, atol=0)
+            torch.testing.assert_close(sin, angles.sin(), rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "position_ids must match input_ids"):
+            model(tokens, labels, position_ids=supplied[:, :-1])
 
     def test_packed_lm_isolates_documents(self) -> None:
         """Changing the preceding document must not change the supervised document's LM loss or gradients."""

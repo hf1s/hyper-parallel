@@ -725,7 +725,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             input_ids: Token IDs, ``[1, sequence]``.
             shift_labels: Targets already shifted by one token; negative targets are ignored.
             labels: Unused; ``shift_labels`` carries the supervision.
-            position_ids: Sequence positions for RoPE.
+            position_ids: Batch-provided RoPE positions; defaults to continuous positions at ``sequence_start``.
             attention_mask: Must be ``None``; cumulative lengths define independent causal documents.
             use_cache: Must be ``False``.
             actual_seq_len: Global cumulative document ends, without a leading zero.
@@ -797,7 +797,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             input_ids: Token IDs, ``[1, sequence]``.
             labels: Targets already shifted by one token.
             loss_mask: Mask of the supervised targets.
-            position_ids: Compatibility input from the batch processor; JT derives continuous positions locally.
+            position_ids: Batch-provided RoPE positions, including any document resets or CP slicing.
+                When omitted, continuous positions start at ``sequence_start``.
             actual_seq_len: Global cumulative ends of independent documents.
             sequence_start: Global offset of the local input interval.
 
@@ -817,12 +818,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         if (not ends or ends[0] <= 0 or any(left >= right for left, right in zip(ends, ends[1:]))
                 or sequence_start < 0 or sequence_start + sequence_length > ends[-1]):
             raise ValueError("JT cumulative document ends must increase and cover the local token interval")
-        indices = torch.arange(sequence_start, sequence_start + sequence_length, device=input_ids.device)
-        absolute_positions = indices.unsqueeze(0)
-        if position_ids is not None and position_ids.shape != input_ids.shape:
+        if position_ids is None:
+            position_ids = torch.arange(
+                sequence_start, sequence_start + sequence_length, device=input_ids.device).unsqueeze(0)
+        elif position_ids.shape != input_ids.shape:
             raise ValueError("JT position_ids must match input_ids")
-        # Derive continuous positions locally, including the offset of a CP slice.
-        position_ids = absolute_positions
         # NumPy FP32 inverse frequencies match MindFormers bitwise; torch.pow rounds some entries differently.
         dim = cfg.qk_rope_head_dim
         inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
