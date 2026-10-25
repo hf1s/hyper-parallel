@@ -100,6 +100,16 @@ class TestJTContextParallel(unittest.TestCase):
                                           actual_seq_len=(3,) if packed else None)
             self.assertEqual(kernel.call_args.kwargs["softmax_layout"], "TND" if packed else "")
             torch.testing.assert_close(observer.max_logits_val, maxima)
+            if packed:
+                stats[-1] = 100
+            else:
+                stats[:, :, -1] = 100
+            observer.max_logits_val = None
+            with patch("torch_npu.npu_fusion_attention", return_value=(output, stats)):
+                observed_fusion_attention(observer, query, query, query, None,
+                                          actual_seq_len=(3,) if packed else None,
+                                          query_token_mask=torch.tensor([[True, True, False]]))
+            torch.testing.assert_close(observer.max_logits_val, maxima)
 
     def test_mtp_loss_uses_global_target_denominator(self):
         """Local MTP sums use global target counts before the model-level CP sum."""
@@ -239,7 +249,7 @@ class TestJTContextParallel(unittest.TestCase):
         torch.testing.assert_close(targets[1], torch.tensor([[3, -100, -100, -100, -100, -100]]))
 
     def test_packed_metadata_and_zero_local_supervision(self):
-        """Global boundaries survive CP; only globally empty supervision is rejected."""
+        """Global boundaries survive CP; empty CE remains compatible with the independent router objective."""
         runtime = JTSequenceRuntime()
         info = RuntimeInputContext(local_input_shape=(1, 4), parallel_ranks={"cp": 0},
                                    parallel_sizes={"cp": 2}, options={})
@@ -249,13 +259,10 @@ class TestJTContextParallel(unittest.TestCase):
         context.degree, context.rank, context.cp_group = 2, 0, None
         batch = {"input_ids": torch.arange(4).view(1, 4), "shift_labels": torch.full((1, 4), -100), **metadata}
         with patch("hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel.dist.all_reduce",
-                   side_effect=lambda count, **_kwargs: count.fill_(2)):
+                   side_effect=AssertionError("CP preparation must not require a CE target count")):
             _, result = context.prepare(None, (), batch)
         self.assertEqual(result["actual_seq_len"], (3, 8))
         self.assertEqual(result["sequence_start"], 0)
-        with patch("hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel.dist.all_reduce"):
-            with self.assertRaisesRegex(ValueError, "somewhere in the global"):
-                context.prepare(None, (), batch)
 
     def test_packed_reference_attention_matches_independent_documents(self):
         """CPU packed outputs and gradients equal separate single-document executions."""

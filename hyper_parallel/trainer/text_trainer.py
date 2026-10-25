@@ -151,6 +151,7 @@ class TextTrainer:
             tokenizer=self.base.tokenizer,
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
+            model_config=self.base.model_config,
         )
         self.base.get_batch = get_batch
 

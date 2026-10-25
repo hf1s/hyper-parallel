@@ -238,8 +238,8 @@ dataloader:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
     attention_mode: compressed
-    # JT uses continuous RoPE positions; attention remains isolated by document boundaries.
-    reset_position_ids: false
+    # Reset positions per document so packing and microbatch grouping share one RoPE contract.
+    reset_position_ids: true
     runtime_input_adapter:
       _target_: hyper_parallel.models.jt_deepseek_v3.adapter.data.runtime.JTSequenceRuntime
   sampler_type: single

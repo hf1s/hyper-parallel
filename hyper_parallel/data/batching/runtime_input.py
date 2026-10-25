@@ -164,7 +164,9 @@ class RuntimeInputAdapter(ABC):
 
         Returns:
             Mapping merged into the model forward inputs. Keys must not replace
-            fields already owned by the generic batch path.
+            fields already owned by the generic batch path. The optional reserved
+            ``loss_token_counts`` mapping is sent only to the loss aggregator;
+            it supplies scalar denominators keyed by complete loss names.
         """
         raise NotImplementedError
 

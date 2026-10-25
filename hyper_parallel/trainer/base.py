@@ -780,7 +780,9 @@ class BaseTrainer(Stateful, ABC):
             resolved_metrics["lr"] = float(learning_rates[0])
         token_counts = getattr(self, "step_token_counts", {})
         token_values = []
-        for value in token_counts.values():
+        for name, value in token_counts.items():
+            if not name.endswith("_tokens"):
+                continue
             token_values.append(float(value.item() if torch.is_tensor(value) else value))
         if token_values:
             resolved_metrics["tokens"] = sum(token_values)

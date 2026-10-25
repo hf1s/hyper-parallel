@@ -410,6 +410,63 @@ dataloader:
     source_type: online
 ```
 
+### JT 多样本 packing 与固定行宽批次
+
+默认 `build_online_text_collate_fn` 将选中的样本拼为 `[1, sum(lengths)]`，仍保留每篇文档的
+attention 边界，原本就能接收 `micro_batch_size > 1`。默认 packing 也支持不等长样本，无需为了
+增加 mbs 改成二维行批。需要保留等长的两行 `[2, length]` 时，可在现有 JT 配置中显式使用：
+
+```yaml
+training:
+  micro_batch_size: 2
+  # global_batch_size 必须能被 micro_batch_size * dp_size 整除。
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    pack_across_samples: false
+```
+
+保留现有 JT 配方的 `get_batch` 和 `JTSequenceRuntime` 设置，并使用 `reset_position_ids: true`。
+行批的每条样本必须是一维、非空且等长的
+token/label 序列；不等长会报错。每行分别按运行时 TP/SP 拓扑补齐，padding 标签为 `-100`，并作为
+单独文档计入展平后的 `cu_seq_lens`。例如两条长度为 3 的样本按 4 对齐后，形状是 `[2, 4]`，
+边界是 `[0, 3, 4, 7, 8]`。JT 行批仅支持 `cp_size=1`；CP>1 继续使用默认的一条 packed token 流。
+
+两种布局都会保留 `sample_ranges: [num_samples, 2]`，表示每条原始样本在展平物理 token 流中的
+真实区间。上例为 `[[0, 3], [4, 7]]`；默认拼接则是 `[[0, 3], [3, 6]]`。区间外的对齐 token
+只用于满足物理布局，不参与监督、router aux、expert bias 的负载计数或 QK clipping 统计。
+这个 collator 接收未 padding 的样本，每条样本的真实 token 是一个连续区间；它不表示源数据中
+任意位置的 padding 洞。prompt 的 `labels=-100` 以及有效 token ID 0 都不能用来推断 padding。
+
+文档边界与样本边界用途不同：`cu_seq_lens` 隔离 attention、重置 RoPE 位置并截断每一层 MTP 的
+未来 embedding、target 和路由有效位；一条样本可包含多个文档。labels 仍是源数据已经对齐的
+next-token targets，不会再次整体移位，也不会擅自删掉文档末端已经提供的有效 LM target。
+这与当前
+[Megatron packed MTP](https://github.com/NVIDIA/Megatron-LM/blob/2052769557dcf7045c4091d1996f0bc59afeb80e/megatron/core/transformer/multi_token_prediction.py#L348-L393)
+和 [TorchTitan packed MTP](https://github.com/pytorch/torchtitan/blob/89e4339c963c138188c69655929722df98ef8441/torchtitan/models/deepseek_v3/mtp.py#L40-L102)
+的文档内移位政策一致。
+
+LM 和各 MTP 深度分别按整 step 的有效目标数加权。JT 输出 `foundation_loss/lm`、
+`foundation_loss/mtp_1`、`foundation_loss/mtp_2` 等独立项，每层已乘 `mtp_loss_factor / D`；
+它们替代原先合并的 `foundation_loss/mtp`，日志消费者需要相应更新。`JTSequenceRuntime` 从
+Trainer 注入的真实 model config 获取深度，通过 loss-only 的 `loss_token_counts` 提供完整 loss
+key 对应的计数。通用 Trainer 优先使用显式计数，其余模型保留原有 token-domain 加权行为。
+自定义循环若直接创建 `TextParallelBatch`，也需要传入 `model_config=model.config`。
+各深度没有有效目标时返回可微零，不影响独立的 router 目标。
+
+Router aux 先按每条原始样本计算，再按整 step 的样本数平均；主干和 MTP 各层的贡献相加。
+某样本在某 MTP 深度没有有效路由位置时，该项为零。这个统计单位在 flat、rows 和梯度累积间
+保持稳定；Megatron 的 THD seq-aux 与 TorchTitan 的 microbatch aux 并非都按原始样本分组，
+这里采用显式的样本语义，不宣称复刻它们全部的 aux 公式与分组策略。
+
+`chunk_loss_size` 限制每行每次投影的位置数，行数增加仍会增加每块总 token 数。
+分块会引入重算，行批与分块都不保证降低延迟或提高吞吐；性能和显存应分别在相同工作负载下测量。
+
+`TokenBatchLoader` 继续适用于默认的 token-budget packing；它可能挑选不等长样本，不会替行批补成
+公共行宽。Omni 和 Indexed collator 的布局不受这个选项影响。
+
 ### Online Mapping DeepSeek-V4.1 Omni baseline
 
 ```yaml

@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import math
+from numbers import Real
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -39,8 +41,8 @@ def mean_global_loss(
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
-        current_token_counts: Token counts for the current micro batch.
-        step_token_counts: Token counts for the local optimizer step.
+        current_token_counts: Current denominators, with optional complete-loss-name overrides.
+        step_token_counts: Corresponding denominators summed over the local optimizer step.
         device_mesh: Trainer mesh context containing parallel sizes and groups.
 
     Returns:
@@ -66,13 +68,17 @@ def mean_global_loss(
 
     for key, cur_loss in losses.items():
         loss_name = key.split("_loss", maxsplit=1)[0]  # foundation/image_decoder/**
-
-        cur_token_len = current_token_counts[f"{loss_name}_tokens"]
+        count_key = key if key in step_token_counts else f"{loss_name}_tokens"
+        cur_token_len = current_token_counts[count_key].item()
+        step_token_len = step_token_counts[count_key].item()
+        if any(not isinstance(value, Real) or not math.isfinite(value) or value < 0
+               for value in (cur_token_len, step_token_len)):
+            raise ValueError(f"Loss count {count_key} must be finite and nonnegative")
         if sequence_parallel:
-            cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
+            cur_token_len = all_reduce(cur_token_len, op="sum", group=sequence_parallel_group)
 
         all_reduced_len = all_reduce(
-            step_token_counts[f"{loss_name}_tokens"].item(),
+            step_token_len,
             op="sum",
             group=dp_cp_group,
         )

@@ -108,6 +108,9 @@ class OmniParallelBatch:
         device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
         runtime_inputs = self._build_runtime_inputs(device_batch)
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(device_batch)
+        loss_token_counts = runtime_inputs.pop("loss_token_counts", None)
+        if loss_token_counts is not None:
+            loss_inputs["loss_token_counts"] = loss_token_counts
         model_inputs.update(runtime_inputs)
 
         return model_inputs, loss_inputs
@@ -180,6 +183,7 @@ class TextParallelBatch:
             reset_attention_mask: bool = False,
             eod_mask_loss: bool = False,
             runtime_input_adapter: RuntimeInputAdapter | None = None,
+            model_config: Any = None,
     ) -> None:
         """Initialize the batch runtime and its parallel execution context.
 
@@ -197,6 +201,7 @@ class TextParallelBatch:
             reset_attention_mask: Whether EOD starts an independent attention sequence.
             eod_mask_loss: Whether EOD tokens are excluded from the loss.
             runtime_input_adapter: Optional model-owned forward-input extension.
+            model_config: Optional model configuration for model-owned loss metadata.
         """
         # pylint: disable=too-many-locals
 
@@ -216,6 +221,7 @@ class TextParallelBatch:
         ):
             raise TypeError("TextParallelBatch runtime_input_adapter must be a RuntimeInputAdapter")
         self.runtime_input_adapter = runtime_input_adapter
+        self.model_config = model_config
         self._batch_flow_logged = False
 
         if source_type == "online":
@@ -309,6 +315,7 @@ class TextParallelBatch:
                 "attention_mode": self.attention_runtime.mode,
                 "causal": self.causal,
                 "sliding_window": self.sliding_window,
+                "model_config": self.model_config,
             },
         )
         collisions = set(runtime_inputs).intersection(model_runtime_inputs)
@@ -451,7 +458,8 @@ class TextParallelBatch:
         if self.labels_are_shifted:
             model_inputs["shift_labels"] = parallel_batch["labels"]
 
-        runtime_inputs = runtime_inputs or {}
+        runtime_inputs = dict(runtime_inputs or {})
+        loss_token_counts = runtime_inputs.pop("loss_token_counts", None)
         collisions = set(model_inputs).intersection(runtime_inputs)
         if collisions:
             raise ValueError(
@@ -466,5 +474,7 @@ class TextParallelBatch:
         }
         if self.labels_are_shifted:
             loss_inputs["shift_labels"] = parallel_batch["labels"]
+        if loss_token_counts is not None:
+            loss_inputs["loss_token_counts"] = loss_token_counts
 
         return model_inputs, loss_inputs
