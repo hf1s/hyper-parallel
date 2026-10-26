@@ -5,7 +5,8 @@ recipes, data preparation, launchers, and validation manifests are grouped by
 family:
 
 - `qwen3_moe/`: cropped and full-model Qwen3-MoE text demos;
-- `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling.
+- `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling;
+- `xing40/`: Xing4.0-29B launcher.
 
 ## Qwen3-MoE cropped Hugging Face demos
 
@@ -191,3 +192,30 @@ only after all 16 ranks complete. Use
 [`deepseek_v41_validation.yaml`](deepseek_v41/deepseek_v41_validation.yaml) to
 generate reproducible structure, module-parity, precision, checkpoint, and
 performance evidence for the selected local environment.
+
+## Xing4.0-29B
+
+The recipe [`train.yaml`](../../hyper_parallel/models/xing40/recipes/train.yaml)
+trains Xing4.0-29B, a 40-layer, 64-expert DeepSeek-V3-architecture model with four
+mHC residual streams and one MTP depth, on eight NPUs with FSDP. The model computes
+the LM loss, the MTP loss and the router balance loss itself (`ModelOutputLoss`).
+Its router, experts, MLP and norms are the Transformers DeepSeek-V3 modules, which
+the recipe swaps for the framework's NPU `GroupedExperts` and `RMSNorm` through
+`plan_overrides`. The mHC modules can likewise be swapped for the fused
+`MhcPreModule`/`MhcPostModule`, which need the omni custom operators. As in
+MindFormers, FSDP computes the router, mHC and RMSNorm parameters in FP32 and the
+rest in BF16 (`fsdp_config.mix_precision.custom_params`).
+
+```bash
+bash examples/training_demo/xing40/run_train.sh /path/to/text_document
+```
+
+The recipe holds the whole model configuration; `adapter/builder.py` turns it into
+the model's configuration and builds the model with
+`HyperAutoModelForCausalLM.from_config`. The model is randomly initialized unless
+`--checkpoint.restore_from=/path/to/checkpoint` restores a checkpoint, which by
+default also restores the optimizer and training state; add
+`--checkpoint.restore_optimizer=false --checkpoint.restore_train_state=false` to
+restore only weights. Append `--accelerator.ep_size=8` for expert parallelism, and
+`--model.config.num_nextn_predict_layers=0` to train without MTP like the
+MindFormers 29B reference.
