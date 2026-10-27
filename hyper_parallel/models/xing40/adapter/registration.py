@@ -24,6 +24,16 @@ from hyper_parallel.models.xing40.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
 
+
+def _load_replacements():
+    """Return the family's replacement-factory module (lazy provider)."""
+    from hyper_parallel.models.xing40.adapter.conversion import (  # pylint: disable=import-outside-toplevel
+        module_replacement,
+    )
+
+    return module_replacement
+
+
 register_custom_model(
     "Xing40ForCausalLM",
     "hyper_parallel.models.xing40.modeling_xing40",
@@ -33,6 +43,7 @@ register_custom_model(
 XING40_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Xing40ForCausalLM",
     model_type="xing40",
+    replacements=_load_replacements,
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(XING40_ADAPTER_SPEC)
