@@ -22,6 +22,10 @@ model:
     v_head_dim: 128
     rms_norm_eps: 1.0e-06
     hidden_act: silu
+    # Paired with fsdp_config.mix_precision.custom_params['model.embed_tokens.weight']
+    # below: the table stays FP32, this casts only the lookup output. An all-FP32 run
+    # (--fsdp_config.mix_precision.param_dtype=float32) must also set this to float32.
+    embedding_output_dtype: bfloat16
     rope_parameters:
       rope_type: default
       rope_theta: 10000.0
@@ -67,9 +71,11 @@ fsdp_config:
     param_dtype: bfloat16
     reduce_dtype: float32
     cast_forward_inputs: false
-    # MindFormers computes the router, mHC and RMSNorm parameters in FP32 (moe_router_dtype,
-    # mhc_params_dtype and layernorm_compute_dtype); everything else computes in BF16.
+    # Keep FP32 embedding lookup/scatter; the model casts its output before
+    # residual expansion. Router, mHC and RMSNorm also compute in FP32.
     custom_params:
+      'model.embed_tokens.weight':
+        param_dtype: float32
       '*.mlp.gate.weight':
         param_dtype: float32
       '*_hc_pre.*':
