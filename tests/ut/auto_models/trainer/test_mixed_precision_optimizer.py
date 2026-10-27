@@ -17,7 +17,6 @@
 
 import copy
 import logging
-import os
 import tempfile
 import unittest
 from typing import Any
@@ -186,12 +185,15 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
 
         self.assertEqual(adamw.param_groups[0]["step"], 0)
         self.assertEqual(muon.param_groups[0]["step"], 0)
-        self.assertEqual(set(adamw.state[model.adamw_param]), {"exp_avg", "exp_avg_sq"})
+        self.assertEqual(set(adamw.state[model.adamw_param]), {"step", "exp_avg", "exp_avg_sq"})
+        self.assertEqual(adamw.state[model.adamw_param]["step"], 0)
         self.assertEqual(set(muon.state[model.muon_param]), {"momentum_buffer"})
         self.assertTrue(torch.equal(adamw.state[model.adamw_param]["exp_avg"], torch.zeros(2)))
         self.assertTrue(torch.equal(muon.state[model.muon_param]["momentum_buffer"], torch.zeros(2, 2)))
         self.assertTrue(torch.equal(model.adamw_param, expected_adamw))
         self.assertTrue(torch.equal(model.muon_param, expected_muon))
+        with patch("torch.zeros_like", side_effect=AssertionError("Existing moments must not be reallocated")):
+            self.assertTrue(initialize_optimizer_state(optimizer))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
@@ -563,6 +565,106 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         restored_main_param = restored_optimizer.fp32_from_float16_groups[0][0]
         self.assertTrue(torch.equal(restored_main_param, expected))
 
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
+    def test_dcp_restores_parameter_steps_and_legacy_defaults(
+            self, mock_rank: Any, mock_size: Any, mock_barrier: Any,
+    ) -> None:
+        """Resume explicit or legacy counters through DCP and direct flat loads."""
+        del mock_rank, mock_size, mock_barrier
+        cases = ((False, False, True), (False, True, True), (True, False, True),
+                 (True, True, True), (True, False, False), (True, True, False))
+        for flatten, legacy, via_dcp in cases:
+            with self.subTest(flatten=flatten, legacy=legacy, via_dcp=via_dcp):
+                model, optimizer = _build_optimizer()
+                optimizer.optimizer.flatten = flatten
+                leaf = optimizer.optimizer.optimizer
+                params = _optimizer_parameters(optimizer)
+                reference_params = [param.detach().clone() for param in params]
+                group = leaf.param_groups[0]
+                reference = torch.optim.AdamW(
+                    reference_params, lr=group["lr"], betas=group["betas"], eps=group["eps"],
+                    weight_decay=group["weight_decay"], foreach=False, fused=False,
+                )
+                for second_grad in ((None, None) if legacy else (1.0, None)):
+                    model.low.main_grad = torch.ones_like(model.low, dtype=torch.float32)
+                    model.fp32.grad = None if second_grad is None else torch.full_like(model.fp32, second_grad)
+                    optimizer.step()
+                    reference_params[0].grad = torch.ones_like(reference_params[0])
+                    reference_params[1].grad = (
+                        None if second_grad is None else torch.full_like(reference_params[1], second_grad)
+                    )
+                    reference.step()
+                saved = copy.deepcopy(optimizer.state_dict())
+                if legacy and flatten:
+                    for key in list(saved):
+                        if key.startswith("state.") and key.endswith(".step"):
+                            del saved[key]
+                        elif key.endswith("." + CoreAdamW.PARAMETER_STEP_MODE):
+                            del saved[key]
+                elif legacy:
+                    for state in saved["state"].values():
+                        state.pop("step", None)
+                    for saved_group in saved['param_groups']:
+                        saved_group.pop(CoreAdamW.PARAMETER_STEP_MODE, None)
+
+                restored_model, restored = _build_optimizer()
+                restored.optimizer.flatten = flatten
+                if via_dcp:
+                    self.assertTrue(initialize_optimizer_state(restored))
+                    load_state = {"model": restored_model.state_dict(), "optimizer": restored.state_dict()}
+                    with tempfile.TemporaryDirectory() as checkpoint_path:
+                        dcp_save({"model": model.state_dict(), "optimizer": saved},
+                                 checkpoint_id=checkpoint_path, no_dist=True)
+                        DistributedCheckpointer().load(checkpoint_path, load_state)
+                    restored_model.load_state_dict(load_state["model"])
+                    restored.load_state_dict(load_state["optimizer"])
+                else:
+                    restored_model.load_state_dict(model.state_dict())
+                    restored.load_state_dict(saved)
+                restored_leaf = restored.optimizer.optimizer
+                restored_params = _optimizer_parameters(restored)
+                expected_steps = [2, 0 if legacy else 1]
+                actual_steps = [restored_leaf.state[param]["step"] if restored_leaf.state.get(param) else 0
+                                for param in restored_params]
+                self.assertEqual(actual_steps, expected_steps, f"expected={expected_steps}, got={actual_steps}")
+                restored_model.low.main_grad = torch.full_like(restored_model.low, 0.5, dtype=torch.float32)
+                restored_model.fp32.grad = torch.full_like(restored_model.fp32, -1.0)
+                restored.step()
+                for param, value in zip(reference_params, (0.5, -1.0)):
+                    param.grad = torch.full_like(param, value)
+                reference.step()
+                for param, expected in zip(restored_params, reference_params):
+                    torch.testing.assert_close(param, expected, rtol=2e-6, atol=2e-7)
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        torch.testing.assert_close(restored_leaf.state[param][key], reference.state[expected][key])
+
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
+    def test_model_only_dcp_keeps_other_optimizer_integer_steps(
+            self, mock_rank: Any, mock_size: Any, mock_barrier: Any,
+    ) -> None:
+        """Hyper AdamW migration must not change native SparseAdam's integer state."""
+        del mock_rank, mock_size, mock_barrier
+        param = nn.Parameter(torch.tensor([1.0, 2.0]))
+        optimizer = torch.optim.SparseAdam([param], lr=0.01)
+        param.grad = torch.sparse_coo_tensor([[0]], [0.5], size=param.shape)
+        optimizer.step()
+        saved = copy.deepcopy(optimizer.state_dict())
+        self.assertIsInstance(saved['state'][0]['step'], int)
+        load_state = {'model': {'weight': torch.zeros_like(param)}, 'optimizer': copy.deepcopy(saved)}
+        with tempfile.TemporaryDirectory() as checkpoint_path:
+            dcp_save({'model': {'weight': param.detach().clone()}},
+                     checkpoint_id=checkpoint_path, no_dist=True)
+            DistributedCheckpointer().load(checkpoint_path, load_state)
+        optimizer.load_state_dict(load_state['optimizer'])
+        state = optimizer.state[param]
+        self.assertEqual(state['step'], 1, f"expected=1, got={state['step']}")
+        for key in ('exp_avg', 'exp_avg_sq'):
+            torch.testing.assert_close(state[key], saved['state'][0][key], rtol=0, atol=0)
+
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     @patch(
@@ -761,7 +863,7 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         state_dict = optimizer.state_dict()
 
         self.assertEqual(set(state_dict["state"]), {"low", "fp32"})
-        self.assertEqual(set(state_dict["state"]["low"]), {"exp_avg", "exp_avg_sq"})
+        self.assertEqual(set(state_dict["state"]["low"]), {"step", "exp_avg", "exp_avg_sq"})
         self.assertEqual(state_dict["param_groups"][0]["step"], 1)
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
