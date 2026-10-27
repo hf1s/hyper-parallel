@@ -267,5 +267,44 @@ class TestMhcKernelContract(unittest.TestCase):
         self.assertFalse(torch.isnan(fused_pre.phi.weight).any().item(), "the mixing projection stays NaN")
 
 
+class TestXing40EmbeddingPrecision(unittest.TestCase):
+    """Keep lookup/scatter precision independent of residual activation precision."""
+
+    def test_fp32_lookup_with_low_precision_output_preserves_scatter(self):
+        """Repeated tokens accumulate their low-precision output gradients in FP32."""
+        model = _model(embedding_output_dtype="bfloat16")
+        weight = model.model.embed_tokens.weight
+        ids = torch.tensor([[3, 3]])
+        output = model.model.embed_inputs(ids)
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(weight.dtype, torch.float32)
+        torch.testing.assert_close(output, weight.detach()[ids].to(torch.bfloat16), rtol=0, atol=0)
+        coefficients = torch.ones_like(output)
+        coefficients[:, 1] = 1 / 256
+        (output * coefficients).sum().backward()
+        expected = torch.zeros_like(weight)
+        expected[3] = 1 + 1 / 256
+        torch.testing.assert_close(weight.grad, expected, rtol=0, atol=0)
+        self.assertIs(model.model.embed_tokens.weight, weight)
+
+    def test_output_policy_is_shared_by_backbone_and_mtp(self):
+        """Both lookups apply one policy after the native embedding boundary."""
+        model = _model(embedding_output_dtype="bfloat16")
+        with mock.patch.object(model.model, "embed_inputs", wraps=model.model.embed_inputs) as lookup:
+            losses = _train_step(model)
+        self.assertEqual(lookup.call_count, 2)
+        self.assertTrue(all(torch.isfinite(loss).item() for loss in losses.values()))
+
+    def test_default_and_serialized_output_dtype(self):
+        """Existing callers retain their lookup dtype; invalid policies fail early."""
+        model = _model()
+        ids = torch.tensor([[3, 7]])
+        torch.testing.assert_close(model.model.embed_inputs(ids), model.model.embed_tokens(ids), rtol=0, atol=0)
+        config = _config(embedding_output_dtype="bfloat16")
+        self.assertEqual(Xing40Config.from_dict(config.to_dict()).embedding_output_dtype, "bfloat16")
+        with self.assertRaisesRegex(ValueError, "embedding_output_dtype"):
+            _config(embedding_output_dtype="int32")
+
+
 if __name__ == "__main__":
     unittest.main()
