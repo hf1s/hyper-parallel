@@ -17,11 +17,11 @@
 import unittest
 
 import torch
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
 
 from hyper_parallel.core.optimizer.muon import Muon as MuonOptimizer
 from hyper_parallel.models.xing40.adapter.optim import _ns_transform, build_optimizer, clip_qk
 from hyper_parallel.models.xing40.modeling_xing40 import (
-    Xing40Attention,
     Xing40Config,
     Xing40ForCausalLM,
 )
@@ -55,7 +55,7 @@ class TestQkClip(unittest.TestCase):
             and other heads are unchanged; the maxima are cleared.
         """
         torch.manual_seed(0)
-        attention = Xing40Attention(CONFIG)
+        attention = DeepseekV3Attention(CONFIG, layer_idx=0)
         query, key_value = attention.q_b_proj.weight.detach().clone(), attention.kv_b_proj.weight.detach().clone()
         attention.max_logits = torch.tensor([10.0, 400.0, 99.0, 100.0])
         clip_qk([attention], 100.0)
@@ -87,7 +87,7 @@ class TestQkClip(unittest.TestCase):
                 model=model, muon_config={"muon_lr": 1e-3}, adamw_config={"adamw_lr": 1e-3},
                 qk_clip_threshold=threshold).get_optimizer()
             torch.stack(list(model(input_ids, shift_labels=input_ids.roll(-1, 1)).loss.values())).sum().backward()
-            attention = [module for module in model.modules() if isinstance(module, Xing40Attention)]
+            attention = [module for module in model.modules() if isinstance(module, DeepseekV3Attention)]
             for module in attention:
                 module.max_logits = torch.tensor([10.0, 400.0, 99.0, 100.0])
             optimizer.step()
@@ -151,6 +151,8 @@ class TestMuonSchema(unittest.TestCase):
         cases = {
             "model.layers.0.self_attn.linear_qkv.weight": (
                 (q_lora + kv_lora + rope, 32), [(q_lora, 32), (kv_lora, 32), (rope, 32)]),
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight": (
+                (kv_lora + rope, 32), [(kv_lora, 32), (rope, 32)]),
             "model.layers.0.self_attn.q_b_proj.weight": (
                 (heads * (nope + rope), 16), [(heads * nope, 16), (heads * rope, 16)]),
             "model.layers.0.self_attn.kv_b_proj.weight": (

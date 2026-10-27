@@ -199,12 +199,15 @@ The recipe [`train.yaml`](../../hyper_parallel/models/xing40/recipes/train.yaml)
 trains Xing4.0-29B, a 40-layer, 64-expert DeepSeek-V3-architecture model with four
 mHC residual streams and one MTP depth, on eight NPUs with FSDP. The model computes
 the LM loss, the MTP loss and the router balance loss itself (`ModelOutputLoss`).
-Its router, experts, MLP and norms are the Transformers DeepSeek-V3 modules, which
-the recipe swaps for the framework's NPU `GroupedExperts` and `RMSNorm` through
-`plan_overrides`. The mHC modules can likewise be swapped for the fused
-`MhcPreModule`/`MhcPostModule`, which need the omni custom operators. As in
-MindFormers, FSDP computes the router, mHC and RMSNorm parameters in FP32 and the
-rest in BF16 (`fsdp_config.mix_precision.custom_params`).
+Its attention, router, experts, MLP and norms are the Transformers DeepSeek-V3
+modules. On NPU the recipe swaps in the framework's modules through `plan_overrides`:
+`MLAAttention` (as `adapter/attention.py`'s `Xing40MLAAttention`, which keeps the
+MindFormers FP32 RoPE and records the logit maxima QK clipping consumes),
+`GroupedExperts`, `RMSNorm` and the fused `MhcPreModule`/`MhcPostModule`. The fused
+mHC, as in the MindFormers production configuration, needs the omni custom operators;
+remove its two entries for the non-fused MindFormers reference. As in MindFormers,
+FSDP computes the router, mHC and RMSNorm parameters in FP32 and the rest in BF16
+(`fsdp_config.mix_precision.custom_params`).
 
 ```bash
 bash examples/training_demo/xing40/run_train.sh /path/to/text_document
