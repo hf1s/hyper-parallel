@@ -992,8 +992,9 @@ class OptimizerSwapAdapter:
 
         units = []
         for group_index, group in enumerate(self.optimizer.param_groups):
+            previous_group_step = group.get("step") or 0
             if self.is_new_adamw:
-                group["step"] = (group.get("step") or 0) + 1
+                group["step"] = previous_group_step + 1
             for param in group["params"]:
                 grad = getattr(param, "grad", None)
                 if grad is None:
@@ -1001,7 +1002,7 @@ class OptimizerSwapAdapter:
                 if getattr(grad, "is_sparse", False):
                     raise ValueError("Swap optimizer only supports dense Adam/AdamW gradients.")
                 state = self.optimizer.state[param]
-                self._init_param_state(param, grad, group)
+                self._prepare_param_state(param, grad, group, previous_group_step)
                 slots = self._build_slots(param, state)
                 units.append(UpdateUnit(
                     adapter_index=group_index,
@@ -1015,8 +1016,9 @@ class OptimizerSwapAdapter:
         """Build a stable packed layout while retaining inactive materialized states."""
         records = []
         for group_index, group in enumerate(self.optimizer.param_groups):
+            previous_group_step = group.get("step") or 0
             if self.is_new_adamw:
-                group["step"] = (group.get("step") or 0) + 1
+                group["step"] = previous_group_step + 1
             for param in group["params"]:
                 grad = getattr(param, "grad", None)
                 state = self.optimizer.state.get(param)
@@ -1024,7 +1026,7 @@ class OptimizerSwapAdapter:
                     if getattr(grad, "is_sparse", False):
                         raise ValueError("Swap optimizer only supports dense Adam/AdamW gradients.")
                     state = self.optimizer.state[param]
-                    self._init_param_state(param, grad, group)
+                    self._prepare_param_state(param, grad, group, previous_group_step)
                 if state:
                     self._register_present_slots(param, state)
                 has_slots = any((id(param), key) in self._slots for key in self._configured_state_keys())
@@ -1070,8 +1072,8 @@ class OptimizerSwapAdapter:
         """Gather the per-parameter argument lists one optimizer step needs.
 
         Units without a gradient are skipped.  ``max_exp_avg_sqs`` stays empty
-        unless the group is amsgrad, and ``state_steps`` holds ``None`` for new
-        AdamW, which advances the step counter itself.
+        unless the group is amsgrad. Hyper AdamW reads its integer counters from
+        optimizer state while forming batches with equal effective steps.
         """
         args = GroupArgs([], [], [], [], [], [])
         for unit in units:
@@ -1103,21 +1105,28 @@ class OptimizerSwapAdapter:
 
     def _step_group(self, group: Dict[str, Any], units: List[UpdateUnit]) -> None:
         """Run one group's parameters through the matching functional Adam/AdamW."""
+        if self.is_new_adamw:
+            by_step: Dict[int, List[UpdateUnit]] = defaultdict(list)
+            for unit in units:
+                if unit.grad is not None:
+                    by_step[self.optimizer.state[unit.param]["step"]].append(unit)
+            for parameter_step, active_units in by_step.items():
+                args = self._collect_group_args(active_units, group)
+                self._step_new_adamw(
+                    group,
+                    args.params,
+                    args.grads,
+                    args.exp_avgs,
+                    args.exp_avg_sqs,
+                    args.max_exp_avg_sqs,
+                    parameter_step=parameter_step,
+                )
+            return
+
         args = self._collect_group_args(units, group)
         params = args.params
 
         if not params:
-            return
-
-        if self.is_new_adamw:
-            self._step_new_adamw(
-                group,
-                args.params,
-                args.grads,
-                args.exp_avgs,
-                args.exp_avg_sqs,
-                args.max_exp_avg_sqs,
-            )
             return
 
         func = getattr(torch.optim._functional, self.functional_name)
@@ -1162,21 +1171,21 @@ class OptimizerSwapAdapter:
             exp_avgs: Sequence[Any],
             exp_avg_sqs: Sequence[Any],
             max_exp_avg_sqs: Sequence[Any],
+            *,
+            parameter_step: int,
     ) -> None:
         """Run the new AdamW functional for one group."""
         if params and params[0].device.type == "cpu":
-            # torch.optim._functional.adamw increments tensor state_steps
-            # internally. New AdamW already advanced group["step"] in
-            # prepare_step(), so feed step - 1 to preserve outer-step
-            # semantics for CPU-only tests.
-            step_tensor = torch.tensor(float(group["step"] - 1), dtype=torch.float32)
+            # The functional increments every parameter's scalar in place.
+            # Aliasing one scalar across parameters would advance it repeatedly.
+            state_steps = [torch.tensor(parameter_step - 1, dtype=torch.int64) for _ in params]
             torch.optim._functional.adamw(
                 params,
                 grads,
                 exp_avgs,
                 exp_avg_sqs,
                 max_exp_avg_sqs,
-                [step_tensor] * len(params),
+                state_steps,
                 amsgrad=group["amsgrad"],
                 beta1=group["betas"][0],
                 beta2=group["betas"][1],
@@ -1199,7 +1208,7 @@ class OptimizerSwapAdapter:
             exp_avgs,
             exp_avg_sqs,
             max_exp_avg_sqs,
-            group["step"],
+            parameter_step,
             amsgrad=group["amsgrad"],
             beta1=group["betas"][0],
             beta2=group["betas"][1],
@@ -1232,6 +1241,16 @@ class OptimizerSwapAdapter:
         """Load optimizer checkpoint state while restoring swap-managed slots."""
         del args, kwargs
         stripped, removed = self.strip_swappable_state(state_dict)
+        if self.is_new_adamw:
+            for group in stripped['param_groups']:
+                for param_id in group['params']:
+                    original = state_dict.get('state', {}).get(param_id)
+                    if original:
+                        # Read legacy defaults while moments are still visible;
+                        # stripped states no longer identify prior updates.
+                        stripped['state'][param_id]['step'] = self.optimizer.get_parameter_step(
+                            original, group.get('step') or 0,
+                        )
         self.optimizer.load_state_dict(stripped)
         self.load_swappable_state(state_dict, removed)
 
@@ -1456,10 +1475,28 @@ class OptimizerSwapAdapter:
             state[key] = device_tensor
             self._slots[(id(param), key)] = self._make_slot(key, device_tensor)
 
+    def _prepare_param_state(
+            self,
+            param: Any,
+            grad: Any,
+            group: Dict[str, Any],
+            previous_group_step: int,
+    ) -> None:
+        """Initialize buffers and advance only this active parameter's counter."""
+        state = self.optimizer.state[param]
+        completed_steps = (
+            self.optimizer.get_parameter_step(state, previous_group_step) if self.is_new_adamw else None
+        )
+        self._init_param_state(param, grad, group)
+        if completed_steps is not None:
+            state["step"] = completed_steps + 1
+
     def _init_param_state(self, param: Any, grad: Any, group: Dict[str, Any]) -> None:
         """Initialize missing Adam state and swap slots for one parameter."""
         del grad
         state = self.optimizer.state[param]
+        if self.is_new_adamw and len(state) == 0:
+            state["step"] = 0
         if not self.is_new_adamw and len(state) == 0:
             step_device = (
                 param.device

@@ -29,6 +29,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from hyper_parallel.core.optimizer.adamw import AdamW as HyperAdamW
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
@@ -247,12 +248,25 @@ class ChainedOptimizer:
         """
         for optimizer in self.chained_optimizers:
             with self._optimizer_parameter_view():
-                set_optimizer_state_dict(
-                    self.model,
-                    optimizer,
-                    optim_state_dict=state_dict,
-                    options=StateDictOptions(flatten_optimizer_state_dict=self.flatten),
+                hyper_adamw = self.flatten and isinstance(
+                    getattr(optimizer, 'optimizer', optimizer), HyperAdamW,
                 )
+                if hyper_adamw:
+                    # Legacy flat checkpoints lack this newly added metadata;
+                    # let Torch retain its own FQN, alias and group handling.
+                    for group in optimizer.param_groups:
+                        group.pop(HyperAdamW.PARAMETER_STEP_MODE, None)
+                try:
+                    set_optimizer_state_dict(
+                        self.model,
+                        optimizer,
+                        optim_state_dict=state_dict,
+                        options=StateDictOptions(flatten_optimizer_state_dict=self.flatten),
+                    )
+                finally:
+                    if hyper_adamw:
+                        for group in optimizer.param_groups:
+                            group[HyperAdamW.PARAMETER_STEP_MODE] = True
 
         self._synchronize_steps()
 

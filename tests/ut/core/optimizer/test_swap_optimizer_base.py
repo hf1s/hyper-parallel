@@ -2279,8 +2279,8 @@ class TestSwapAdapterStepPreparation(_AdapterTestCase):
 
         self.assertIs(adapter.optimizer.state[param]["exp_avg"], existing)
 
-    def test_init_param_state_skips_step_for_new_adamw(self):
-        """hyper-parallel's AdamW owns its step counter, so none is created."""
+    def test_init_param_state_initializes_new_adamw_parameter_step(self) -> None:
+        """Hyper AdamW uses a non-swappable integer counter for each parameter."""
         param = torch.nn.Parameter(torch.ones(8))
         optimizer = torch.optim.AdamW([param], lr=0.01)
         adapter = object.__new__(OptimizerSwapAdapter)
@@ -2292,8 +2292,8 @@ class TestSwapAdapterStepPreparation(_AdapterTestCase):
 
         adapter._init_param_state(param, None, {"amsgrad": False})
 
-        self.assertNotIn("step", optimizer.state[param])
-        self.assertEqual(set(optimizer.state[param]), set(ADAM_STATE_KEYS))
+        self.assertEqual(optimizer.state[param]["step"], 0)
+        self.assertEqual(set(optimizer.state[param]), {"step", *ADAM_STATE_KEYS})
 
     def test_init_param_state_adds_amsgrad_state_only_when_requested(self):
         """amsgrad adds the running maximum beside the two moments."""
@@ -2308,7 +2308,7 @@ class TestSwapAdapterStepPreparation(_AdapterTestCase):
 
         adapter._init_param_state(param, None, {"amsgrad": True})
 
-        self.assertEqual(set(optimizer.state[param]), set(ALL_STATE_KEYS))
+        self.assertEqual(set(optimizer.state[param]), {"step", *ALL_STATE_KEYS})
 
     def test_publish_packed_state_is_a_noop_for_per_tensor_runtimes(self):
         """Legacy runtimes leave the optimizer state mapping untouched."""

@@ -153,6 +153,39 @@ def _prepare_main_param_state_for_dcp_load(
             )
 
 
+def _prepare_adamw_steps_for_dcp_load(state_dict: Dict[str, Any], available_keys: set[str]) -> None:
+    """Distinguish legacy AdamW moments from parameters never updated.
+
+    Only explicitly marked Hyper AdamW groups participate. Other optimizers,
+    including ones with integer counters, keep their original load behavior.
+    """
+    optimizers = state_dict.get('optimizer')
+    is_list = isinstance(optimizers, list)
+    branches = optimizers if is_list else [optimizers]
+    for index, optimizer in enumerate(branches):
+        if not isinstance(optimizer, dict):
+            continue
+        prefix = f'optimizer.{index}' if is_list else 'optimizer'
+        groups = optimizer.get('param_groups')
+        nested = isinstance(groups, list)
+        if nested:
+            names = [name for group in groups if group.get(HyperAdamW.PARAMETER_STEP_MODE)
+                     for name in group['params']]
+        else:
+            marker_suffix = '.' + HyperAdamW.PARAMETER_STEP_MODE
+            names = [key[len('param_groups.'):-len(marker_suffix)] for key, value in optimizer.items()
+                     if key.startswith('param_groups.') and key.endswith(marker_suffix) and value is True]
+        for name in names:
+            state_prefix = f'{prefix}.state.{name}.'
+            parameter_state = optimizer.get('state', {}).get(name, {}) if nested else optimizer
+            step_key = 'step' if nested else f'state.{name}.step'
+            if not isinstance(parameter_state.get(step_key), int) or state_prefix + 'step' in available_keys:
+                continue
+            has_moments = any(state_prefix + key in available_keys
+                              for key in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq'))
+            parameter_state[step_key] = None if has_moments else 0
+
+
 class _ModelStrictLoadPlanner(StandardLoadPlanner):
     """Allow partial optimizer state while still requiring a complete model.
 
@@ -186,6 +219,7 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
             state_dict,
             set(metadata.state_dict_metadata),
         )
+        _prepare_adamw_steps_for_dcp_load(state_dict, set(metadata.state_dict_metadata))
         super().configure_planner(state_dict, metadata, **kwargs)
 
     def build_local_plan(self) -> Any:
@@ -210,7 +244,7 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
             preview = ", ".join(missing_optimizer[:3])
             logger.warning(
                 "%s optimizer entries are absent from the checkpoint and keep their "
-                "zero-initialised values (e.g. %s). Expected for parameters that "
+                "initial or legacy defaults (e.g. %s). Expected for parameters that "
                 "never received a gradient, or for a checkpoint written with "
                 "save_optimizer=false.",
                 len(missing_optimizer),
@@ -266,16 +300,14 @@ def _materialize_hyper_optimizer_state(
                 if id(param) not in param_ids:
                     continue
                 state = optimizer.state[param]
+                if isinstance(optimizer, HyperAdamW):
+                    state['step'] = optimizer.get_parameter_step(state, group['step'])
                 for state_key in state_keys:
-                    state.setdefault(
-                        state_key,
-                        torch.zeros_like(param, memory_format=torch.preserve_format),
-                    )
+                    if state_key not in state:
+                        state[state_key] = torch.zeros_like(param, memory_format=torch.preserve_format)
                 if isinstance(optimizer, HyperAdamW) and group.get("amsgrad", False):
-                    state.setdefault(
-                        "max_exp_avg_sq",
-                        torch.zeros_like(param, memory_format=torch.preserve_format),
-                    )
+                    if 'max_exp_avg_sq' not in state:
+                        state['max_exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
     return True
 
 
@@ -327,6 +359,9 @@ def initialize_optimizer_state(optimizer: Any) -> bool:
     """
     leaf_optimizers = _leaf_optimizers(optimizer)
     if all(leaf_optimizer.state for leaf_optimizer in leaf_optimizers):
+        for leaf_optimizer in leaf_optimizers:
+            if isinstance(leaf_optimizer, HyperAdamW):
+                _materialize_hyper_optimizer_state(leaf_optimizer, _optimizer_parameters(leaf_optimizer))
         return True
 
     leaf_parameters = {

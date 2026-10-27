@@ -59,7 +59,14 @@ def adamw(
 
 
 class AdamW(torch.optim.Optimizer):
-    """AdamW optimizer implementation."""
+    """AdamW with bias correction based on each parameter's effective updates.
+
+    A missing gradient skips that parameter's counter as well as its moments.
+    Legacy checkpoints without parameter counters use the saved group step for
+    initialized moments; their historical missing-gradient counts are unavailable.
+    """
+
+    PARAMETER_STEP_MODE = '_hp_adamw_parameter_steps'
 
     def __init__(
             self,
@@ -81,12 +88,58 @@ class AdamW(torch.optim.Optimizer):
         }
         super().__init__(params, defaults)
 
+    def add_param_group(self, param_group: dict) -> None:
+        """Register the explicit checkpoint policy for this optimizer family."""
+        super().add_param_group(param_group)
+        self.param_groups[-1][self.PARAMETER_STEP_MODE] = True
+
     def __setstate__(self, state):
         """Set optimizer state."""
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault('amsgrad', False)
             group.setdefault('maximize', False)
+            group[self.PARAMETER_STEP_MODE] = True
+            for param in group['params']:
+                param_state = self.state.get(param)
+                if param_state:
+                    # Torch's flat loader reconstructs absent legacy fields as
+                    # empty dictionaries. A never-active parameter stays lazy.
+                    if all(isinstance(param_state.get(key), dict) and not param_state[key]
+                           for key in ('exp_avg', 'exp_avg_sq')):
+                        param_state.clear()
+                    else:
+                        param_state['step'] = self.get_parameter_step(param_state, group.get('step') or 0)
+
+    @staticmethod
+    def get_parameter_step(state: dict, group_step: int) -> int:
+        """Read an effective update count, including legacy checkpoint defaults.
+
+        ``None`` or an empty dictionary represents a legacy entry with moments
+        but no saved counter after DCP or Torch flat-state reconstruction.
+        Tensor counters imported from Torch are normalized once, outside the
+        ordinary integer-counter path.
+
+        Args:
+            state: This parameter's optimizer state.
+            group_step: Saved group count used only for initialized legacy state.
+
+        Returns:
+            The nonnegative number of effective updates already completed.
+        """
+        value = state.get('step')
+        if value is None or (isinstance(value, dict) and not value):
+            value = group_step if any(isinstance(state.get(key), torch.Tensor)
+                                     for key in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq')) else 0
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        try:
+            step = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('AdamW parameter step must be a nonnegative integer') from exc
+        if step < 0 or step != value:
+            raise ValueError('AdamW parameter step must be a nonnegative integer')
+        return step
 
     def __str__(self):
         return super().__repr__()
@@ -101,15 +154,11 @@ class AdamW(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            max_exp_avg_sqs = []
-
             amsgrad = group['amsgrad']
             beta1, beta2 = group['betas']
-            group['step'] = (group.get('step') or 0) + 1
+            previous_group_step = group.get('step') or 0
+            group['step'] = previous_group_step + 1
+            params_by_step = {}
 
             current_rank_params = group['params']
             for p in current_rank_params:
@@ -120,6 +169,7 @@ class AdamW(torch.optim.Optimizer):
                     raise RuntimeError('AdamW does not support sparse gradients')
 
                 state = self.state[p]
+                completed_steps = self.get_parameter_step(state, previous_group_step)
 
                 if len(state) == 0:
                     state['exp_avg'] = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
@@ -127,22 +177,18 @@ class AdamW(torch.optim.Optimizer):
                     if amsgrad:
                         state['max_exp_avg_sq'] = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
 
-                params_with_grad.append(p)
-                grads.append(p.grad)
-                exp_avgs.append(state['exp_avg'])
-                exp_avg_sqs.append(state['exp_avg_sq'])
+                state['step'] = completed_steps + 1
+                params_by_step.setdefault(state['step'], []).append(p)
 
-                if amsgrad:
-                    max_exp_avg_sqs.append(state['max_exp_avg_sq'])
-
-            if params_with_grad:
+            for parameter_step, params_with_grad in params_by_step.items():
+                states = [self.state[param] for param in params_with_grad]
                 adamw(
                     params_with_grad,
-                    grads,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    group['step'],
+                    [param.grad for param in params_with_grad],
+                    [state['exp_avg'] for state in states],
+                    [state['exp_avg_sq'] for state in states],
+                    [state['max_exp_avg_sq'] for state in states] if amsgrad else [],
+                    parameter_step,
                     amsgrad=amsgrad,
                     beta1=beta1,
                     beta2=beta2,
