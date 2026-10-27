@@ -136,6 +136,50 @@ class TestMuonSchema(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_packed_mlp_preserves_separate_gate_up_updates(self):
+        """
+        Feature: Muon updates after the SwiGLUMLP replacement.
+        Description: Pack unequal gate/up gradients into the Dense and shared FC1 layouts and
+            run two native Muon steps alongside their separate projection parameters.
+        Expectation: Packing preserves both logical matrix updates and their FP32 momentum.
+        """
+        transform = _ns_transform(CONFIG)
+        for name, intermediate in (
+                ("model.layers.0.mlp.linear_fc1.weight", CONFIG.intermediate_size),
+                ("model.layers.1.mlp.shared_experts.linear_fc1.weight", CONFIG.moe_intermediate_size)):
+            with self.subTest(name=name):
+                values = torch.arange(intermediate * CONFIG.hidden_size, dtype=torch.float32)
+                values = values.reshape(intermediate, CONFIG.hidden_size)
+                gate_values = (values.remainder(17) - 8) / 32
+                up_values = (values.remainder(11) - 5) / 16
+                gate = torch.nn.Parameter(gate_values)
+                up = torch.nn.Parameter(up_values)
+                packed = torch.nn.Parameter(torch.cat((gate_values, up_values)))
+                packed.model_name = name
+                prefix = name.removesuffix(".linear_fc1.weight")
+                gate.model_name = prefix + ".gate_proj.weight"
+                up.model_name = prefix + ".up_proj.weight"
+                options = {"lr": 1e-3, "weight_decay": 0.1, "momentum": 0.95, "ns_steps": 5,
+                           "ns_variant": "legacy", "ns_transform_fn": transform}
+                fused_optimizer = MuonOptimizer([packed], **options)
+                separate_optimizer = MuonOptimizer([gate, up], **options)
+                for step in range(2):
+                    gate.grad = (values.remainder(13) - 6 + step) / 64
+                    up.grad = (values.remainder(7) - 3 - step) / 8
+                    packed.grad = torch.cat((gate.grad, up.grad))
+                    fused_optimizer.step()
+                    separate_optimizer.step()
+                    torch.testing.assert_close(
+                        packed, torch.cat((gate, up)), rtol=0, atol=0,
+                        msg=f"{name}: packed gate/up parameter update differs at step {step + 1}")
+                    expected_momentum = torch.cat((separate_optimizer.state[gate]["momentum_buffer"],
+                                                   separate_optimizer.state[up]["momentum_buffer"]))
+                    torch.testing.assert_close(
+                        fused_optimizer.state[packed]["momentum_buffer"], expected_momentum, rtol=0, atol=0,
+                        msg=f"{name}: packed momentum differs at step {step + 1}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_splits_restore_the_original_layout(self):
         """
         Feature: Muon NS input transform.
