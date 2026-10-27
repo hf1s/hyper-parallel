@@ -29,7 +29,6 @@ from torch import nn
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.optimizer.muon import NSInputTransform
-from hyper_parallel.models.xing40.modeling_xing40 import Xing40Attention
 
 __all__ = ["build_optimizer", "clip_qk"]
 
@@ -59,7 +58,9 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
     builder = Muon(muon_config={**muon_config, "ns_transform_fn": _ns_transform(model.config, transposed_experts)},
                    adamw_config=dict(adamw_config), model=model, no_decay_params=no_decay)
     if qk_clip_threshold > 0:
-        attention = [module for module in model.modules() if isinstance(module, Xing40Attention)]
+        # The MLA modules: the NPU replace_xing40_mla_attention result or, unreplaced, Transformers attention.
+        attention = [module for module in model.modules()
+                     if hasattr(module, "q_b_proj") and hasattr(module, "kv_b_proj")]
         chained = builder.get_optimizer()
         step_leaves = chained.step
 
@@ -90,7 +91,9 @@ def _ns_transform(config: Any, transposed_experts: frozenset[str] = frozenset()
                   ) -> Callable[[str, torch.Tensor], NSInputTransform | None]:
     """Return the MindFormers Muon schema, which orthogonalizes these blocks separately.
 
-    * ``linear_qkv``: the query latent, KV latent and shared RoPE-key row blocks;
+    * ``linear_qkv``: the query latent, KV latent and shared RoPE-key row blocks; the
+      unfused Transformers layout keeps ``q_a_proj`` whole and splits
+      ``kv_a_proj_with_mqa`` into its KV latent and RoPE-key rows;
     * ``q_b_proj``/``kv_b_proj``: the per-head no-RoPE rows and the RoPE or value rows;
     * packed Dense/shared ``linear_fc1.weight``: the contiguous gate and up halves
       created by the SwiGLUMLP replacement;
@@ -125,6 +128,8 @@ def _ns_transform(config: Any, transposed_experts: frozenset[str] = frozenset()
         """
         if name.endswith(".self_attn.linear_qkv.weight"):
             return block_split(update, latent_blocks, dim=0)
+        if name.endswith(".self_attn.kv_a_proj_with_mqa.weight"):
+            return block_split(update, latent_blocks[1:], dim=0)
         if name.endswith(".self_attn.q_b_proj.weight"):
             return head_split(update, rope)
         if name.endswith(".self_attn.kv_b_proj.weight"):
@@ -142,7 +147,7 @@ def _ns_transform(config: Any, transposed_experts: frozenset[str] = frozenset()
 
 
 @torch.no_grad()
-def clip_qk(attention: Sequence[Xing40Attention], threshold: float) -> None:
+def clip_qk(attention: Sequence[nn.Module], threshold: float) -> None:
     """Rescale the query/key projections of heads whose maximum logit exceeded ``threshold``.
 
     MuonClip: with ``s = threshold / max(max_logit, threshold)`` per head, the query
@@ -151,13 +156,13 @@ def clip_qk(attention: Sequence[Xing40Attention], threshold: float) -> None:
     all hold every head. The recorded maxima are then cleared.
 
     Args:
-        attention: Attention modules whose ``max_logits`` were recorded since the last step.
+        attention: MLA modules; the NPU fused attention records their ``max_logits`` each step.
         threshold: Maximum attention logit.
 
     Raises:
-        RuntimeError: If a module recorded no maxima, as on non-NPU devices.
+        RuntimeError: If a module recorded no maxima, as without the NPU fused attention.
     """
-    maxima = [module.max_logits for module in attention]
+    maxima = [getattr(module, "max_logits", None) for module in attention]
     if any(maximum is None for maximum in maxima):
         raise RuntimeError("QK clipping requires the logit maxima recorded by the NPU fused attention")
     flat = torch.cat(maxima)

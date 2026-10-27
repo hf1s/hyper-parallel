@@ -14,15 +14,15 @@
 # ============================================================================
 """Xing4.0: a DeepSeek-V3 causal LM with manifold-constrained hyper-connections (mHC) and MTP.
 
-The router, routed and shared experts, dense MLP, RMSNorm, rotary embedding and RoPE
-are the Transformers DeepSeek-V3 components. This module adds what DeepSeek-V3 lacks,
-with MindFormers numerics: attention with one fused ``linear_qkv`` down projection,
-FP32 RoPE and the logit maxima QK clipping consumes; the mHC residual streams; MoE
-pad tokens, the sequence-wise balance loss and the expert-load bias; multi-token
-prediction; and the training losses. The mHC pre/post modules follow the source
-contract of ``MhcPreModule``/``MhcPostModule``, and the experts that of
-``GroupedExperts``, so recipes can swap in the NPU kernels. The recipe supplies every
-configuration value.
+The attention, router, routed and shared experts, dense MLP, RMSNorm, rotary embedding
+and RoPE are the Transformers DeepSeek-V3 components. This module adds what DeepSeek-V3
+lacks, with MindFormers numerics: the mHC residual streams; MoE pad tokens, the
+sequence-wise balance loss and the expert-load bias; multi-token prediction; and the
+training losses. The attention, the mHC pre/post modules and the experts are the sources
+of the framework's ``MLAAttention`` (as
+``adapter.conversion.module_replacement.replace_xing40_mla_attention``),
+``MhcPreModule``/``MhcPostModule`` and ``GroupedExperts``, which the recipe swaps in on
+NPU. The recipe supplies every configuration value.
 """
 
 # This model uses the Torch/HF runtime, like the existing model families.
@@ -40,12 +40,12 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoConfig, DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+    DeepseekV3Attention,
     DeepseekV3MLP,
     DeepseekV3MoE,
     DeepseekV3PreTrainedModel,
     DeepseekV3RMSNorm,
     DeepseekV3RotaryEmbedding,
-    apply_rotary_pos_emb_interleave,
 )
 from transformers.utils import ModelOutput
 
@@ -59,7 +59,6 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 
 __all__ = [
-    "Xing40Attention",
     "Xing40Config",
     "Xing40ForCausalLM",
     "Xing40MhcPost",
@@ -142,93 +141,6 @@ class Xing40RotaryEmbedding(DeepseekV3RotaryEmbedding):
         dim = config.qk_rope_head_dim
         inv_freq = 1.0 / (config.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         return torch.from_numpy(inv_freq.astype(np.float32)).to(device=device), 1.0
-
-
-class Xing40Attention(nn.Module):
-    """Causal multi-head latent attention with the fused query/KV down projection.
-
-    RoPE runs in FP32 and rounds once. On NPU the fused attention kernel also folds the
-    per-head softmax maxima into ``max_logits``, which QK clipping consumes after the
-    optimizer step.
-    """
-
-    def __init__(self, config: Xing40Config) -> None:
-        """Build the projections and latent norms.
-
-        Args:
-            config: Model configuration.
-        """
-        super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.q_lora_rank = config.q_lora_rank
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.scaling = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
-        # Read by the NPU fusion-attention option resolver.
-        self.is_causal = True
-        self.linear_qkv = nn.Linear(
-            config.hidden_size, self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
-        self.q_a_layernorm = DeepseekV3RMSNorm(self.q_lora_rank, config.rms_norm_eps)
-        self.q_b_proj = nn.Linear(
-            self.q_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim), bias=False)
-        self.kv_a_layernorm = DeepseekV3RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
-        self.max_logits: torch.Tensor | None = None
-
-    def forward(self, hidden_states: torch.Tensor,
-                position_embeddings: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        """Attend causally over ``hidden_states`` ``[batch, sequence, hidden]``.
-
-        Args:
-            hidden_states: Normalized layer input.
-            position_embeddings: FP32 RoPE ``(cos, sin)`` tables.
-        """
-        batch, sequence = hidden_states.shape[:2]
-        query_latent, kv_latent, key_rope = self.linear_qkv(hidden_states).split(
-            (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
-        query = self.q_b_proj(self.q_a_layernorm(query_latent)).view(batch, sequence, self.num_heads, -1)
-        query_nope, query_rope = query.split((self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
-        key_value = self.kv_b_proj(self.kv_a_layernorm(kv_latent)).view(batch, sequence, self.num_heads, -1)
-        key_nope, value = key_value.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
-        cos, sin = position_embeddings
-        query_rope, key_rope = apply_rotary_pos_emb_interleave(
-            query_rope.float(), key_rope.unsqueeze(2).float(), cos, sin, unsqueeze_dim=2)
-        query = torch.cat((query_nope, query_rope.to(query_nope.dtype)), dim=-1)
-        key = torch.cat((key_nope, key_rope.to(key_nope.dtype).expand(-1, -1, self.num_heads, -1)), dim=-1)
-        if hidden_states.device.type == "npu":
-            output = self._npu_attention(query, key, value.contiguous())
-        else:
-            output = F.scaled_dot_product_attention(  # pylint: disable=not-callable
-                query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
-                is_causal=True, scale=self.scaling).transpose(1, 2)
-        return self.o_proj(output.reshape(batch, sequence, -1))
-
-    def _npu_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        """Run TND fused attention on ``[batch, sequence, heads, dim]`` inputs and record the logit maxima."""
-        # NPU-only kernels; importing them on other devices would require torch_npu.
-        # pylint: disable=import-outside-toplevel
-        import torch_npu
-        from hyper_parallel.components.functional.npu_fusion_attention import _prepare_fusion_attention_context
-
-        batch, sequence = query.shape[:2]
-        lengths = tuple(range(sequence, batch * sequence + 1, sequence))
-        context = _prepare_fusion_attention_context(
-            self, query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), None,
-            {"actual_seq_len": lengths})
-        output, softmax_max = torch_npu.npu_fusion_attention(
-            context.query, context.key, context.value, self.num_heads, context.input_layout,
-            pse=None, padding_mask=None, atten_mask=context.attention_mask, scale=self.scaling,
-            pre_tockens=context.pre_tokens, next_tockens=context.next_tokens, keep_prob=1.0,
-            inner_precise=0, sparse_mode=context.sparse_mode, actual_seq_qlen=context.query_lengths,
-            actual_seq_kvlen=context.key_lengths, softmax_layout="TND")[:2]
-        with torch.no_grad():
-            maximum = softmax_max.amax(dim=(0, 2))
-            self.max_logits = maximum if self.max_logits is None else torch.maximum(self.max_logits, maximum)
-        return output.view(batch, sequence, self.num_heads, self.v_head_dim)
 
 
 class Xing40MoE(DeepseekV3MoE):
@@ -483,15 +395,19 @@ class Xing40MhcHead(nn.Module):
 class Xing40DecoderLayer(nn.Module):
     """Decoder layer whose attention and MLP sublayers are wrapped by mHC."""
 
-    def __init__(self, config: Xing40Config, *, sparse: bool) -> None:
+    def __init__(self, config: Xing40Config, layer_idx: int, *, sparse: bool) -> None:
         """Build the attention, MLP, norms and the two hyper-connections.
 
         Args:
             config: Model configuration.
+            layer_idx: Index of the layer among the decoder layers and the MTP depths.
             sparse: Use the routed MoE instead of the dense MLP.
         """
         super().__init__()
-        self.self_attn = Xing40Attention(config)
+        self.self_attn = DeepseekV3Attention(config, layer_idx)
+        # Transformers builds the latent norms with the default epsilon; MindFormers uses rms_norm_eps.
+        self.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
+        self.self_attn.kv_a_layernorm.variance_epsilon = config.rms_norm_eps
         self.mlp = Xing40MoE(config) if sparse else DeepseekV3MLP(config)
         self.input_layernorm = DeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = DeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -509,7 +425,8 @@ class Xing40DecoderLayer(nn.Module):
             position_embeddings: FP32 RoPE ``(cos, sin)`` tables.
         """
         layer_input, post, mix, residual = self.attn_hc_pre(streams)
-        output = self.self_attn(self.input_layernorm(layer_input), position_embeddings)
+        output = self.self_attn(hidden_states=self.input_layernorm(layer_input),
+                                position_embeddings=position_embeddings, attention_mask=None)[0]
         streams = self.attn_hc_post(output, residual, post, mix)
         layer_input, post, mix, residual = self.ffn_hc_pre(streams)
         output = self.mlp(self.post_attention_layernorm(layer_input))
@@ -532,7 +449,7 @@ class Xing40Model(nn.Module):
             getattr(torch, config.embedding_output_dtype) if config.embedding_output_dtype is not None else None
         )
         self.layers = nn.ModuleList(
-            Xing40DecoderLayer(config, sparse=index >= config.first_k_dense_replace)
+            Xing40DecoderLayer(config, index, sparse=index >= config.first_k_dense_replace)
             for index in range(config.num_hidden_layers))
         self.hc_head = Xing40MhcHead(config)
         self.norm = DeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -578,18 +495,19 @@ class Xing40MTPLayer(nn.Module):
     and normalizes the result for the shared LM head and the next depth.
     """
 
-    def __init__(self, config: Xing40Config) -> None:
+    def __init__(self, config: Xing40Config, layer_idx: int) -> None:
         """Build the fusion norms and projection, the decoder layer, the head and the output norm.
 
         Args:
             config: Model configuration.
+            layer_idx: Index of the depth's decoder layer, after the backbone's layers.
         """
         super().__init__()
         self.num_residual_streams = config.num_residual_streams
         self.enorm = DeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hnorm = DeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-        self.transformer_layer = Xing40DecoderLayer(config, sparse=True)
+        self.transformer_layer = Xing40DecoderLayer(config, layer_idx, sparse=True)
         self.hc_head = Xing40MhcHead(config)
         self.final_layernorm = DeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -618,7 +536,8 @@ class Xing40MTP(nn.Module):
         """
         super().__init__()
         self.layers = nn.ModuleList(
-            Xing40MTPLayer(config) for _ in range(config.num_nextn_predict_layers))
+            Xing40MTPLayer(config, config.num_hidden_layers + depth)
+            for depth in range(config.num_nextn_predict_layers))
         # Marks ``layers`` as the repeated block container for FSDP units and activation checkpointing.
         self.gradient_checkpointing = False
 
