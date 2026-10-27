@@ -80,9 +80,12 @@ class Xing40Config(DeepseekV3Config):
     ``mtp_loss_factor``, ``moe_aux_loss_coeff``, ``moe_router_enable_expert_bias``,
     ``moe_router_bias_update_rate``, ``use_pad_tokens`` and ``chunk_loss_size``.
     ``moe_router_force_expert_balance`` is optional and defaults to False.
+    ``embedding_output_dtype`` optionally casts lookup activations before residual
+    expansion, independently of embedding parameter/storage precision.
     """
 
     model_type = "xing40"
+    embedding_output_dtype: str | None = None
 
     def __post_init__(self, **kwargs: Any) -> None:
         """Default ``architectures`` to the model class this configuration builds.
@@ -93,6 +96,8 @@ class Xing40Config(DeepseekV3Config):
         if self.architectures is None:
             self.architectures = ["Xing40ForCausalLM"]
         super().__post_init__(**kwargs)
+        if self.embedding_output_dtype not in (None, "float32", "bfloat16", "float16"):
+            raise ValueError("embedding_output_dtype must be float32, bfloat16, float16 or None")
 
 
 AutoConfig.register(Xing40Config.model_type, Xing40Config, exist_ok=True)
@@ -523,6 +528,9 @@ class Xing40Model(nn.Module):
         super().__init__()
         self.num_residual_streams = config.num_residual_streams
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.embedding_output_dtype = (
+            getattr(torch, config.embedding_output_dtype) if config.embedding_output_dtype is not None else None
+        )
         self.layers = nn.ModuleList(
             Xing40DecoderLayer(config, sparse=index >= config.first_k_dense_replace)
             for index in range(config.num_hidden_layers))
@@ -532,6 +540,22 @@ class Xing40Model(nn.Module):
         # Marks ``layers`` as the repeated block container for FSDP units and activation checkpointing.
         self.gradient_checkpointing = False
 
+    def embed_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Look up tokens and cast activations after the embedding boundary.
+
+        Args:
+            input_ids: Token IDs with the batch and sequence dimensions.
+
+        Returns:
+            Lookup activations in the configured output dtype, or the lookup's
+            original dtype when no override is configured. Parameter precision
+            and the native embedding backward remain unchanged.
+        """
+        embeddings = self.embed_tokens(input_ids)
+        if self.embedding_output_dtype is not None:
+            embeddings = embeddings.to(self.embedding_output_dtype)
+        return embeddings
+
     def forward(self, input_ids: torch.Tensor,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         """Return the final-normed hidden states the LM head and the first MTP depth read.
@@ -540,7 +564,7 @@ class Xing40Model(nn.Module):
             input_ids: Token IDs ``[batch, sequence]``.
             position_embeddings: FP32 RoPE ``(cos, sin)`` tables.
         """
-        streams = self.embed_tokens(input_ids).repeat(1, 1, self.num_residual_streams)
+        streams = self.embed_inputs(input_ids).repeat(1, 1, self.num_residual_streams)
         for layer in self.layers:
             streams = layer(streams, position_embeddings)
         return self.norm(self.hc_head(streams))
@@ -733,7 +757,7 @@ class Xing40ForCausalLM(Xing40PreTrainedModel):
         for layer in self.mtp.layers:
             input_ids = F.pad(input_ids[:, 1:], (0, 1), value=0)
             targets = F.pad(targets[:, 1:], (0, 1), value=IGNORE_INDEX)
-            hidden = layer(hidden, self.model.embed_tokens(input_ids), position_embeddings)
+            hidden = layer(hidden, self.model.embed_inputs(input_ids), position_embeddings)
             total = total + self._cross_entropy(hidden, targets)
         return total * (self.config.mtp_loss_factor / len(self.mtp.layers))
 

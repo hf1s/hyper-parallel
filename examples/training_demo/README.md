@@ -203,8 +203,11 @@ Its router, experts, MLP and norms are the Transformers DeepSeek-V3 modules, whi
 the recipe swaps for the framework's NPU `GroupedExperts` and `RMSNorm` through
 `plan_overrides`. The mHC modules can likewise be swapped for the fused
 `MhcPreModule`/`MhcPostModule`, which need the omni custom operators. As in
-MindFormers, FSDP computes the router, mHC and RMSNorm parameters in FP32 and the
-rest in BF16 (`fsdp_config.mix_precision.custom_params`).
+MindFormers, FSDP computes the router, mHC, RMSNorm and embedding table parameters
+in FP32 and the rest in BF16 (`fsdp_config.mix_precision.custom_params`); the
+model's `embedding_output_dtype` separately casts the lookup output to BF16
+before it expands into the mHC residual streams, so the two settings must be
+changed together.
 
 ```bash
 bash examples/training_demo/xing40/run_train.sh /path/to/text_document

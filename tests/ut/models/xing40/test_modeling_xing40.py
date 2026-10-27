@@ -423,5 +423,67 @@ class TestMhcKernelContract(unittest.TestCase):
         self.assertFalse(torch.isnan(fused_pre.phi.weight).any().item(), "the mixing projection stays NaN")
 
 
+class TestXing40EmbeddingPrecision(unittest.TestCase):
+    """Keep lookup/scatter precision independent of residual activation precision."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_fp32_lookup_with_low_precision_output_preserves_scatter(self):
+        """
+        Feature: Embedding lookup/scatter precision independent of the residual output cast.
+        Description: Look up a repeated token through embed_inputs with a BF16 output policy and an
+            FP32 table, then backward with per-occurrence coefficients that only round in BF16.
+        Expectation: The output is BF16 and equals the FP32 row cast once; the FP32 weight gradient
+            sums the un-rounded coefficients at the repeated row and stays zero elsewhere.
+        """
+        model = _model(embedding_output_dtype="bfloat16")
+        weight = model.model.embed_tokens.weight
+        ids = torch.tensor([[3, 3]])
+        output = model.model.embed_inputs(ids)
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(weight.dtype, torch.float32)
+        torch.testing.assert_close(output, weight.detach()[ids].to(torch.bfloat16), rtol=0, atol=0)
+        coefficients = torch.ones_like(output)
+        coefficients[:, 1] = 1 / 256
+        (output * coefficients).sum().backward()
+        expected = torch.zeros_like(weight)
+        expected[3] = 1 + 1 / 256
+        torch.testing.assert_close(weight.grad, expected, rtol=0, atol=0)
+        self.assertIs(model.model.embed_tokens.weight, weight)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_output_policy_is_shared_by_backbone_and_mtp(self):
+        """
+        Feature: One embedding output policy for every lookup.
+        Description: Run one training step with a BF16 output policy, wrapping embed_inputs to count calls.
+        Expectation: Both the backbone and the MTP depth's next-token embedding call embed_inputs, and
+            both losses stay finite.
+        """
+        model = _model(embedding_output_dtype="bfloat16")
+        with mock.patch.object(model.model, "embed_inputs", wraps=model.model.embed_inputs) as lookup:
+            losses = _train_step(model)
+        self.assertEqual(lookup.call_count, 2, f"embed_inputs calls: {lookup.call_count}")
+        self.assertTrue(all(torch.isfinite(loss).item() for loss in losses.values()), f"losses: {losses}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_default_and_serialized_output_dtype(self):
+        """
+        Feature: Default output policy and configuration validation.
+        Description: Compare the unset-policy lookup to the plain embedding; round-trip a BF16 policy
+            through config serialization; construct with an unsupported dtype string.
+        Expectation: The unset policy reproduces the plain embedding; serialization preserves the field;
+            an invalid dtype string raises ValueError naming the field.
+        """
+        model = _model()
+        ids = torch.tensor([[3, 7]])
+        torch.testing.assert_close(model.model.embed_inputs(ids), model.model.embed_tokens(ids), rtol=0, atol=0)
+        config = _config(embedding_output_dtype="bfloat16")
+        self.assertEqual(Xing40Config.from_dict(config.to_dict()).embedding_output_dtype, "bfloat16")
+        with self.assertRaisesRegex(ValueError, "embedding_output_dtype"):
+            _config(embedding_output_dtype="int32")
+
+
 if __name__ == "__main__":
     unittest.main()
