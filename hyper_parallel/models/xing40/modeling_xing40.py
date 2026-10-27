@@ -56,6 +56,7 @@ from hyper_parallel.components.losses.chunked_cross_entropy import chunked_cross
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.distributed.expert_parallel.routing import balanced_expert_indices
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 
 __all__ = [
@@ -77,7 +78,8 @@ class Xing40Config(DeepseekV3Config):
 
     Besides the DeepSeek-V3 fields, the recipe sets ``num_residual_streams``,
     ``mhc_sinkhorn_iterations``, ``mhc_init_gating_factor``, ``mhc_layernorm_epsilon``,
-    ``mtp_loss_factor``, ``moe_aux_loss_coeff``, ``moe_router_enable_expert_bias``,
+    ``mtp_loss_factor``, ``moe_aux_loss_coeff``, ``moe_router_force_expert_balance``,
+    ``moe_router_enable_expert_bias``,
     ``moe_router_bias_update_rate``, ``use_pad_tokens`` and ``chunk_loss_size``.
     """
 
@@ -247,6 +249,7 @@ class Xing40MoE(DeepseekV3MoE):
         self.top_k = config.num_experts_per_tok
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.aux_loss_coeff = config.moe_aux_loss_coeff
+        self.force_expert_balance = getattr(config, "moe_router_force_expert_balance", False)
         self.enable_expert_bias = config.moe_router_enable_expert_bias
         self.expert_bias_update_rate = config.moe_router_bias_update_rate
         self.tokens_per_expert: torch.Tensor | None = None
@@ -285,9 +288,23 @@ class Xing40MoE(DeepseekV3MoE):
         Returns:
             Expert indices and routing weights, ``[padding + tokens, top_k]``.
         """
-        logits, weights, indices = self.gate(hidden[:, self.padding:])
-        scores = logits.sigmoid()
-        weights = self._attach_balance_loss(weights, scores)
+        real_hidden = hidden[:, self.padding:]
+        if self.force_expert_balance:
+            logits = F.linear(real_hidden.reshape(-1, hidden.shape[-1]).float(), self.gate.weight.float())
+            scores = logits.sigmoid()
+            indices = balanced_expert_indices(scores.shape[0], self.top_k, self.num_experts, device=scores.device)
+            # The reference router numbers [sequence, batch] tokens before flattening.
+            # Restore our [batch, sequence] layout without changing the expert assignment.
+            indices = indices.reshape(real_hidden.shape[1], real_hidden.shape[0], self.top_k).transpose(0, 1)
+            indices = indices.reshape(-1, self.top_k)
+            weights = scores.gather(1, indices)
+            if self.gate.norm_topk_prob:
+                weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+            weights = weights * self.gate.routed_scaling_factor
+        else:
+            logits, weights, indices = self.gate(real_hidden)
+            scores = logits.sigmoid()
+        weights = self._attach_balance_loss(weights, scores, indices if self.force_expert_balance else None)
         # A recomputed forward replays the same routing; count each token once.
         if not is_recomputing():
             counts = torch.zeros_like(scores[0]).scatter_add_(
@@ -299,17 +316,21 @@ class Xing40MoE(DeepseekV3MoE):
             weights = torch.cat((weights.new_zeros(self.padding, self.top_k), weights))
         return indices, weights
 
-    def _attach_balance_loss(self, weights: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+    def _attach_balance_loss(self, weights: torch.Tensor, scores: torch.Tensor,
+                             selected_indices: torch.Tensor | None = None) -> torch.Tensor:
         """Inject the gradient of ``coeff * E * sum_i(f_i * P_i)`` through the routing weights.
 
-        As in DeepSeek-V3, ``f_i`` counts the unbiased top-k affinities, independently of
-        the expert-load bias, and ``P_i`` averages the normalized affinities.
+        ``f_i`` counts unbiased top-k affinities, or the prescribed cyclic routes when
+        forced balancing is enabled. ``P_i`` averages the normalized affinities.
 
         Args:
             weights: Routing weights of the real tokens.
             scores: Router affinities of every expert.
+            selected_indices: Forced routes, or None to use unbiased top-k affinities.
         """
-        selected = scores.topk(self.top_k, dim=-1, sorted=False).indices.reshape(-1)
+        if selected_indices is None:
+            selected_indices = scores.topk(self.top_k, dim=-1, sorted=False).indices
+        selected = selected_indices.reshape(-1)
         counts = torch.zeros_like(scores[0]).scatter_add_(0, selected, torch.ones_like(selected, dtype=scores.dtype))
         load = counts / selected.numel()
         affinity = (scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)).mean(dim=0)

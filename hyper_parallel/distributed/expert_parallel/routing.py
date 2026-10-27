@@ -377,15 +377,18 @@ def _global_expert_count(module):
     )
 
 
-def _balanced_expert_indices(
+def balanced_expert_indices(
     token_count: int,
     experts_per_token: int,
     expert_count: int,
-    local_count: int,
+    local_count: int = 1,
     *,
-    device,
+    device: torch.device | str | None = None,
 ) -> "torch.Tensor":
-    """Round-robin the ``T*K`` slots over the DESTINATION ranks.
+    """Round-robin the ``T*K`` slots over experts or contiguous expert groups.
+
+    The default ``local_count=1`` cycles over individual experts. Benchmark
+    callers group experts by destination rank using that rank's local count.
 
     Local slot ``i`` goes to one of the ``L`` experts owned by destination
     ``i mod Q`` (``Q = E/L``), so every rank receives exactly ``T*K/Q`` slots
@@ -403,15 +406,17 @@ def _balanced_expert_indices(
         token_count: Local tokens ``T``.
         experts_per_token: Routed experts per token ``K``.
         expert_count: Global routed experts ``E``.
-        local_count: Experts this rank owns ``L``.
+        local_count: Contiguous experts per destination ``L``; 1 cycles over experts.
         device: Device for the returned index tensor.
 
     Returns:
         ``[T, K]`` int64 indices naming the expert each slot is routed to.
 
     Raises:
-        ValueError: If ``E`` is not divisible by ``L``.
+        ValueError: If counts are invalid or ``E`` is not divisible by ``L``.
     """
+    if token_count < 0 or experts_per_token <= 0 or expert_count <= 0:
+        raise ValueError("token_count must be non-negative and expert counts must be positive")
     if local_count <= 0 or expert_count % local_count != 0:
         raise ValueError(
             f"num_experts ({expert_count}) must be divisible by the local "
@@ -429,7 +434,7 @@ def make_balanced_router(real_router):
     The real adapter still runs -- so its weights stay differentiable and the
     router GEMM stays in the compute profile -- but the chosen experts are
     replaced by a round-robin assignment that spreads the local slots over the
-    **destination ranks** (see :func:`_balanced_expert_indices`). Every rank
+    **destination ranks** (see :func:`balanced_expert_indices`). Every rank
     therefore receives exactly ``T*K/Q`` tokens instead of a data-dependent
     count, whatever routing semantics ``real_router`` implements.
 
@@ -466,7 +471,7 @@ def make_balanced_router(real_router):
         """Run ``real_router`` and replace its destinations round-robin."""
         topk_idx, topk_w = real_router(module, hidden_states)
         token_count, experts_per_token = topk_idx.shape
-        balanced_idx = _balanced_expert_indices(
+        balanced_idx = balanced_expert_indices(
             int(token_count),
             int(experts_per_token),
             _global_expert_count(module),

@@ -85,7 +85,7 @@ class TestBalancedExpertIndices(unittest.TestCase):
     def test_spreads_slots_evenly_over_destination_ranks(self) -> None:
         """Every destination rank gets the same slot count; experts differ by <=1."""
         tokens, per_token, total, local = 10, 2, 8, 2
-        indices = routing_module._balanced_expert_indices(  # pylint: disable=protected-access
+        indices = routing_module.balanced_expert_indices(
             tokens, per_token, total, local, device=torch.device("cpu"))
 
         self.assertEqual(tuple(indices.shape), (tokens, per_token))
@@ -106,7 +106,7 @@ class TestBalancedExpertIndices(unittest.TestCase):
     def test_rejects_indivisible_expert_layout(self) -> None:
         """A global expert count that does not split evenly fails fast."""
         with self.assertRaises(ValueError):
-            routing_module._balanced_expert_indices(  # pylint: disable=protected-access
+            routing_module.balanced_expert_indices(
                 4, 1, 6, 4, device=torch.device("cpu"))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -114,8 +114,16 @@ class TestBalancedExpertIndices(unittest.TestCase):
     def test_rejects_a_non_positive_local_count(self) -> None:
         """A rank that owns no expert cannot take slots; fail instead of dividing by 0."""
         with self.assertRaises(ValueError):
-            routing_module._balanced_expert_indices(  # pylint: disable=protected-access
+            routing_module.balanced_expert_indices(
                 4, 1, 8, 0, device=torch.device("cpu"))
+
+
+    def test_rejects_invalid_counts(self) -> None:
+        """The public assignment helper rejects invalid counts before building slot tensors."""
+        for tokens, per_token, experts in ((-1, 1, 8), (4, 0, 8), (4, 1, 0)):
+            with self.subTest(tokens=tokens, per_token=per_token, experts=experts):
+                with self.assertRaisesRegex(ValueError, "non-negative.*positive"):
+                    routing_module.balanced_expert_indices(tokens, per_token, experts, device="cpu")
 
 
 class TestMakeBalancedRouter(unittest.TestCase):
@@ -138,7 +146,7 @@ class TestMakeBalancedRouter(unittest.TestCase):
         self.assertEqual(real.calls, 1, "the real router must still run (gate gradient)")
         self.assertTrue(torch.equal(weights, real.weights),
                         "the real gate weights must be passed through unchanged")
-        expected = routing_module._balanced_expert_indices(  # pylint: disable=protected-access
+        expected = routing_module.balanced_expert_indices(
             tokens, per_token, total, local, device=indices.device)
         self.assertTrue(torch.equal(indices.to(torch.int64), expected))
 

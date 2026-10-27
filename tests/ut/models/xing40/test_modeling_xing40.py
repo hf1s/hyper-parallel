@@ -23,6 +23,7 @@ from unittest import mock
 import torch
 from torch import nn
 
+from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
 from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
 from hyper_parallel.distributed.mesh import DistributedSetup
@@ -214,6 +215,72 @@ class TestXing40Training(unittest.TestCase):
             expected = (count.mean() - count).sign() * layer.expert_bias_update_rate
             torch.testing.assert_close(layer.gate.e_score_correction_bias, expected,
                                        msg="case: no new tokens leave the bias unchanged")
+
+
+class TestXing40ForcedRouting(unittest.TestCase):
+    """Forced balancing preserves affinities and differentiates the selected weights."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_forced_expert_ids_follow_sequence_major_numbering(self):
+        """
+        Feature: Fixed routing across multiple sequences.
+        Description: Route four sequences with eight experts and top-2, independently of their affinities.
+        Expectation: Sequence-major token IDs select each sequence's expert pair and gather its own weights.
+        """
+        layer = _model(n_routed_experts=8, use_pad_tokens=False, moe_aux_loss_coeff=0.0,
+                       moe_router_force_expert_balance=True).model.layers[1].mlp
+        generator = torch.Generator().manual_seed(37)
+        hidden = torch.randn(4, 3, TINY_CONFIG["hidden_size"], generator=generator)
+        expected = torch.tensor([[[0, 1]] * 3, [[2, 3]] * 3, [[4, 5]] * 3, [[6, 7]] * 3])
+        indices, weights = layer.route(hidden)
+        self.assertEqual(indices.reshape(4, 3, 2).tolist(), expected.tolist(),
+                         "case: t = sequence_index * batch_size + batch_index")
+        scores = torch.sigmoid(hidden.double() @ layer.gate.weight.detach().double().T)
+        selected = scores.gather(-1, expected)
+        reference = selected / selected.sum(-1, keepdim=True) * layer.gate.routed_scaling_factor
+        torch.testing.assert_close(weights.reshape(4, 3, 2).double(), reference, rtol=1e-6, atol=1e-7)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_forced_routes_and_gradients_use_original_affinities(self):
+        """
+        Feature: Forced balanced expert routing.
+        Description: Compare non-divisible cyclic assignments and gradients to a float64 formula.
+        Expectation: Routing weights, auxiliary loss and gradients use the selected experts' affinities.
+        """
+        layer = _model(moe_router_force_expert_balance=True).model.layers[1].mlp
+        generator = torch.Generator().manual_seed(19)
+        with torch.no_grad():
+            layer.gate.weight.copy_(torch.randn(layer.gate.weight.shape, generator=generator) * 0.1)
+            layer.gate.e_score_correction_bias[-1] = 1000.0
+        hidden = torch.randn(1, 3, TINY_CONFIG["hidden_size"], generator=generator, requires_grad=True)
+        padded = torch.cat((hidden.new_zeros(1, layer.padding, hidden.shape[-1]), hidden), dim=1)
+        expected_indices = torch.tensor([[0, 1], [2, 3], [0, 1]])
+        coefficients = torch.tensor([[0.2, 0.7], [0.5, 0.3], [0.8, -0.4]])
+        with aux_loss_scale_context():
+            indices, weights = layer.route(padded)
+            self.assertEqual(indices[layer.padding:].tolist(), expected_indices.tolist(),
+                             f"forced indices={indices[layer.padding:].tolist()}, expected={expected_indices.tolist()}")
+            task = (weights[layer.padding:] * coefficients).sum()
+            bind_aux_loss_scale(task)
+            actual_gradients = torch.autograd.grad(task, (hidden, layer.gate.weight))
+
+        reference_hidden = hidden.detach().double().requires_grad_()
+        reference_weight = layer.gate.weight.detach().double().requires_grad_()
+        scores = torch.sigmoid(reference_hidden.reshape(3, -1) @ reference_weight.T)
+        selected = scores.gather(1, expected_indices)
+        reference_weights = selected / selected.sum(-1, keepdim=True) * layer.gate.routed_scaling_factor
+        # Three tokens with top-2 cyclic routes have loads [2, 2, 1, 1] / 6.
+        loads = scores.new_tensor([2, 2, 1, 1]) / 6
+        affinity = (scores / scores.sum(-1, keepdim=True)).mean(0)
+        auxiliary = (affinity * loads).sum() * layer.num_experts
+        objective = (reference_weights * coefficients).sum() + auxiliary * layer.aux_loss_coeff
+        expected_gradients = torch.autograd.grad(objective, (reference_hidden, reference_weight))
+        torch.testing.assert_close(weights[layer.padding:].double(), reference_weights, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(layer.last_aux_loss.double(), auxiliary, rtol=1e-6, atol=1e-7)
+        for actual, expected in zip(actual_gradients, expected_gradients):
+            torch.testing.assert_close(actual.double(), expected, rtol=1e-5, atol=1e-7)
 
 
 class TestMhcKernelContract(unittest.TestCase):
