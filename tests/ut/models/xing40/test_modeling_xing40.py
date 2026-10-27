@@ -23,6 +23,7 @@ from unittest import mock
 import torch
 from torch import nn
 
+from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
 from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
 from hyper_parallel.distributed.mesh import DistributedSetup
@@ -214,6 +215,94 @@ class TestXing40Training(unittest.TestCase):
             expected = (count.mean() - count).sign() * layer.expert_bias_update_rate
             torch.testing.assert_close(layer.gate.e_score_correction_bias, expected,
                                        msg="case: no new tokens leave the bias unchanged")
+
+
+class TestXing40BatchedTraining(unittest.TestCase):
+    """A microbatch keeps independent causal sequences and per-sequence router statistics."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_batched_objective_matches_independent_sequences(self):
+        """
+        Feature: Training with a microbatch larger than one.
+        Description: Compare a four-sequence forward/backward to the mean of independent sequences.
+        Expectation: LM/MTP losses, parameter gradients and real-token expert counts agree.
+        """
+        batched = _model(num_hidden_layers=2)
+        independent = _model(num_hidden_layers=2)
+        generator = torch.Generator().manual_seed(29)
+        tokens = torch.randint(0, TINY_CONFIG["vocab_size"], (4, 9), generator=generator)
+        targets = torch.roll(tokens, -1, dims=1)
+        targets[:, -1] = -100
+        with aux_loss_scale_context():
+            actual = batched(tokens, shift_labels=targets).loss
+            objective = torch.stack(list(actual.values())).sum()
+            bind_aux_loss_scale(objective)
+            objective.backward()
+        expected = {name: torch.zeros_like(value) for name, value in actual.items()}
+        for row in range(tokens.shape[0]):
+            with aux_loss_scale_context():
+                losses = independent(tokens[row:row + 1], shift_labels=targets[row:row + 1]).loss
+                objective = torch.stack(list(losses.values())).sum()
+                bind_aux_loss_scale(objective)
+                (objective / tokens.shape[0]).backward()
+            for name, value in losses.items():
+                expected[name] += value.detach() / tokens.shape[0]
+        for name, value in actual.items():
+            torch.testing.assert_close(value, expected[name], rtol=1e-5, atol=1e-6,
+                                       msg=f"case: {name} averages independent equal-length sequences")
+        for (name, actual_parameter), (_, expected_parameter) in zip(
+                batched.named_parameters(), independent.named_parameters()):
+            torch.testing.assert_close(actual_parameter.grad, expected_parameter.grad, rtol=2e-4, atol=2e-6,
+                                       msg=f"case: batched gradient of {name}")
+        for actual_layer, expected_layer in zip(
+                (m for m in batched.modules() if isinstance(m, Xing40MoE)),
+                (m for m in independent.modules() if isinstance(m, Xing40MoE))):
+            torch.testing.assert_close(actual_layer.tokens_per_expert, expected_layer.tokens_per_expert,
+                                       rtol=0, atol=0, msg="case: padding contributes no expert counts")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_sequence_auxiliary_loss_does_not_pool_sequences(self):
+        """
+        Feature: Per-sequence auxiliary balancing in batched MoE routing.
+        Description: Two sequences favor opposite experts; compare routes and derivatives to a float64 formula.
+        Expectation: The auxiliary objective averages sequence-level products rather than pooled statistics.
+        """
+        layer = _model(use_pad_tokens=False).model.layers[1].mlp
+        with torch.no_grad():
+            layer.gate.weight.zero_()
+            layer.gate.weight[:, 0] = torch.tensor([1.0, 2.0, -1.0, -2.0])
+        hidden = torch.zeros(2, 3, TINY_CONFIG["hidden_size"])
+        hidden[0, :, 0], hidden[1, :, 0] = 1.0, -1.0
+        hidden.requires_grad_()
+        padded = torch.cat((hidden.new_zeros(2, layer.padding, hidden.shape[-1]), hidden), dim=1)
+        coefficients = torch.arange(12, dtype=hidden.dtype).reshape(2, 3, 2) / 10
+        with aux_loss_scale_context():
+            indices, weights = layer.route(padded)
+            indices = indices.reshape(2, layer.padding + 3, layer.top_k)[:, layer.padding:]
+            real_weights = weights.reshape(2, layer.padding + 3, layer.top_k)[:, layer.padding:]
+            objective = (real_weights * coefficients).sum()
+            bind_aux_loss_scale(objective)
+            actual_gradients = torch.autograd.grad(objective, (hidden, layer.gate.weight))
+        reference_hidden = hidden.detach().double().requires_grad_()
+        reference_weight = layer.gate.weight.detach().double().requires_grad_()
+        scores = torch.sigmoid(reference_hidden @ reference_weight.T)
+        selected = scores.gather(-1, indices)
+        expected_weights = selected / selected.sum(-1, keepdim=True) * layer.gate.routed_scaling_factor
+        unbiased = scores.topk(layer.top_k, dim=-1, sorted=False).indices
+        loads = torch.nn.functional.one_hot(unbiased, layer.num_experts).double().sum(dim=(1, 2)) / 6
+        affinities = (scores / scores.sum(-1, keepdim=True)).mean(dim=1)
+        auxiliary = (loads * affinities).sum(-1).mean() * layer.num_experts
+        pooled = (loads.mean(0) * affinities.mean(0)).sum() * layer.num_experts
+        self.assertGreater(abs((auxiliary - pooled).item()), 0.1,
+                           "case: opposing sequence loads distinguish sequence aux from pooled batch aux")
+        reference_objective = (expected_weights * coefficients).sum() + auxiliary * layer.aux_loss_coeff
+        expected_gradients = torch.autograd.grad(reference_objective, (reference_hidden, reference_weight))
+        torch.testing.assert_close(real_weights.double(), expected_weights, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(layer.last_aux_loss.double(), auxiliary, rtol=1e-6, atol=1e-7)
+        for actual, expected in zip(actual_gradients, expected_gradients):
+            torch.testing.assert_close(actual.double(), expected, rtol=1e-5, atol=1e-7)
 
 
 class TestMhcKernelContract(unittest.TestCase):
