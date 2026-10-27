@@ -581,7 +581,7 @@ class StandardLoadPlanner(LoadPlanner):
         self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
         self.original_state_dict = state_dict
         if self.flatten_state_dict:
-            state_dict, self.name_mapping = flatten_state_dict(state_dict)
+            state_dict, self.name_mapping = flatten_state_dict(state_dict, preserve_mapping_keys=True)
         self.state_dict = state_dict
 
     def _rank_owns_dtensor_shard(self, obj: Any) -> bool:

@@ -76,6 +76,22 @@ class TestApi(unittest.TestCase):
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
+    def test_save_load_preserves_integer_mapping_keys_for_bytes(self, mock_barrier, mock_rank, mock_world_size):
+        """Byte leaves restore into the original integer keys and real lists."""
+        del mock_barrier, mock_rank, mock_world_size
+        source = {"optimizer": {"state": {0: {"step": 5}, 1: {"step": 2}}},
+                  7: 11, "groups": [{"step": 8}]}
+        target = {"optimizer": {"state": {0: {"step": 0}, 1: {"step": 0}}},
+                  7: 0, "groups": [{"step": 0}]}
+        with tempfile.TemporaryDirectory() as checkpoint_path:
+            save(source, checkpoint_id=checkpoint_path, no_dist=True)
+            load(target, checkpoint_id=checkpoint_path, no_dist=True)
+        self.assertEqual(target, source)
+        self.assertEqual(set(target["optimizer"]["state"]), {0, 1})
+
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     def test_save_load_roundtrip_no_dist(self, mock_barrier, mock_rank, mock_world_size):
         """
         Feature: save and load round-trip in single-process mode.
