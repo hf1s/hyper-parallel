@@ -367,12 +367,16 @@ def _least_loaded_owner_slot(occurrences: list, storage_sizes: list[int]) -> int
 def traverse_state_dict(
     state_dict: Any,
     visitor: Any,
+    *,
+    preserve_mapping_keys: bool = False,
 ) -> None:
     """
     Invoke ``visitor`` for each value recursively in ``state_dict``.
     Mapping will be traversed and ``visitor`` will be applied to the leaf elements.
     ``visitor`` will only be applied to elements in a list or a tuple, if the
     container contains tensors or mappings.
+    ``preserve_mapping_keys`` retains the original keys in visitor paths;
+    by default mapping keys are converted to strings for checkpoint metadata.
     """
 
     def _is_terminal(value: Any) -> bool:
@@ -395,7 +399,7 @@ def traverse_state_dict(
     def _traverse_obj(path: tuple[Any, ...], value: Any) -> None:
         if isinstance(value, Mapping):
             for k, v in value.items():
-                _traverse_obj(path + (str(k),), v)
+                _traverse_obj(path + (k if preserve_mapping_keys else str(k),), v)
         elif _is_terminal(value):
             visitor(path, value)
         elif isinstance(value, (list, tuple)):
@@ -403,11 +407,19 @@ def traverse_state_dict(
                 _traverse_obj(path + (i,), v)
 
     for key, value in state_dict.items():
-        _traverse_obj((str(key),), value)
+        _traverse_obj((key if preserve_mapping_keys else str(key),), value)
 
 
-def flatten_state_dict(state_dict: Any) -> tuple[dict[str, Any], dict[str, tuple[Any, ...]]]:
-    """Flatten a nested state dict to dotted FQN keys; returns ``(flat_dict, fqn -> path)``."""
+def flatten_state_dict(
+        state_dict: Any,
+        *,
+        preserve_mapping_keys: bool = False,
+) -> tuple[dict[str, Any], dict[str, tuple[Any, ...]]]:
+    """Return dotted FQNs and paths, optionally retaining original mapping keys.
+
+    FQN strings are identical in either mode. Typed paths are useful when
+    loading into an existing skeleton; saved metadata keeps the legacy mode.
+    """
     fqn_names: dict[str, Any] = {}
     mappings: dict[str, tuple[Any, ...]] = {}
 
@@ -422,7 +434,7 @@ def flatten_state_dict(state_dict: Any) -> tuple[dict[str, Any], dict[str, tuple
         fqn_names[new_fqn] = value
         mappings[new_fqn] = path
 
-    traverse_state_dict(state_dict, flat_copy)
+    traverse_state_dict(state_dict, flat_copy, preserve_mapping_keys=preserve_mapping_keys)
     return fqn_names, mappings
 
 
@@ -451,7 +463,7 @@ def set_element(root_dict: Any, path: tuple[Any, ...], value: Any) -> None:
             cur_container = cur_container[prev_key]
 
     last_key = path[-1]
-    if isinstance(last_key, int):
+    if isinstance(cur_container, list):
         extend_list(cur_container, last_key)
 
     cur_container[last_key] = value

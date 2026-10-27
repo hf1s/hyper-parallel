@@ -15,7 +15,6 @@
 """UT for :mod:`hyper_parallel.core.distributed_checkpoint.utils`."""
 # pylint: disable=wrong-import-position
 import importlib
-import os
 import unittest
 from unittest.mock import patch
 
@@ -129,6 +128,19 @@ class TestUtil(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             flatten_state_dict(nested)
         self.assertIn("Duplicate flattened FQN", str(ctx.exception))
+
+    def test_typed_load_paths_keep_fqns_and_existing_mapping_keys(self):
+        """Typed paths update integer dictionaries without changing saved FQNs."""
+        state = {"optimizer": {"state": {0: {"step": 0}}}, 7: 0, "items": [0]}
+        legacy, legacy_paths = flatten_state_dict(state)
+        typed, paths = flatten_state_dict(state, preserve_mapping_keys=True)
+        self.assertEqual(set(typed), set(legacy))
+        self.assertEqual(legacy_paths["optimizer.state.0.step"], ("optimizer", "state", "0", "step"))
+        self.assertEqual(paths["optimizer.state.0.step"], ("optimizer", "state", 0, "step"))
+        set_element(state, paths["optimizer.state.0.step"], 5)
+        set_element(state, paths["7"], 9)
+        set_element(state, paths["items"], [3])
+        self.assertEqual(state, {"optimizer": {"state": {0: {"step": 5}}}, 7: 9, "items": [3]})
 
     def test_set_element_nested_dict_and_list(self):
         """
