@@ -117,6 +117,41 @@ class TestJTMuonLayout(unittest.TestCase):
         self.assertTrue(torch.equal(output, value))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_q_up_scale_uses_the_last_logical_matrix(self):
+        """
+        Feature: MF Q-up shared RMS scale.
+        Description: Transform unequal NoPE and RoPE groups across two heads.
+        Expectation: Both NS matrices use the final RoPE matrix dimensions for scaling.
+        """
+        transform = self.layout.ns_transform_fn("model.layers.0.self_attn.q_b_proj.weight", torch.ones(6, 2))
+        self.assertEqual([tuple(value.shape) for value in transform.tensors], [(4, 2), (2, 2)])
+        self.assertEqual(transform.scale_shapes, [(2, 2), (2, 2)])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_fused_q_down_keeps_its_separate_mf_scale_group(self):
+        """
+        Feature: Fused QKV contains two MF parameter scale groups.
+        Description: Use Q-down rows larger than the hidden dimension and unequal KV sections.
+        Expectation: Q-down keeps its shape while both KV sections share the last KV shape.
+        """
+        layout = JTMuonLayout.from_config(layout_config(q_lora_rank=7, kv_lora_rank=3))
+        transform = layout.ns_transform_fn("model.layers.0.self_attn.linear_qkv.weight", torch.ones(11, 2))
+        self.assertEqual(transform.scale_shapes, [(7, 2), (1, 2), (1, 2)])
+        output = torch.empty(11, 2)
+        transform.restore([torch.full((7, 2), 1), torch.full((3, 2), 2), torch.full((1, 2), 3)], output)
+        self.assertEqual(output[:, 0].tolist(), [1] * 7 + [2] * 3 + [3])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_expert_scale_shape_excludes_the_expert_batch_dimension(self):
+        """
+        Feature: Expert logical RMS dimensions.
+        Description: Use more experts than either individual matrix dimension.
+        Expectation: Scale shapes contain only matrix rows and columns, independent of expert count.
+        """
+        transform = self.layout.ns_transform_fn("model.layers.1.mlp.experts.gate_up_proj", torch.ones(8, 6, 2))
+        self.assertEqual(transform.scale_shapes, [(3, 2), (3, 2)])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_unmatched_parameter_keeps_native_layout(self):
         """
         Feature: Unmatched parameter identity.

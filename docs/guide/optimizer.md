@@ -155,9 +155,16 @@ Q-up 和 KV-up 按通道种类汇集全部 attention heads，分别进行 NS 后
 这里需要完整的逻辑 MLA 矩阵，分片参数应先由 Muon 完成 gather。
 `native` 是默认布局，保留已有的整矩阵行为。选择内置布局时不能同时传入自定义分块回调。
 
-这个选项定义矩阵布局；NS 系数、次数、epsilon 和 RMS 缩放由 Muon 配置及原生路径决定。
+这个选项同时匹配 MF 的缩放分组：同一个 MF 参数拆出的矩阵共享末块最后两维的 RMS scale；
+HP fused QKV 中的 Q-down 对应独立的 MF 参数，仍使用自己的 shape，KV-down 与 RoPE 共享末块 shape。
+专家维不计入二维矩阵的 scale。NS 系数、次数和 epsilon 仍由 Muon 配置决定。
+
+通用 `NSInputTransform.scale_shapes` 是可选的逐块 `(rows, columns)` 列表，长度应与 `tensors` 相同。
+省略时保留各块按自身 shape 缩放的行为；提供时在原生缩放位置一次性应用目标 scale，
+保留 BF16 写回精度。此接口不改变 NS 分块、NS 算术顺序、学习率位置或通信路径。
 上例的 4 次 NS 对应兼容性验证使用的 MF 快照；部分函数名包含 `newtonschulz5` 的实现实际只执行 4 次更新。
 请检查参考实现的迭代次数，公共 Muon 的默认值仍为 5。
+恢复优化器状态时也要核对加载后的参数组配置，checkpoint 可能覆盖 YAML 中的 NS 次数等选项。
 
 单卡示例见 [hp_4k_1_card_mf_muon.yaml](../../examples/training_demo/jt_deepseek_v3/hp_4k_1_card_mf_muon.yaml)。
 它使用原生 Muon+AdamW，默认从头训练；恢复时需要匹配该参数布局和优化器状态的 checkpoint。

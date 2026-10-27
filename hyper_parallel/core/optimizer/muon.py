@@ -58,10 +58,16 @@ _NS_ASYM5_COEFFS: Tuple[Tuple[float, float, float], ...] = (
 
 @dataclass
 class NSInputTransform:
-    """Prepared NS tensors and the callback that restores their updates."""
+    """Prepared NS tensors, reversible restoration and optional logical RMS shapes.
+
+    ``scale_shapes`` supplies one positive ``(rows, columns)`` pair per tensor.
+    Omitting it retains native scaling from each computed update's own shape.
+    Shapes describe the scale basis only; they do not reshape the NS matrices.
+    """
 
     tensors: List[torch.Tensor]
     restore: Callable[[List[torch.Tensor], torch.Tensor], None]
+    scale_shapes: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass(frozen=True)
@@ -123,7 +129,18 @@ def zeropower_via_newtonschulz5(
         epsilon: float = 1e-10,
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
 ) -> torch.Tensor:
-    """Newton-Schulz orthogonalization with preallocated matmul buffers."""
+    """Newton-Schulz orthogonalization with preallocated matmul buffers.
+
+    Args:
+        ns_inputs: Batched matrix input in the computation dtype.
+        steps: Number of polynomial updates.
+        ns_variant: Built-in or custom polynomial coefficient selection.
+        epsilon: Additive input norm stabilizer.
+        ns_coefficients: Optional custom coefficient triples.
+
+    Returns:
+        Orthogonalized matrices with their original dimensions.
+    """
     mat_x = ns_inputs
     transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
     if transposed:
@@ -175,12 +192,26 @@ def compute_muon_slice_scale(
         slice_tensor: torch.Tensor,
         matched_adamw_rms: float,
         zero_rms_scale_mode: str = "zero",
+        *,
+        logical_shape: Optional[Tuple[int, int]] = None,
 ) -> float:
-    """Compute Muon scale from the logical matrix dims of a reshaped slice."""
+    """Compute Muon scale using native dimensions or a validated transform shape.
+
+    Args:
+        slice_tensor: Computed NS update before RMS scaling.
+        matched_adamw_rms: Target update RMS, or zero for the selected zero mode.
+        zero_rms_scale_mode: Native zero-RMS fallback policy.
+        logical_shape: Optional scale basis validated by the input transform.
+
+    Returns:
+        Scalar multiplier applied once to the update in its native dtype.
+    """
     if not matched_adamw_rms:
         return 1.0 if zero_rms_scale_mode == "use_lr" else 0.0
     shape = tuple(slice_tensor.shape)
-    if len(shape) == 3 and shape[1] == 1:
+    if logical_shape is not None:
+        logical_dims = logical_shape
+    elif len(shape) == 3 and shape[1] == 1:
         logical_dims = (shape[0], shape[2])
     else:
         logical_dims = shape[-2:]
@@ -354,20 +385,8 @@ class Muon(BaseDistributedOptimizer):
         no_comm_ns: Dict[int, Dict] = {}
         for group_idx in range(num_groups):
             info = self._hsdp_assignment_batches.get(group_idx)
-            if not info:
-                # No HSDP info — all params are no_comm.
-                unshard_params = self.unshard_params_by_group.get(group_idx, [])
-                no_comm_ns[group_idx] = self._update_muon_momentum(
-                    self.param_groups[group_idx], unshard_params
-                )
-            else:
-                no_comm_params = info.get("no_comm", [])
-                if no_comm_params:
-                    no_comm_ns[group_idx] = self._update_muon_momentum(
-                        self.param_groups[group_idx], no_comm_params
-                    )
-                else:
-                    no_comm_ns[group_idx] = {}
+            params = info.get("no_comm", []) if info else self.unshard_params_by_group.get(group_idx, [])
+            no_comm_ns[group_idx] = self._update_muon_momentum(self.param_groups[group_idx], params)
 
         # Process no-comm params.
         for group_idx in range(num_groups):
@@ -378,16 +397,7 @@ class Muon(BaseDistributedOptimizer):
                     self._run_post_update_fn(group, no_comm_ns[group_idx].keys())
 
         # Flatten nested batch into a linear schedule.
-        group_linear_batches: Dict[int, List[HSDPGroupAssignment]] = {}
-        max_num_batches = 0
-        for group_idx in range(num_groups):
-            info = self._hsdp_assignment_batches.get(group_idx)
-            linear_batches = []
-            if info:
-                for bg in info.get("batch_groups", []):
-                    linear_batches.extend(bg.get("sub_batches", []))
-            group_linear_batches[group_idx] = linear_batches
-            max_num_batches = max(max_num_batches, len(linear_batches))
+        group_linear_batches, max_num_batches = self._get_linear_hsdp_batches(num_groups)
 
         # Process batches: compute momentum per-batch for owned params only (HSDP de-duplication).
         for batch_idx in range(max_num_batches):
@@ -417,6 +427,27 @@ class Muon(BaseDistributedOptimizer):
 
         broadcaster.wait_all()
         return loss
+
+    def _get_linear_hsdp_batches(self, num_groups: int) -> Tuple[Dict[int, List[HSDPGroupAssignment]], int]:
+        """Flatten assignment groups while preserving their existing scheduling order.
+
+        Args:
+            num_groups: Number of optimizer parameter groups.
+
+        Returns:
+            Per-group assignments and the largest assignment count.
+        """
+        batches: Dict[int, List[HSDPGroupAssignment]] = {}
+        max_count = 0
+        for group_idx in range(num_groups):
+            info = self._hsdp_assignment_batches.get(group_idx)
+            linear_batches = []
+            if info:
+                for batch_group in info.get("batch_groups", []):
+                    linear_batches.extend(batch_group.get("sub_batches", []))
+            batches[group_idx] = linear_batches
+            max_count = max(max_count, len(linear_batches))
+        return batches, max_count
 
     def _run_post_update_fn(
             self,
@@ -785,7 +816,12 @@ class Muon(BaseDistributedOptimizer):
         _, reshaped_inputs = self._reshape_ns_input(param, working_input)
 
         def restore_view_updates(updates: List[torch.Tensor], output: torch.Tensor) -> None:
-            """Write reshaped NS updates back into the views and the working input."""
+            """Write reshaped NS updates back into the views and the working input.
+
+            Args:
+                updates: Logical matrix updates in prepared view order.
+                output: Original-layout update destination.
+            """
             for reshaped_input, update in zip(reshaped_inputs, updates):
                 reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
             if output.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
@@ -812,8 +848,26 @@ class Muon(BaseDistributedOptimizer):
                 raise ValueError("NSInputTransform tensors must have the same dtype as the NS input")
             if tensor.dim() < 2:
                 raise ValueError("NSInputTransform tensors must have at least two dimensions")
+        Muon._validate_scale_shapes(transform.scale_shapes, len(transform.tensors))
         if not callable(transform.restore):
             raise ValueError("NSInputTransform.restore must be callable")
+
+    @staticmethod
+    def _validate_scale_shapes(shapes: Optional[List[Tuple[int, int]]], count: int) -> None:
+        """Validate optional logical RMS metadata independently of tensor preparation.
+
+        Args:
+            shapes: One positive two-dimensional scale basis per transformed tensor.
+            count: Number of transformed tensors.
+        """
+        if shapes is None:
+            return
+        if not isinstance(shapes, (list, tuple)) or len(shapes) != count:
+            raise ValueError("NSInputTransform.scale_shapes must have one shape per tensor")
+        for shape in shapes:
+            if (not isinstance(shape, (list, tuple)) or len(shape) != 2
+                    or any(not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in shape)):
+                raise ValueError("NSInputTransform.scale_shapes must contain positive integer (rows, columns)")
 
     def _compute_batched_ns_outputs_for_tensors(
             self,
@@ -1033,10 +1087,12 @@ class Muon(BaseDistributedOptimizer):
 
             # Scale updates.
             for record, reshaped_update in zip(tensor_records, reshaped_updates):
+                scale_shapes = state["transforms"][p_list[record[1]]].scale_shapes
                 slice_scale = compute_muon_slice_scale(
                     reshaped_update,
                     group["matched_adamw_rms"],
                     zero_rms_scale_mode=group["zero_rms_scale_mode"],
+                    logical_shape=None if scale_shapes is None else scale_shapes[record[2]],
                 )
 
                 if group["apply_lr_in_update"]:

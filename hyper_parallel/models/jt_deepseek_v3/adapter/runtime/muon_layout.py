@@ -32,8 +32,9 @@ class JTMuonLayout:
     ``ns_transform_fn`` additionally gathers periodic attention rows into the
     two whole-head-group matrices used by MF, then restores their original rows.
     Both callbacks must be supplied for complete logical-matrix alignment.
-    This controls matrix partitioning; it does not change NS coefficients,
-    arithmetic order, or the optimizer's per-slice RMS scaling policy.
+    Each MF parameter's split matrices share its last matrix's RMS scale shape.
+    The Q-down block inside HP fused QKV remains an independent MF parameter.
+    NS coefficients, arithmetic order and update dtype remain native Muon choices.
     """
 
     q_lora_rank: int
@@ -94,14 +95,15 @@ class JTMuonLayout:
             tensor: Complete parameter-shaped Newton-Schulz input.
 
         Returns:
-            A reversible periodic transform, or None to use the reshape callback.
+            A reversible transform with the corresponding MF parameter's scale shapes,
+            or None to retain an unmatched parameter's native layout.
         """
         if name.endswith(".self_attn.q_b_proj.weight"):
             first, second = self.qk_nope_head_dim, self.qk_rope_head_dim
         elif name.endswith(".self_attn.kv_b_proj.weight"):
             first, second = self.qk_nope_head_dim, self.v_head_dim
         else:
-            return None
+            return self._fused_transform(name, tensor)
         heads = self.num_attention_heads
         width = first + second
         if tensor.ndim != 2 or tensor.shape[0] != heads * width:
@@ -122,4 +124,33 @@ class JTMuonLayout:
             destination[:, :first].copy_(updates[0].view(heads, first, columns))
             destination[:, first:].copy_(updates[1].view(heads, second, columns))
 
-        return NSInputTransform(tensors=pieces, restore=restore)
+        return NSInputTransform(tensors=pieces, restore=restore, scale_shapes=[tuple(pieces[-1].shape)] * 2)
+
+    def _fused_transform(self, name: str, tensor: torch.Tensor) -> NSInputTransform | None:
+        """Attach scale groups to contiguous fusions without changing their NS views.
+
+        Args:
+            name: Fully qualified JT parameter name.
+            tensor: Complete parameter-shaped Newton-Schulz input.
+
+        Returns:
+            A fused logical transform, or None for an ordinary unsplit parameter.
+        """
+        pieces = self.reshape_fn(name, tensor)
+        if len(pieces) == 1:
+            return None
+        shapes = [tuple(pieces[-1].shape[-2:])] * len(pieces)
+        if name.endswith(".self_attn.linear_qkv.weight"):
+            shapes[0] = tuple(pieces[0].shape[-2:])
+
+        def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+            """Write each logical block into the corresponding original storage view.
+
+            Args:
+                updates: Logical matrix updates in original fused-block order.
+                output: Destination in the original HP parameter layout.
+            """
+            for target, update in zip(self.reshape_fn(name, output), updates):
+                target.copy_(update)
+
+        return NSInputTransform(tensors=pieces, restore=restore, scale_shapes=shapes)
