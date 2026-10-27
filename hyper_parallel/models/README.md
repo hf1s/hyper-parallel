@@ -43,3 +43,10 @@ hyper_parallel/
 `models/xing40/recipes/train.yaml`（Xing4.0-29B：DeepSeek-V3 架构 + mHC，8 卡 FSDP，可选 EP）与
 `models/kimi_k26/recipes/train.yaml`（Kimi-K2.6 多模态，4 超节点 / 512 卡主线配方，
 家族说明见 [`models/kimi_k26/README.md`](kimi_k26/README.md)）。
+
+Xing4.0 的 `model.config.moe_router_force_expert_balance` 默认为 `false`，使用正常的
+top-k 路由。设为 `true` 时按 token 索引轮转分配专家，仍从原始 sigmoid affinities
+提取并归一化所选权重；序列级辅助损失和专家计数使用相同的强制分配。
+专家 ID 复用公共 `balanced_expert_indices` 的逐专家轮转，按 `[sequence, batch]`
+编号后映射回模型的 `[batch, sequence]` 布局。EP 基准开关
+`fix_router` 会保留原 top-k 权重，和此训练配置的权重重取语义不同。
