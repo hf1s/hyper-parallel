@@ -31,6 +31,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3MLAAttention,
     JTDeepseekV3MoE,
 )
+from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.muon_layout import JTMuonLayout
 
 
 def _value_copies(parameter: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -140,12 +141,15 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
     _update_expert_bias(model)
 
 
-def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
+def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float,
+                    muon_layout: str = "native", **kwargs: Any) -> Muon:
     """Build the Muon/AdamW optimizer and register the JT post-step hook.
 
     Args:
         model: Model whose final FSDP parameter layouts are already prepared.
         qk_clip_threshold: Positive clipping threshold for QK projections.
+        muon_layout: ``native`` keeps whole parameters; ``mindformers`` supplies
+            logical matrix split/restore callbacks for JT MLA and fused SwiGLU weights.
         **kwargs: Muon builder options from the training recipe.
 
     Returns:
@@ -156,7 +160,16 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     """
     if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
         raise ValueError("qk_clip_threshold must be finite and positive")
+    if muon_layout not in ("native", "mindformers"):
+        raise ValueError("muon_layout must be 'native' or 'mindformers'")
     muon_config = dict(kwargs["muon_config"])
+    if muon_layout == "mindformers":
+        callback_names = {"reshape_fn", "ns_transform_fn"}
+        if any(key.removeprefix("muon_") in callback_names and value is not None
+               for key, value in muon_config.items()):
+            raise ValueError("muon_layout='mindformers' owns reshape_fn and ns_transform_fn")
+        layout = JTMuonLayout.from_config(model.config)
+        muon_config.update(reshape_fn=layout.reshape_fn, ns_transform_fn=layout.ns_transform_fn)
     builder = Muon(model=model, muon_config=muon_config, **{
         name: value for name, value in kwargs.items() if name != "muon_config"
     })

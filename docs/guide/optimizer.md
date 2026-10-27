@@ -135,3 +135,29 @@ model.set_gradient_scaling_factor(scale_factor=0.5)
 3. **warmup**：建议使用 warmup_steps，从 0 线性增加到目标 lr
 4. **weight_decay**：AdamW 的 weight_decay 建议设为 0.1
 5. **与 FSDP 配合**：FSDP 下优化器状态自动分片，无需额外配置
+
+## JT DeepSeek-V3 的逻辑矩阵布局
+
+JT 的 optimizer adapter 可以为原生 Torch Muon 注册 `reshape_fn` 和 `ns_transform_fn`：
+
+```yaml
+optimizer:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.build_optimizer
+  muon_layout: mindformers
+  muon_config:
+    ns_variant: legacy
+    ns_steps: 4
+    ns_epsilon: 1.0e-7
+```
+
+`mindformers` 布局将 fused QKV、dense/shared/routed expert 的 gate/up 分成逻辑矩阵；
+Q-up 和 KV-up 按通道种类汇集全部 attention heads，分别进行 NS 后恢复原始行顺序。
+这里需要完整的逻辑 MLA 矩阵，分片参数应先由 Muon 完成 gather。
+`native` 是默认布局，保留已有的整矩阵行为。选择内置布局时不能同时传入自定义分块回调。
+
+这个选项定义矩阵布局；NS 系数、次数、epsilon 和 RMS 缩放由 Muon 配置及原生路径决定。
+上例的 4 次 NS 对应兼容性验证使用的 MF 快照；部分函数名包含 `newtonschulz5` 的实现实际只执行 4 次更新。
+请检查参考实现的迭代次数，公共 Muon 的默认值仍为 5。
+
+单卡示例见 [hp_4k_1_card_mf_muon.yaml](../../examples/training_demo/jt_deepseek_v3/hp_4k_1_card_mf_muon.yaml)。
+它使用原生 Muon+AdamW，默认从头训练；恢复时需要匹配该参数布局和优化器状态的 checkpoint。
