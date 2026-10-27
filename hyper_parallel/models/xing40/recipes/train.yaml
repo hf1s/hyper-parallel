@@ -3,6 +3,8 @@
 # Expert parallelism: add --accelerator.ep_size=<n>. The MindFormers 29B reference trains
 # without MTP: --model.config.num_nextn_predict_layers=0 matches it.
 # Weights: random initialization, or a checkpoint through checkpoint.restore_from.
+# NPU modules (plan_overrides): framework MLA, RMSNorm, grouped experts and fused mHC, which
+# needs omni_training_custom_ops.
 model:
   _target_: hyper_parallel.models.xing40.adapter.builder.build_model
   config:
@@ -153,8 +155,20 @@ checkpoint:
   save_steps: 100
   restore_from: null
 plan_overrides:
-# Fused NPU RMSNorm, as in the MindFormers reference.
-- match: '*norm'
+# NPU MLA: the framework MLAAttention (one fused linear_qkv down projection) with the
+# MindFormers FP32 RoPE and the logit maxima QK clipping consumes. It swaps its latent
+# norms for the NPU RMSNorm itself, so the norm entry below leaves them out.
+- match: '*.self_attn'
+  module_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Attention
+  exact_type: true
+  replace_module:
+    _target_: hyper_parallel.models.xing40.adapter.conversion.module_replacement.replace_xing40_mla_attention
+# Fused NPU RMSNorm, as in the MindFormers reference: the input, post-attention and MTP final
+# layernorms ('*[!a]_layernorm' skips the attention's q_a_/kv_a_layernorm), and model.norm
+# and the MTP enorm/hnorm.
+- match:
+  - '*[!a]_layernorm'
+  - '*[.eh]norm'
   module_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm
   exact_type: true
   replace_module:
@@ -166,8 +180,18 @@ plan_overrides:
   exact_type: true
   replace_module:
     _target_: hyper_parallel.components.modules.GroupedExperts
-# NPU fused mHC (MindFormers use_fused_mhc; needs omni_training_custom_ops): replace '*_hc_pre'
-# with hyper_parallel.components.modules.MhcPreModule and '*_hc_post' with MhcPostModule.
+# NPU fused mHC, as the MindFormers production configuration (use_fused_mhc); needs
+# omni_training_custom_ops. Drop these two entries for the non-fused MindFormers reference.
+- match: '*_hc_pre'
+  module_type: hyper_parallel.models.xing40.modeling_xing40.Xing40MhcPre
+  exact_type: true
+  replace_module:
+    _target_: hyper_parallel.components.modules.MhcPreModule
+- match: '*_hc_post'
+  module_type: hyper_parallel.models.xing40.modeling_xing40.Xing40MhcPost
+  exact_type: true
+  replace_module:
+    _target_: hyper_parallel.components.modules.MhcPostModule
 # The mHC mixings, the stream-collapse head and the MTP fusion projection are replicated,
 # token-wise modules.
 - match: '*_hc_pre'
