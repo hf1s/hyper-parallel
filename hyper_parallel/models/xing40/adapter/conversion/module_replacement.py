@@ -57,6 +57,9 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
 
     Returns:
         The attention output, ``[batch, sequence, heads, v_head_dim]``, and no attention weights.
+
+    Raises:
+        ValueError: If the kernel's ``softmax_max`` is not the expected ``(T, heads, 8)`` shape.
     """
     # torch_npu is optional outside Ascend environments.
     import torch_npu  # pylint: disable=C0415
@@ -75,6 +78,14 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
         inner_precise=0, sparse_mode=context.sparse_mode, actual_seq_qlen=context.query_lengths,
         actual_seq_kvlen=context.key_lengths, softmax_layout="TND")[:2]
     with torch.no_grad():
+        # softmax_max is (T, N, 8) for TND input: core/shard/ops/parallel_npu_flash_attention_score.py's
+        # sharding rule hard-codes this ("TND softmax outputs are 3-D (T, N, 8)"), and
+        # test_parallel_npu_flash_attention_score.py asserts dim 0 is token, dim 1 is head. Check it
+        # instead of silently maxing across the wrong axis if that assumption is ever wrong (MindFormers'
+        # own max_logit_tracker.py exists specifically because this failure raises nothing on its own).
+        if softmax_max.ndim != 3 or softmax_max.shape[1] != heads:
+            raise ValueError(f"Expected (T, {heads}, 8) softmax_max for TND fusion attention, "
+                             f"got shape {tuple(softmax_max.shape)}.")
         maximum = softmax_max.amax(dim=(0, 2))
         module.max_logits = maximum if module.max_logits is None else torch.maximum(module.max_logits, maximum)
     return output.view(batch, sequence, heads, -1), None

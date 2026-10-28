@@ -24,10 +24,6 @@ model:
     v_head_dim: 128
     rms_norm_eps: 1.0e-06
     hidden_act: silu
-    # Paired with fsdp_config.mix_precision.custom_params['model.embed_tokens.weight']
-    # below: the table stays FP32, this casts only the lookup output. An all-FP32 run
-    # (--fsdp_config.mix_precision.param_dtype=float32) must also set this to float32.
-    embedding_output_dtype: bfloat16
     rope_parameters:
       rope_type: default
       rope_theta: 10000.0
@@ -73,8 +69,9 @@ fsdp_config:
     param_dtype: bfloat16
     reduce_dtype: float32
     cast_forward_inputs: false
-    # Keep FP32 embedding lookup/scatter; the model casts its output before
-    # residual expansion. Router, mHC and RMSNorm also compute in FP32.
+    # Keep FP32 embedding lookup/scatter; the model unconditionally casts its output to
+    # BF16 before residual expansion (Xing40Model.embed_inputs). Router, mHC and RMSNorm
+    # also compute in FP32.
     custom_params:
       'model.embed_tokens.weight':
         param_dtype: float32

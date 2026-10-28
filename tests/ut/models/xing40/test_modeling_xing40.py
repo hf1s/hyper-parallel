@@ -14,7 +14,6 @@
 # ============================================================================
 """CPU training-lifecycle tests of the Xing4.0 model."""
 
-import math
 from collections.abc import Callable
 import tempfile
 import unittest
@@ -48,8 +47,6 @@ TINY_CONFIG = {
     "mhc_init_gating_factor": 0.01, "mhc_layernorm_epsilon": 1e-6, "num_nextn_predict_layers": 1,
     "mtp_loss_factor": 0.3, "chunk_loss_size": 8,
 }
-# Reference mHC shift initialization: pre = 1/4, post = 1 and a strongly diagonal residual mixing.
-_IDENTITY_SHIFT = torch.cat((torch.full((4,), -math.log(3.0)), torch.zeros(4), ((torch.eye(4) - 1.0) * 5.0).flatten()))
 _TO_EMPTY = nn.Module.to_empty
 
 
@@ -92,8 +89,8 @@ class TestXing40Training(unittest.TestCase):
         """
         Feature: Meta-device construction through the recipe's builder.
         Description: to_empty() storage is NaN; the framework then runs the random initialization.
-        Expectation: No tensor, RoPE tables included, stays NaN and the mHC gates and shifts take their
-            reference values.
+        Expectation: No tensor, RoPE tables included, stays NaN and the mHC gates take their reference
+            value; mHC shifts are zeroed (checkpoint-dependent, no from-scratch reference).
         """
         with mock.patch.object(nn.Module, "to_empty", _poisoned_to_empty):
             model = build_model(config=TINY_CONFIG)
@@ -103,8 +100,8 @@ class TestXing40Training(unittest.TestCase):
         connection = model.mtp.layers[0].transformer_layer.ffn_hc_pre
         torch.testing.assert_close(connection.branch_alpha.detach(), torch.full((3,), 0.01),
                                    msg="case: gates take mhc_init_gating_factor")
-        torch.testing.assert_close(connection.branch_beta.detach(), _IDENTITY_SHIFT,
-                                   msg="case: shifts start as the identity residual")
+        torch.testing.assert_close(connection.branch_beta.detach(), torch.zeros_like(connection.branch_beta),
+                                   msg="case: shifts are zeroed, not NaN")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
@@ -253,7 +250,11 @@ class TestXing40BatchedTraining(unittest.TestCase):
                                        msg=f"case: {name} averages independent equal-length sequences")
         for (name, actual_parameter), (_, expected_parameter) in zip(
                 batched.named_parameters(), independent.named_parameters()):
-            torch.testing.assert_close(actual_parameter.grad, expected_parameter.grad, rtol=2e-4, atol=2e-6,
+            # embed_tokens.weight is the only parameter whose forward value crosses the
+            # unconditional BF16 cast (embed_inputs); batched and per-sequence calls round
+            # independently, so its gradient needs a looser tolerance than the rest.
+            grad_rtol = 3e-2 if name == "model.embed_tokens.weight" else 2e-4
+            torch.testing.assert_close(actual_parameter.grad, expected_parameter.grad, rtol=grad_rtol, atol=2e-6,
                                        msg=f"case: batched gradient of {name}")
         for actual_layer, expected_layer in zip(
                 (m for m in batched.modules() if isinstance(m, Xing40MoE)),
@@ -408,7 +409,7 @@ class TestMhcKernelContract(unittest.TestCase):
         Feature: Random initialization with the fused mHC replacement.
         Description: Build through the recipe's builder with '*_hc_pre' replaced by MhcPreModule and NaN-filled
             to_empty() storage.
-        Expectation: The fused modules take the mHC reference initialization.
+        Expectation: The fused modules take the mHC reference gate value and zeroed, not NaN, shifts.
         """
         setup = DistributedSetup(module_replacements=[ModuleReplacementSpec(
             match=("*_hc_pre",), factory=MhcPreModule, module_type=Xing40MhcPre)])
@@ -418,25 +419,25 @@ class TestMhcKernelContract(unittest.TestCase):
         self.assertIsInstance(fused_pre, MhcPreModule, f"replaced module: {type(fused_pre).__name__}")
         torch.testing.assert_close(fused_pre.branch_alpha.detach(), torch.full((3,), 0.01),
                                    msg="case: gates take mhc_init_gating_factor")
-        torch.testing.assert_close(fused_pre.branch_beta.detach(), _IDENTITY_SHIFT,
-                                   msg="case: shifts start as the identity residual")
+        torch.testing.assert_close(fused_pre.branch_beta.detach(), torch.zeros_like(fused_pre.branch_beta),
+                                   msg="case: shifts are zeroed, not NaN")
         self.assertFalse(torch.isnan(fused_pre.phi.weight).any().item(), "the mixing projection stays NaN")
 
 
 class TestXing40EmbeddingPrecision(unittest.TestCase):
-    """Keep lookup/scatter precision independent of residual activation precision."""
+    """Keep lookup/scatter precision independent of the unconditional BF16 output cast."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_fp32_lookup_with_low_precision_output_preserves_scatter(self):
         """
         Feature: Embedding lookup/scatter precision independent of the residual output cast.
-        Description: Look up a repeated token through embed_inputs with a BF16 output policy and an
-            FP32 table, then backward with per-occurrence coefficients that only round in BF16.
+        Description: Look up a repeated token through embed_inputs with an FP32 table, then backward
+            with per-occurrence coefficients that only round in BF16.
         Expectation: The output is BF16 and equals the FP32 row cast once; the FP32 weight gradient
             sums the un-rounded coefficients at the repeated row and stays zero elsewhere.
         """
-        model = _model(embedding_output_dtype="bfloat16")
+        model = _model()
         weight = model.model.embed_tokens.weight
         ids = torch.tensor([[3, 3]])
         output = model.model.embed_inputs(ids)
@@ -453,36 +454,18 @@ class TestXing40EmbeddingPrecision(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
-    def test_output_policy_is_shared_by_backbone_and_mtp(self):
+    def test_output_cast_is_shared_by_backbone_and_mtp(self):
         """
-        Feature: One embedding output policy for every lookup.
-        Description: Run one training step with a BF16 output policy, wrapping embed_inputs to count calls.
+        Feature: One embedding output cast for every lookup.
+        Description: Run one training step, wrapping embed_inputs to count calls.
         Expectation: Both the backbone and the MTP depth's next-token embedding call embed_inputs, and
             both losses stay finite.
         """
-        model = _model(embedding_output_dtype="bfloat16")
+        model = _model()
         with mock.patch.object(model.model, "embed_inputs", wraps=model.model.embed_inputs) as lookup:
             losses = _train_step(model)
         self.assertEqual(lookup.call_count, 2, f"embed_inputs calls: {lookup.call_count}")
         self.assertTrue(all(torch.isfinite(loss).item() for loss in losses.values()), f"losses: {losses}")
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_default_and_serialized_output_dtype(self):
-        """
-        Feature: Default output policy and configuration validation.
-        Description: Compare the unset-policy lookup to the plain embedding; round-trip a BF16 policy
-            through config serialization; construct with an unsupported dtype string.
-        Expectation: The unset policy reproduces the plain embedding; serialization preserves the field;
-            an invalid dtype string raises ValueError naming the field.
-        """
-        model = _model()
-        ids = torch.tensor([[3, 7]])
-        torch.testing.assert_close(model.model.embed_inputs(ids), model.model.embed_tokens(ids), rtol=0, atol=0)
-        config = _config(embedding_output_dtype="bfloat16")
-        self.assertEqual(Xing40Config.from_dict(config.to_dict()).embedding_output_dtype, "bfloat16")
-        with self.assertRaisesRegex(ValueError, "embedding_output_dtype"):
-            _config(embedding_output_dtype="int32")
 
 
 if __name__ == "__main__":

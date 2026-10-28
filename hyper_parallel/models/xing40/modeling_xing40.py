@@ -30,7 +30,6 @@ NPU. The recipe supplies every configuration value.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,7 +53,6 @@ from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.mhc import MhcPreModule
 from hyper_parallel.components.losses.chunked_cross_entropy import chunked_cross_entropy
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
-from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 
@@ -79,12 +77,9 @@ class Xing40Config(DeepseekV3Config):
     ``mtp_loss_factor``, ``moe_aux_loss_coeff``, ``moe_router_enable_expert_bias``,
     ``moe_router_bias_update_rate``, ``use_pad_tokens`` and ``chunk_loss_size``.
     ``moe_router_force_expert_balance`` is optional and defaults to False.
-    ``embedding_output_dtype`` optionally casts lookup activations before residual
-    expansion, independently of embedding parameter/storage precision.
     """
 
     model_type = "xing40"
-    embedding_output_dtype: str | None = None
 
     def __post_init__(self, **kwargs: Any) -> None:
         """Default ``architectures`` to the model class this configuration builds.
@@ -95,19 +90,9 @@ class Xing40Config(DeepseekV3Config):
         if self.architectures is None:
             self.architectures = ["Xing40ForCausalLM"]
         super().__post_init__(**kwargs)
-        if self.embedding_output_dtype not in (None, "float32", "bfloat16", "float16"):
-            raise ValueError("embedding_output_dtype must be float32, bfloat16, float16 or None")
 
 
 AutoConfig.register(Xing40Config.model_type, Xing40Config, exist_ok=True)
-
-
-def _copy_global(target: torch.Tensor, value: torch.Tensor) -> None:
-    """Copy a full tensor into a parameter that FSDP may already have sharded."""
-    value = value.to(device=target.device, dtype=target.dtype)
-    if isinstance(target, DTensor):
-        value = distribute_tensor(value, target.device_mesh, target.placements)
-    target.copy_(value)
 
 
 class Xing40RotaryEmbedding(DeepseekV3RotaryEmbedding):
@@ -445,9 +430,6 @@ class Xing40Model(nn.Module):
         super().__init__()
         self.num_residual_streams = config.num_residual_streams
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        self.embedding_output_dtype = (
-            getattr(torch, config.embedding_output_dtype) if config.embedding_output_dtype is not None else None
-        )
         self.layers = nn.ModuleList(
             Xing40DecoderLayer(config, index, sparse=index >= config.first_k_dense_replace)
             for index in range(config.num_hidden_layers))
@@ -458,20 +440,20 @@ class Xing40Model(nn.Module):
         self.gradient_checkpointing = False
 
     def embed_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Look up tokens and cast activations after the embedding boundary.
+        """Look up tokens and cast the activation to BF16 at the embedding boundary.
+
+        MindFormers keeps the embedding table in FP32 (``embedding_params_dtype``) but computes
+        the rest of the model in BF16 (``compute_dtype``); this is the one cast MindFormers makes
+        between the two, unconditionally, with no other supported width. Parameter precision and
+        the native embedding backward are unaffected.
 
         Args:
             input_ids: Token IDs with the batch and sequence dimensions.
 
         Returns:
-            Lookup activations in the configured output dtype, or the lookup's
-            original dtype when no override is configured. Parameter precision
-            and the native embedding backward remain unchanged.
+            Lookup activations cast to ``torch.bfloat16``.
         """
-        embeddings = self.embed_tokens(input_ids)
-        if self.embedding_output_dtype is not None:
-            embeddings = embeddings.to(self.embedding_output_dtype)
-        return embeddings
+        return self.embed_tokens(input_ids).to(torch.bfloat16)
 
     def forward(self, input_ids: torch.Tensor,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -576,11 +558,10 @@ class Xing40PreTrainedModel(DeepseekV3PreTrainedModel):
             num_stream = module.num_stream
             nn.init.normal_(module.phi.weight, mean=0.0, std=1e-4)
             module.branch_alpha.fill_(self.config.mhc_init_gating_factor)
-            # Start as the identity residual: pre = 1/4, post = 1 and strongly diagonal mixing.
-            _copy_global(module.branch_beta, torch.cat((
-                torch.full((num_stream,), -math.log(3.0)),
-                torch.zeros(num_stream),
-                ((torch.eye(num_stream) - 1.0) * 5.0).flatten())))
+            # Zeroed, not the mHC reference identity-residual shift: every real run loads a
+            # converted checkpoint (mHC has no from-scratch reference path, matching the
+            # framework's MhcPreModule, which does not initialize its own parameters either).
+            module.branch_beta.zero_()
         elif isinstance(module, Xing40MhcHead):
             nn.init.normal_(module.hc_fn, mean=0.0, std=self.config.initializer_range)
             module.hc_base.zero_()

@@ -208,9 +208,9 @@ the logit maxima QK clipping consumes), `GroupedExperts`, `RMSNorm` and the fuse
 configuration, needs the omni custom operators; remove its two entries for the
 non-fused MindFormers reference. As in MindFormers, FSDP computes the router, mHC,
 RMSNorm and embedding table parameters in FP32 and the rest in BF16
-(`fsdp_config.mix_precision.custom_params`); the model's `embedding_output_dtype`
-separately casts the lookup output to BF16 before it expands into the mHC residual
-streams, so the two settings must be changed together.
+(`fsdp_config.mix_precision.custom_params`); the model unconditionally casts the
+embedding lookup output to BF16 before it expands into the mHC residual streams
+(`Xing40Model.embed_inputs`), the one cast MindFormers itself makes here.
 
 ```bash
 bash examples/training_demo/xing40/run_train.sh /path/to/text_document
