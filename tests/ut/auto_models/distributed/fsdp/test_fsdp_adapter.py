@@ -132,7 +132,8 @@ fsdp_config:
             self.assertTrue(state.mp_policy.apply_grad_on_fp32_main_grad)
             expected_dtype = torch.bfloat16 if module is model.layers[1] else torch.float32
             self.assertEqual(state.hsdp_params[0].all_gather_inputs[0].dtype, expected_dtype)
-            self.assertEqual(state.hsdp_params[0].reduce_comm_dtype(torch.ones(4, dtype=expected_dtype)), expected_dtype)
+            self.assertEqual(state.hsdp_params[0].reduce_comm_dtype(torch.ones(4, dtype=expected_dtype)),
+                             expected_dtype)
         self.assertTrue(all(parameter_ref() is None for parameter_ref in parameter_refs))
         self.assertIsInstance(root_state.mp_policy.custom_params, WeakIdKeyDictionary)
         self.assertEqual(len(root_state.mp_policy.custom_params), 0)
