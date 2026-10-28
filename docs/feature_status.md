@@ -5,6 +5,7 @@
 ## 支持模型
 
 - [x] Qwen3-30B-A3B
+- [x] DeepSeek-V3.2（DSA + MoE，TP/CP/EP/FSDP）
 
 ## HyperShard
 

@@ -39,11 +39,21 @@ def _load_context_parallel():
     return context_parallel
 
 
+def _load_expert_parallel():
+    """Return the DeepSeek-V3.2 EP compute factory provider lazily."""
+    from hyper_parallel.models.deepseek_v32.adapter.distributed import (  # pylint: disable=C0415
+        expert_parallel,
+    )
+
+    return expert_parallel
+
+
 DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV32ForCausalLM",
     model_type="deepseek_v32",
     replacements=_load_replacements,
     context_parallel=_load_context_parallel,
+    expert_parallel=_load_expert_parallel,
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)

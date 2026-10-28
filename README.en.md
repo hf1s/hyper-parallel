@@ -74,7 +74,7 @@ through certain syntax constraints, utilising advanced graph optimisation capabi
     - [x] Qwen3.5-0.8B-Base
     - [x] Qwen3.5-35B-A3B-Base (MoE)
     - [x] Qwen3-VL-30B-A3B-Instruct (MoE)
-    - [ ] DeepSeekV3.2
+    - [x] DeepSeekV3.2
     - [ ] Qwen3-Omni
 
 - HyperShard
