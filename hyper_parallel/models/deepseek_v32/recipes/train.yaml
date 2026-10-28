@@ -1,14 +1,26 @@
-# DeepSeek-V3.2 single-device Trainer recipe.
+# DeepSeek-V3.2 完整训练配方（唯一对外交付的 DeepSeek-V3.2 recipe）。
 #
-# The model configuration, tokenizer, and weights come from the official
-# Hugging Face checkpoint. Parallel topology sections are intentionally
-# omitted, so Trainer defaults keep TP/CP/EP/PP and FSDP degrees at 1. The
-# conditional CP override remains available and is activated only when a user
-# explicitly sets accelerator.cp_size greater than 1.
+# 主线拓扑：64 节点 / 512 卡 Ascend NPU（hccl backend）。
+#   dense 区域：tp 1 × cp 1 × dp 512，FSDP 在 512 卡上切分；
+#   专家区域：ep 64 × edp 8（edp = dp*cp*tp/ep），edp 维度再做 FSDP 切分。
+# 显存估算（未在本配方上实测，按需在目标集群确认）：FP32 参数 + FP32 main grad
+# + AdamW 两个 FP32 动量 ≈ 16 B/param；256 个路由专家（约 654B 参数）由
+# ep 64 × edp_shard 8 摊到每卡约 1.28B 参数（≈ 20 GB），dense 部分约 18B 参数在
+# 512 卡上可忽略，再加 4K 序列全重计算激活，单卡约 30 GB。
 #
-# DeepSeek-V3.2 is a very large model; running this recipe requires a device
-# with enough memory for the selected checkpoint and optimizer states. Local
-# or offline assets can be selected with dotted overrides, for example:
+# 其它并行维度都通过 CLI dotted override 打开，无需维护第二份配置：
+#   TP/loss parallel：--accelerator.tp_size=2 --accelerator.loss_parallel=true；DSA 暂不支持
+#                     sequence parallel。
+#     MoE 层在 TP 下走 TP-extend-EP（专家只按 ep 切），因此 tp_size>1 时 ep_size
+#     必须 >1；fused gate_up 专家不能直接做 TP 切分（planner 会给出明确报错）。
+#   CP：--accelerator.cp_size=2，下方 `when: cp` 的 DSA CP wrapper 自动生效；
+#   EP：--accelerator.ep_size 与 --fsdp_config.edp_shard_size 一起调整。
+# 修改拓扑时保持 world_size = tp*cp*dp、dp*cp 可被 dp_shard_size 整除、
+# dp*cp*tp/ep 可被 edp_shard_size 整除、256 个专家可被 ep_size 整除，且
+# global_batch_size 可被 micro_batch_size*dp 整除。
+#
+# 默认加载公开 Hugging Face 资源（模型、tokenizer、dataset）。本地或离线资源
+# 用命令行覆盖，例如：
 #   scripts/train_lm.py <this file> \
 #     --model.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2 \
 #     --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2
@@ -17,13 +29,16 @@ model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
   torch_dtype: bfloat16
-  attn_implementation: eager
+  # DSA 替换不读取稠密 mask；sdpa 让 Transformers 只构建 bool 因果 mask。
+  attn_implementation: sdpa
   force_hf: true
+
+model_init_dtype: float32
 
 training:
   train_iters: 3
   train_samples: null
-  global_batch_size: 1
+  global_batch_size: 512
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -31,6 +46,29 @@ training:
   max_grad_norm: 1.0
   seed: 42
   enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 64
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 512
+  edp_shard_size: 8
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
 
 plan_overrides:
   - match:
@@ -41,22 +79,45 @@ plan_overrides:
     replace_module:
       _target_: >-
         hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
+  # MLA + Lightning-indexer DSA。q_a/kv_a 融合为 linear_qkv（权重由 make_transforms 拼接），
+  # 稀疏注意力与 indexer 走 NPU 融合算子；TP 下主注意力头按 q_b/kv_b 列切，indexer 头复制。
   - match: "*.self_attn"
     module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Attention
     replace_module:
       _target_: >-
         hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+  # 专家始终使用同一个 grouped-GEMM 实现；EP 只改变该边界外的 token 分发与合并。
   - match: "*.mlp.experts"
     module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Experts
     replace_module:
       _target_: >-
         hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+  # CP：本 rank 保留本地 query，异步 all-gather indexer key 与 MLA 压缩 KV，
+  # 只消费到本地 query 结尾的因果前缀；打包边界由 runtime input 的
+  # cu_seq_lens 投影到本地。
   - match: "*.self_attn"
     when: cp
     region_dispatch: false
     inner_target: self
     inner_wrapper:
       _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+  # EP：只匹配 MoE 层。DeepSeek-V3.2 的 first_k_dense_replace=3，层 0-2 为稠密 MLP，
+  # 层 3-60 为 MoE；fnmatch 不支持数值区间，因此分两条 glob 覆盖 3-9 与 10-99。
+  # 裁剪模型改变稠密层数时需要同步调整这两条 glob。
+  - match: "model.layers.[3-9].mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.expert_parallel.deepseek_v32_ep_compute_fn
+      use_grouped_gemm: true
+      overlap_shared_expert: true
+  - match: "model.layers.[1-9][0-9].mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.expert_parallel.deepseek_v32_ep_compute_fn
+      use_grouped_gemm: true
+      overlap_shared_expert: true
 
 mixed_precision:
   enabled: false
@@ -92,7 +153,7 @@ dataset:
     config_name: wikitext-2-raw-v1
     cache_dir: null
     labels_are_shifted: true
-    create_attention_mask_in_dataloader: true
+    create_attention_mask_in_dataloader: false
     create_ltor_fields_in_dataloader: false
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: Salesforce/wikitext
@@ -105,7 +166,10 @@ dataloader:
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
-    attention_mode: dense
+    # DSA 从累计序列长度推导因果与文档边界，不需要 [S, S] 稠密 mask。
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v32.adapter.data.runtime.DeepseekV32PackedSequence
   sampler_type: single
   data_rearrange_map: null
   data_sharding: false
@@ -117,6 +181,7 @@ dataloader:
 
 optimizer:
   _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     lr: 1.0e-5

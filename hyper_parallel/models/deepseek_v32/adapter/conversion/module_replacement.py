@@ -42,7 +42,23 @@ def replace_deepseek_v32_dsa_attention(
     module_fqn: str,
     context: Mapping[str, Any],
 ) -> nn.Module:
-    """Replace DeepSeek-V3.2 MLA/indexer attention with the fused DSA module."""
+    """Replace DeepSeek-V3.2 MLA/indexer attention with the fused DSA module.
+
+    The indexer KL loss distils the attention distribution summed over every
+    head. Tensor parallelism leaves each rank a subset of the heads and the
+    fused KL operator has no cross-rank reduction, so the trainable-indexer
+    loss is rejected together with ``tp_size > 1``.
+    """
+    config = module.config
+    indexer_loss = getattr(config, "dsa_loss_coeff", 0.0) and not getattr(
+        config, "freeze_DSA", getattr(config, "freeze_dsa", False)
+    )
+    if indexer_loss and context.get("tp", False):
+        raise ValueError(
+            f"{module_fqn}: the DeepSeek-V3.2 indexer KL loss (dsa_loss_coeff="
+            f"{config.dsa_loss_coeff}) needs every attention head on one rank; "
+            "train it with tp_size=1 or set dsa_loss_coeff=0 / freeze_dsa=true"
+        )
     from hyper_parallel.components.modules import DeepseekV32DSAAttention  # pylint: disable=C0415
 
     return DeepseekV32DSAAttention(module=module, module_fqn=module_fqn, context=context)

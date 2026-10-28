@@ -54,6 +54,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 > **支持模型**
 >
 > - [Qwen3-30B-A3B](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
+> - [DeepSeek-V3.2](hyper_parallel/models/deepseek_v32/recipes/train.yaml)
 
 ### HyperParallel Core
 

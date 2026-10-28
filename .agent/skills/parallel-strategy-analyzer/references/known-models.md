@@ -53,6 +53,18 @@ Compresses KV cache into a low-rank latent vector instead of storing per-head K/
 
 **Impact on parallel strategy**: MLA compresses KV cache ~32× (512-dim vs 128×128=16384 for standard MHA). For CP ring attention, use `kv_lora_rank` instead of `n_kv × d_head` when estimating KV transfer volume — makes CP nearly free for MLA models.
 
+### DSA (DeepSeek Sparse Attention) — DeepSeek V3.2
+
+V3.2 keeps MLA and adds a Lightning Indexer that selects `index_topk` keys per query for sparse attention:
+
+| Parameter | V3.2 |
+|-----------|------|
+| index_n_heads | 64 |
+| index_head_dim | 128 |
+| index_topk | 2048 |
+
+**Impact on parallel strategy**: attention score memory and compute scale with `s × index_topk` instead of `s²` once `s > index_topk`; the indexer itself still scores `s²` pairs with `index_n_heads × index_head_dim`. Under CP the indexer keys (`index_head_dim` per token) are all-gathered alongside the MLA latent KV. The indexer heads stay replicated under TP, and the trainable indexer KL loss needs every attention head on one rank, so it is incompatible with `tp_size > 1`.
+
 ### GQA (Grouped Query Attention) — LLaMA-2/3, Qwen3/3.5
 
 `n_kv < n_h`: multiple query heads share one KV head. Reduces CP communication by `n_kv/n_h` ratio.
