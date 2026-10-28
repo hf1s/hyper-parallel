@@ -88,6 +88,39 @@ class TestXing40Training(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_attention_scale_is_independent_of_rotary_frequencies(self):
+        """
+        Feature: Explicit attention score scale with ordinary rotary embeddings.
+        Description: Save/reload config and run attention through SDPA with the explicit score scale.
+        Expectation: The requested scale is applied once, with unchanged frequencies and default behavior.
+        """
+        scale = (1.0 + 0.1 * math.log(40.0)) ** 2 / math.sqrt(16)
+        default = _model()
+        config = _config(attention_softmax_scale=scale)
+        restored = Xing40Config.from_dict(config.to_dict())
+        model = Xing40ForCausalLM(restored)
+        torch.testing.assert_close(model.model.rotary_emb.inv_freq, default.model.rotary_emb.inv_freq,
+                                   rtol=0, atol=0)
+        self.assertEqual(default.model.layers[0].self_attn.scaling, 16 ** -0.5)
+        self.assertEqual(model.mtp.layers[0].transformer_layer.self_attn.scaling, scale)
+        source = model.model.layers[0].self_attn.double()
+        source.config._attn_implementation = "sdpa"
+        inputs = torch.linspace(-1, 1, 3 * 64, dtype=torch.float64).reshape(1, 3, 64).requires_grad_()
+        cos = torch.ones(1, 3, TINY_CONFIG["qk_rope_head_dim"], dtype=torch.float64)
+        with mock.patch("torch.nn.functional.scaled_dot_product_attention",
+                        wraps=nn.functional.scaled_dot_product_attention) as attention:
+            actual, _ = source(inputs, (cos, torch.zeros_like(cos)), attention_mask=None)
+        attention.assert_called_once()
+        self.assertEqual(attention.call_args.kwargs["scale"], scale)
+        actual.square().sum().backward()
+        self.assertTrue(torch.isfinite(inputs.grad).all())
+        self.assertGreater(inputs.grad.abs().sum().item(), 0.0)
+        for invalid in (0.0, -1.0, float("inf"), float("nan"), True, "0.5"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "attention_softmax_scale"):
+                _config(attention_softmax_scale=invalid)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_meta_materialization_initializes_every_tensor(self):
         """
         Feature: Meta-device construction through the recipe's builder.
