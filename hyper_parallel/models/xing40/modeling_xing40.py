@@ -81,10 +81,13 @@ class Xing40Config(DeepseekV3Config):
     ``moe_router_force_expert_balance`` is optional and defaults to False.
     ``embedding_output_dtype`` optionally casts lookup activations before residual
     expansion, independently of embedding parameter/storage precision.
+    ``attention_softmax_scale`` optionally sets the attention score scale,
+    independently of the rotary embedding frequencies. None retains DeepSeek-V3's scale.
     """
 
     model_type = "xing40"
     embedding_output_dtype: str | None = None
+    attention_softmax_scale: float | None = None
 
     def __post_init__(self, **kwargs: Any) -> None:
         """Default ``architectures`` to the model class this configuration builds.
@@ -97,6 +100,10 @@ class Xing40Config(DeepseekV3Config):
         super().__post_init__(**kwargs)
         if self.embedding_output_dtype not in (None, "float32", "bfloat16", "float16"):
             raise ValueError("embedding_output_dtype must be float32, bfloat16, float16 or None")
+        scale = self.attention_softmax_scale
+        if scale is not None and (isinstance(scale, bool) or not isinstance(scale, (int, float))
+                                  or not math.isfinite(scale) or scale <= 0):
+            raise ValueError("attention_softmax_scale must be positive and finite or None")
 
 
 AutoConfig.register(Xing40Config.model_type, Xing40Config, exist_ok=True)
@@ -405,6 +412,8 @@ class Xing40DecoderLayer(nn.Module):
         """
         super().__init__()
         self.self_attn = DeepseekV3Attention(config, layer_idx)
+        if config.attention_softmax_scale is not None:
+            self.self_attn.scaling = config.attention_softmax_scale
         # Transformers builds the latent norms with the default epsilon; MindFormers uses rms_norm_eps.
         self.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
         self.self_attn.kv_a_layernorm.variance_epsilon = config.rms_norm_eps
