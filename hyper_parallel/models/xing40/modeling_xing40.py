@@ -79,6 +79,7 @@ class Xing40Config(DeepseekV3Config):
     ``mhc_sinkhorn_iterations``, ``mhc_init_gating_factor``, ``mhc_layernorm_epsilon``,
     ``mtp_loss_factor``, ``moe_aux_loss_coeff``, ``moe_router_enable_expert_bias``,
     ``moe_router_bias_update_rate``, ``use_pad_tokens`` and ``chunk_loss_size``.
+    ``moe_router_force_expert_balance`` is optional and defaults to False.
     """
 
     model_type = "xing40"
@@ -229,9 +230,10 @@ class Xing40MoE(DeepseekV3MoE):
     """DeepSeek-V3 MoE with the MindFormers training extensions.
 
     The router, the routed experts and the shared experts are the Transformers
-    modules. Each call prefixes one zero pad token per expert, injects the
-    sequence-wise balance loss through the routing weights and counts the routed
-    tokens. The Trainer's ``MoEMonitorCallback`` reads ``enable_expert_bias`` and
+    modules. Each call prefixes each sequence with one zero pad token per expert,
+    injects the sequence-wise balance loss through the routing weights and counts
+    the routed tokens. The Trainer's ``MoEMonitorCallback`` reads
+    ``enable_expert_bias`` and
     ``expert_bias_update_rate``, sums ``tokens_per_expert`` over the data-parallel
     ranks and calls :meth:`update_expert_bias`.
     """
@@ -247,6 +249,7 @@ class Xing40MoE(DeepseekV3MoE):
         self.top_k = config.num_experts_per_tok
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.aux_loss_coeff = config.moe_aux_loss_coeff
+        self.force_expert_balance = getattr(config, "moe_router_force_expert_balance", False)
         self.enable_expert_bias = config.moe_router_enable_expert_bias
         self.expert_bias_update_rate = config.moe_router_bias_update_rate
         self.tokens_per_expert: torch.Tensor | None = None
@@ -285,10 +288,28 @@ class Xing40MoE(DeepseekV3MoE):
         Returns:
             Expert indices and routing weights, ``[batch * (padding + tokens), top_k]``.
         """
-        # Removing each sequence's pad prefix leaves a strided batch; HF's gate uses view().
-        logits, weights, indices = self.gate(hidden[:, self.padding:].reshape(-1, hidden.shape[-1]))
-        scores = logits.sigmoid()
-        weights = self._attach_balance_loss(weights, scores, batch_size=hidden.shape[0])
+        real_hidden = hidden[:, self.padding:]
+        if self.force_expert_balance:
+            logits = F.linear(  # pylint: disable=not-callable
+                real_hidden.reshape(-1, hidden.shape[-1]).float(), self.gate.weight.float())
+            scores = logits.sigmoid()
+            # Cycle the T*K slots over experts in order, as MindFormers' forced routing.
+            slots = torch.arange(scores.shape[0] * self.top_k, device=scores.device)
+            indices = (slots % self.num_experts).view(scores.shape[0], self.top_k)
+            # The reference router numbers [sequence, batch] tokens before flattening.
+            # Restore our [batch, sequence] layout without changing the expert assignment.
+            indices = indices.reshape(real_hidden.shape[1], real_hidden.shape[0], self.top_k).transpose(0, 1)
+            indices = indices.reshape(-1, self.top_k)
+            weights = scores.gather(1, indices)
+            if self.gate.norm_topk_prob:
+                weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+            weights = weights * self.gate.routed_scaling_factor
+        else:
+            # Removing each sequence's pad prefix leaves a strided batch; HF's gate uses view().
+            logits, weights, indices = self.gate(real_hidden.reshape(-1, hidden.shape[-1]))
+            scores = logits.sigmoid()
+        weights = self._attach_balance_loss(weights, scores, batch_size=hidden.shape[0],
+                                            selected_indices=indices if self.force_expert_balance else None)
         # A recomputed forward replays the same routing; count each token once.
         if not is_recomputing():
             counts = torch.zeros_like(scores[0]).scatter_add_(
@@ -303,20 +324,24 @@ class Xing40MoE(DeepseekV3MoE):
                                  weights.reshape(batch, -1, self.top_k)), dim=1).reshape(-1, self.top_k)
         return indices, weights
 
-    def _attach_balance_loss(self, weights: torch.Tensor, scores: torch.Tensor,
-                             batch_size: int = 1) -> torch.Tensor:
+    def _attach_balance_loss(self, weights: torch.Tensor, scores: torch.Tensor, batch_size: int,
+                             selected_indices: torch.Tensor | None = None) -> torch.Tensor:
         """Inject ``coeff * E * mean_b(sum_i(f_bi * P_bi))`` through the routing weights.
 
-        As in DeepSeek-V3, ``f_i`` counts the unbiased top-k affinities, independently of
-        the expert-load bias, and ``P_i`` averages the normalized affinities within
-        each sequence. The sequence objectives are averaged over the batch.
+        ``f_bi`` counts unbiased top-k affinities per sequence, or the prescribed cyclic routes
+        when forced balancing is enabled, independently of the expert-load bias. ``P_bi`` averages
+        the normalized affinities within each sequence. The sequence objectives are averaged over
+        the batch.
 
         Args:
             weights: Routing weights of the real tokens.
             scores: Router affinities of every expert.
             batch_size: Number of independent sequences before flattening the tokens.
+            selected_indices: Forced routes, or None to use unbiased top-k affinities.
         """
-        selected = scores.topk(self.top_k, dim=-1, sorted=False).indices.reshape(batch_size, -1)
+        if selected_indices is None:
+            selected_indices = scores.topk(self.top_k, dim=-1, sorted=False).indices
+        selected = selected_indices.reshape(batch_size, -1)
         counts = scores.new_zeros(batch_size, self.num_experts).scatter_add_(
             1, selected, torch.ones_like(selected, dtype=scores.dtype))
         load = counts / selected.shape[1]
@@ -620,7 +645,7 @@ class Xing40PreTrainedModel(DeepseekV3PreTrainedModel):
 
 
 class Xing40ForCausalLM(Xing40PreTrainedModel):
-    """Causal LM whose forward returns the LM and MTP losses of one ``[1, sequence]`` batch."""
+    """Causal LM whose forward returns the LM and MTP losses of one ``[batch, sequence]`` training batch."""
 
     def __init__(self, config: Xing40Config) -> None:
         """Build the backbone, LM head and MTP depths.
