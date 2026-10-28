@@ -128,6 +128,7 @@ def mhc_pre(
     norm_eps: float = 1e-6,
     hc_eps: float = 1e-6,
     gamma: Optional[torch.Tensor] = None,
+    use_fused: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare an input and its mixing coefficients for an MHC-wrapped block.
 
@@ -141,6 +142,7 @@ def mhc_pre(
         norm_eps: RMS normalization epsilon.
         hc_eps: Hyper-connection numerical stability epsilon.
         gamma: Optional RMS normalization scale.
+        use_fused: Allow the fused NPU implementation when available.
 
     Returns:
         Block input, post coefficients, residual coefficients, and residual buffer.
@@ -149,7 +151,7 @@ def mhc_pre(
         NPU inputs run the AscendC operator when ``omni_training_custom_ops`` is
         installed; other inputs run the same computation with PyTorch operators.
     """
-    if x.device.type != "npu" or omni_training_custom_ops is None:
+    if not use_fused or x.device.type != "npu" or omni_training_custom_ops is None:
         return _mhc_pre_reference(x, phi, branch_alpha, branch_beta, num_stream, sinkhorn_iters, norm_eps,
                                   hc_eps, gamma)
     shape = x.size()
