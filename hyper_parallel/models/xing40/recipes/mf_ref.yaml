@@ -1,20 +1,13 @@
 # MindFormers reference recipe for the Xing4.0-29B 4-layer alignment.
 #
-# Public code reference (PyNative DeepSeek-V3, no mHC/QK-clip extensions):
-#         https://gitcode.com/mindspore/mindformers/blob/master/mindformers/models/deepseek3/modeling_deepseek_v3_pynative.py
-#         (master 902de5f0aa5f16c77fe8f45c57550d333ac32634)
-# Run snapshot (private fork recorded in the image, not publicly readable):
-#         mindformers @ 472349f66919476f14aea17f56f49475ce89af03
-#         (fork Somnus2020/mindformers_formal_v1.0, master)
-# Image:  ms-r211-ops-base:20261014, container ds3-align (/opt/src/mindformers)
-# Launch: python run_mindformer.py --config /work/mf_4l_2000sizes.yaml --mode 1
-# Data:   /host/mmap_deepseekv3_datasets_text_document, sizes [2000, 0, 0], seq 4096
-# Loads the shared step-200 checkpoint (/work/state/mf-step200) and runs 201-2000.
+# Code:   mindformers PyNative DeepSeek-V3
+#         mindformers/models/deepseek3/modeling_deepseek_v3_pynative.py (master)
+# Config: derived from deepseek-v3-29b-8card/base.yaml (net-regression-suite);
+#         same 4-layer model, Muon and mHC settings, with the dataset, steps (2000),
+#         batch (1/1) and the step-200 checkpoint load changed for the alignment.
 #
-# Derived from deepseek-v3-29b-8card/base.yaml (net-regression-suite): same 4-layer
-# model, Muon and mHC settings; only the dataset, steps (2000), batch (1/1) and
-# checkpoint load differ. mHC is NOT fused here (use_fused_mhc: false).
-# The HP counterpart is this repository's xing40 recipe with num_hidden_layers=4,
+# 4 layers, no MTP, use_fused_mhc: false, seq 4096, loads step-200 and runs 201-2000.
+# HP counterpart: this repository's xing40 recipe with num_hidden_layers=4,
 # global_batch_size=1 and the step-200 DCP restore.
 
 run_mode: train
