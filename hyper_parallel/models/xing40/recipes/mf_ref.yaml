@@ -1,7 +1,11 @@
 # MindFormers reference recipe for the Xing4.0-29B 4-layer alignment.
 #
-# Code:   mindformers @ 472349f66919476f14aea17f56f49475ce89af03
-#         (recorded in the image as fork Somnus2020/mindformers_formal_v1.0, master)
+# Public code reference (PyNative DeepSeek-V3, no mHC/QK-clip extensions):
+#         https://gitcode.com/mindspore/mindformers/blob/master/mindformers/models/deepseek3/modeling_deepseek_v3_pynative.py
+#         (master 902de5f0aa5f16c77fe8f45c57550d333ac32634)
+# Run snapshot (private fork recorded in the image, not publicly readable):
+#         mindformers @ 472349f66919476f14aea17f56f49475ce89af03
+#         (fork Somnus2020/mindformers_formal_v1.0, master)
 # Image:  ms-r211-ops-base:20261014, container ds3-align (/opt/src/mindformers)
 # Launch: python run_mindformer.py --config /work/mf_4l_2000sizes.yaml --mode 1
 # Data:   /host/mmap_deepseekv3_datasets_text_document, sizes [2000, 0, 0], seq 4096
