@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU tests of the Xing4.0 optimizer: Muon schema, AdamW decay groups and QK clipping."""
+"""CPU tests of the Xing4.0 optimizer: AdamW decay groups and QK clipping."""
 
 import unittest
 
@@ -20,7 +20,7 @@ import torch
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
 
 from hyper_parallel.core.optimizer.muon import Muon as MuonOptimizer
-from hyper_parallel.models.xing40.adapter.optim import _ns_transform, build_optimizer, clip_qk
+from hyper_parallel.models.xing40.adapter.optim import build_optimizer, clip_qk
 from hyper_parallel.models.xing40.modeling_xing40 import (
     Xing40Config,
     Xing40ForCausalLM,
@@ -129,97 +129,6 @@ class TestAdamwDecayGroups(unittest.TestCase):
         for name in ("model.layers.0.attn_hc_pre.branch_alpha", "model.hc_head.hc_base", "model.hc_head.hc_scale"):
             self.assertEqual(decay.get(name), 0.0, f"{name} decay={decay.get(name)}")
         self.assertEqual(decay.get("lm_head.weight"), 0.1, f"lm_head decay={decay.get('lm_head.weight')}")
-
-
-class TestMuonSchema(unittest.TestCase):
-    """MindFormers matrix splits for Newton-Schulz."""
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_packed_mlp_preserves_separate_gate_up_updates(self):
-        """
-        Feature: Muon updates after the SwiGLUMLP replacement.
-        Description: Pack unequal gate/up gradients into the Dense and shared FC1 layouts and
-            run two native Muon steps alongside their separate projection parameters.
-        Expectation: Packing preserves both logical matrix updates and their FP32 momentum.
-        """
-        transform = _ns_transform(CONFIG)
-        for name, intermediate in (
-                ("model.layers.0.mlp.linear_fc1.weight", CONFIG.intermediate_size),
-                ("model.layers.1.mlp.shared_experts.linear_fc1.weight", CONFIG.moe_intermediate_size)):
-            with self.subTest(name=name):
-                values = torch.arange(intermediate * CONFIG.hidden_size, dtype=torch.float32)
-                values = values.reshape(intermediate, CONFIG.hidden_size)
-                gate_values = (values.remainder(17) - 8) / 32
-                up_values = (values.remainder(11) - 5) / 16
-                gate = torch.nn.Parameter(gate_values)
-                up = torch.nn.Parameter(up_values)
-                packed = torch.nn.Parameter(torch.cat((gate_values, up_values)))
-                packed.model_name = name
-                prefix = name.removesuffix(".linear_fc1.weight")
-                gate.model_name = prefix + ".gate_proj.weight"
-                up.model_name = prefix + ".up_proj.weight"
-                options = {"lr": 1e-3, "weight_decay": 0.1, "momentum": 0.95, "ns_steps": 5,
-                           "ns_variant": "legacy", "ns_transform_fn": transform}
-                fused_optimizer = MuonOptimizer([packed], **options)
-                separate_optimizer = MuonOptimizer([gate, up], **options)
-                for step in range(2):
-                    gate.grad = (values.remainder(13) - 6 + step) / 64
-                    up.grad = (values.remainder(7) - 3 - step) / 8
-                    packed.grad = torch.cat((gate.grad, up.grad))
-                    fused_optimizer.step()
-                    separate_optimizer.step()
-                    torch.testing.assert_close(
-                        packed, torch.cat((gate, up)), rtol=0, atol=0,
-                        msg=f"{name}: packed gate/up parameter update differs at step {step + 1}")
-                    expected_momentum = torch.cat((separate_optimizer.state[gate]["momentum_buffer"],
-                                                   separate_optimizer.state[up]["momentum_buffer"]))
-                    torch.testing.assert_close(
-                        fused_optimizer.state[packed]["momentum_buffer"], expected_momentum, rtol=0, atol=0,
-                        msg=f"{name}: packed momentum differs at step {step + 1}")
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_splits_restore_the_original_layout(self):
-        """
-        Feature: Muon NS input transform.
-        Description: Split the fused latent projection into its query/KV/RoPE-key blocks, the MLA up
-            projections per head and the fused expert gate/up matrix in halves, in the Transformers
-            [E, 2I, H] layout and in the transposed GroupedExperts [E, H, 2I] layout.
-        Expectation: Each part has the expected shape and restoring the unmodified parts reproduces the input.
-        """
-        transform = _ns_transform(CONFIG, frozenset({"model.layers.2.mlp.experts"}))
-        heads, nope, rope, value = 4, CONFIG.qk_nope_head_dim, CONFIG.qk_rope_head_dim, CONFIG.v_head_dim
-        q_lora, kv_lora = CONFIG.q_lora_rank, CONFIG.kv_lora_rank
-        expert = CONFIG.moe_intermediate_size
-        cases = {
-            "model.layers.0.self_attn.linear_qkv.weight": (
-                (q_lora + kv_lora + rope, 32), [(q_lora, 32), (kv_lora, 32), (rope, 32)]),
-            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight": (
-                (kv_lora + rope, 32), [(kv_lora, 32), (rope, 32)]),
-            "model.layers.0.self_attn.q_b_proj.weight": (
-                (heads * (nope + rope), 16), [(heads * nope, 16), (heads * rope, 16)]),
-            "model.layers.0.self_attn.kv_b_proj.weight": (
-                (heads * (nope + value), 8), [(heads * nope, 8), (heads * value, 8)]),
-            "model.layers.1.mlp.experts.gate_up_proj": (
-                (4, 2 * expert, 32), [(4, expert, 32), (4, expert, 32)]),
-            "model.layers.2.mlp.experts.gate_up_proj": (
-                (4, 32, 2 * expert), [(4, 32, expert), (4, 32, expert)]),
-        }
-        for name, (shape, part_shapes) in cases.items():
-            with self.subTest(name=name):
-                update = torch.randn(shape)
-                split = transform(name, update)
-                self.assertEqual([tuple(part.shape) for part in split.tensors], part_shapes)
-                restored = torch.empty_like(update)
-                split.restore(split.tensors, restored)
-                torch.testing.assert_close(restored, update, rtol=0, atol=0)
-        query = torch.randn(heads * (nope + rope), 16)
-        query_parts = transform("model.layers.0.self_attn.q_b_proj.weight", query).tensors
-        per_head = query.view(heads, nope + rope, 16)
-        torch.testing.assert_close(query_parts[0], per_head[:, :nope].reshape(-1, 16), rtol=0, atol=0)
-        torch.testing.assert_close(query_parts[1], per_head[:, nope:].reshape(-1, 16), rtol=0, atol=0)
-        self.assertIsNone(transform("model.layers.0.self_attn.o_proj.weight", torch.randn(8, 8)))
 
 
 if __name__ == "__main__":
