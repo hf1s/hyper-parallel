@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Muon for Xing4.0: AdamW decay groups and QK clipping after each step."""
+"""Muon for Xing4.0: MindFormers matrix splits and QK clipping after each step."""
 
 # This adapter uses the Torch runtime, like the existing optimizer builders.
 # pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -28,13 +28,14 @@ from torch import nn
 
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.optimizer.muon import NSInputTransform
 
 __all__ = ["build_optimizer", "clip_qk"]
 
 
 def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_config: dict[str, Any],
                     qk_clip_threshold: float = 0.0) -> Muon:
-    """Build the framework Muon with the MindFormers AdamW decay groups.
+    """Build Muon with the MindFormers Newton-Schulz block splits and AdamW decay groups.
 
     As in MindFormers, AdamW does not decay one-dimensional parameters (norm weights, mHC
     gates and biases) or biases.
@@ -51,8 +52,11 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
     """
     # The AdamW grouping matches name fragments; full names select exactly the 1-D parameters.
     no_decay = ["bias", *(name for name, parameter in model.named_parameters() if parameter.ndim == 1)]
-    builder = Muon(muon_config=dict(muon_config), adamw_config=dict(adamw_config), model=model,
-                   no_decay_params=no_decay)
+    # The GroupedExperts replacement stores the expert matrices transposed, [E, H, 2I].
+    transposed_experts = frozenset(name for name, module in model.named_modules()
+                                   if getattr(module, "is_transposed", False))
+    builder = Muon(muon_config={**muon_config, "ns_transform_fn": _ns_transform(model.config, transposed_experts)},
+                   adamw_config=dict(adamw_config), model=model, no_decay_params=no_decay)
     if qk_clip_threshold > 0:
         # The MLA modules: the NPU replace_xing40_mla_attention result or, unreplaced, Transformers attention.
         attention = [module for module in model.modules()
@@ -68,6 +72,78 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
         # The Trainer keeps this chained optimizer; optimizer-state swap replaces its leaves, not it.
         chained.step = step_and_clip
     return builder
+
+
+def _periodic_split(matrix: torch.Tensor, first: int, second: int) -> list[torch.Tensor]:
+    """Split per-head ``[first; second]`` row blocks into the two stacked matrices."""
+    heads = matrix.T.reshape(matrix.shape[1], -1, first + second)
+    return [heads[..., :first].reshape(matrix.shape[1], -1).T, heads[..., first:].reshape(matrix.shape[1], -1).T]
+
+
+def _periodic_merge(parts: list[torch.Tensor], first: int, second: int) -> torch.Tensor:
+    """Invert :func:`_periodic_split`."""
+    columns = parts[0].shape[1]
+    heads = torch.cat((parts[0].T.reshape(columns, -1, first), parts[1].T.reshape(columns, -1, second)), dim=-1)
+    return heads.reshape(columns, -1).T
+
+
+def _ns_transform(config: Any, transposed_experts: frozenset[str] = frozenset()
+                  ) -> Callable[[str, torch.Tensor], NSInputTransform | None]:
+    """Return the MindFormers Muon schema, which orthogonalizes these blocks separately.
+
+    * ``linear_qkv``: the query latent, KV latent and shared RoPE-key row blocks; the
+      unfused Transformers layout keeps ``q_a_proj`` whole and splits
+      ``kv_a_proj_with_mqa`` into its KV latent and RoPE-key rows;
+    * ``q_b_proj``/``kv_b_proj``: the per-head no-RoPE rows and the RoPE or value rows;
+    * packed Dense/shared ``linear_fc1.weight``: the contiguous gate and up halves
+      created by the SwiGLUMLP replacement;
+    * ``experts.gate_up_proj``: each expert's gate and up halves, along dimension 1 of
+      ``[E, 2I, H]`` or dimension 2 of the transposed ``[E, H, 2I]`` of the modules
+      named in ``transposed_experts``.
+    """
+    nope, rope, value = config.qk_nope_head_dim, config.qk_rope_head_dim, config.v_head_dim
+    latent_blocks = (config.q_lora_rank, config.kv_lora_rank, rope)
+
+    def block_split(update: torch.Tensor, sizes: Sequence[int], dim: int) -> NSInputTransform:
+        """Split contiguous blocks of ``sizes`` along ``dim``; restore into the matching views."""
+        def restore(parts: list[torch.Tensor], output: torch.Tensor) -> None:
+            """Copy each block's update into its view of ``output``."""
+            for view, part in zip(output.split(list(sizes), dim=dim), parts):
+                view.copy_(part)
+
+        return NSInputTransform(tensors=list(update.split(list(sizes), dim=dim)), restore=restore)
+
+    def head_split(update: torch.Tensor, second: int) -> NSInputTransform:
+        """Split per-head no-RoPE rows from the ``second`` rows that follow them."""
+        return NSInputTransform(
+            tensors=_periodic_split(update, nope, second),
+            restore=lambda parts, output: output.copy_(_periodic_merge(parts, nope, second)))
+
+    def transform(name: str, update: torch.Tensor) -> NSInputTransform | None:
+        """Split one parameter's update for Newton-Schulz, or return None to keep it whole.
+
+        Args:
+            name: Parameter FQN.
+            update: Full momentum update of the parameter.
+        """
+        if name.endswith(".self_attn.linear_qkv.weight"):
+            return block_split(update, latent_blocks, dim=0)
+        if name.endswith(".self_attn.kv_a_proj_with_mqa.weight"):
+            return block_split(update, latent_blocks[1:], dim=0)
+        if name.endswith(".self_attn.q_b_proj.weight"):
+            return head_split(update, rope)
+        if name.endswith(".self_attn.kv_b_proj.weight"):
+            return head_split(update, value)
+        if name.endswith((".mlp.linear_fc1.weight", ".mlp.shared_experts.linear_fc1.weight")):
+            if update.ndim != 2 or update.shape[0] % 2:
+                raise ValueError("Packed SwiGLU FC1 must be a matrix with an even number of rows")
+            return block_split(update, (update.shape[0] // 2,) * 2, dim=0)
+        if name.endswith(".mlp.experts.gate_up_proj"):
+            dim = 2 if name.removesuffix(".gate_up_proj") in transposed_experts else 1
+            return block_split(update, (config.moe_intermediate_size,) * 2, dim=dim)
+        return None
+
+    return transform
 
 
 @torch.no_grad()
