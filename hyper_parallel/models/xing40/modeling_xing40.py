@@ -373,8 +373,9 @@ class Xing40DecoderLayer(nn.Module):
         """
         super().__init__()
         self.self_attn = DeepseekV3Attention(config, layer_idx)
-        if config.attention_softmax_scale is not None:
-            self.self_attn.scaling = config.attention_softmax_scale
+        mscale = 0.1 * math.log(getattr(config, "scaling_factor", 1.0)) + 1.0
+        self.self_attn.scaling = config.attention_softmax_scale or mscale * mscale / (
+            config.qk_nope_head_dim + config.qk_rope_head_dim) ** 0.5
         # Transformers builds the latent norms with the default epsilon; MindFormers uses rms_norm_eps.
         self.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
         self.self_attn.kv_a_layernorm.variance_epsilon = config.rms_norm_eps
