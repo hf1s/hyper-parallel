@@ -38,6 +38,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch import nn
 from transformers import AutoConfig, DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
@@ -56,6 +57,7 @@ from hyper_parallel.components.functional.mhc_post import mhc_post
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
 from hyper_parallel.components.losses.chunked_cross_entropy import chunked_cross_entropy
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
+from hyper_parallel.core.utils.communication import differentiable_all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 
@@ -166,6 +168,7 @@ class Xing40MoE(DeepseekV3MoE):
         self.expert_bias_update_rate = config.moe_router_bias_update_rate
         self.tokens_per_expert: torch.Tensor | None = None
         self.last_aux_loss: torch.Tensor | None = None
+        self.aux_loss_cp_group = None
         # Expert-parallel routed computation installed by the EP adapter; None computes locally.
         self.ep_executor = None
 
@@ -256,9 +259,21 @@ class Xing40MoE(DeepseekV3MoE):
         selected = selected_indices.reshape(batch_size, -1)
         counts = scores.new_zeros(batch_size, self.num_experts).scatter_add_(
             1, selected, torch.ones_like(selected, dtype=scores.dtype))
-        load = counts / selected.shape[1]
-        affinity = (scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)).reshape(
-            batch_size, -1, self.num_experts).mean(dim=1)
+        if getattr(self, 'aux_loss_cp_group', None) is None:
+            load = counts / selected.shape[1]
+            affinity = (scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)).reshape(
+                batch_size, -1, self.num_experts).mean(dim=1)
+        else:
+            normalized = (scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)).reshape(
+                batch_size, -1, self.num_experts)
+            group = self.aux_loss_cp_group
+            with torch.no_grad():
+                counts = counts.detach()
+                dist.all_reduce(counts, group=group)
+                tokens = counts.new_tensor(normalized.shape[1])
+                dist.all_reduce(tokens, group=group)
+            load = counts / (tokens * self.top_k)
+            affinity = differentiable_all_reduce(normalized.sum(dim=1), "sum", group) / tokens
         loss = (affinity * load).sum(dim=-1).mean() * self.num_experts
         self.last_aux_loss = loss.detach()
         return aux_loss_auto_scale(weights, loss * self.aux_loss_coeff)
