@@ -86,6 +86,7 @@ class Xing40Config(DeepseekV3Config):
 
     model_type = "xing40"
     attention_softmax_scale: float | None = None
+    use_fused_mhc: bool = True
 
     def __post_init__(self, **kwargs: Any) -> None:
         """Default ``architectures`` to the model class this configuration builds.
@@ -96,6 +97,8 @@ class Xing40Config(DeepseekV3Config):
         if self.architectures is None:
             self.architectures = ["Xing40ForCausalLM"]
         super().__post_init__(**kwargs)
+        if not isinstance(self.use_fused_mhc, bool):
+            raise ValueError("use_fused_mhc must be a boolean")
         scale = self.attention_softmax_scale
         if scale is not None and (isinstance(scale, bool) or not isinstance(scale, (int, float))
                                   or not math.isfinite(scale) or scale <= 0):
@@ -296,6 +299,7 @@ class Xing40MhcPre(nn.Module):
         """
         super().__init__()
         self.num_stream = num_stream = config.num_residual_streams
+        self.use_fused_mhc = config.use_fused_mhc
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
         self.norm_eps = config.mhc_layernorm_epsilon
         self.phi = nn.Linear(num_stream * config.hidden_size, (num_stream + 2) * num_stream, bias=False)
@@ -313,7 +317,8 @@ class Xing40MhcPre(nn.Module):
             residual mixing and ``x``.
         """
         return mhc_pre(x, self.phi.weight, self.branch_alpha, self.branch_beta, self.num_stream,
-                       sinkhorn_iters=self.sinkhorn_iterations, norm_eps=self.norm_eps, hc_eps=_HC_EPS)
+                       sinkhorn_iters=self.sinkhorn_iterations, norm_eps=self.norm_eps, hc_eps=_HC_EPS,
+                       use_fused=self.use_fused_mhc)
 
 
 class Xing40MhcPost(nn.Module):
@@ -331,6 +336,7 @@ class Xing40MhcPost(nn.Module):
         """
         super().__init__()
         self.num_stream = config.num_residual_streams
+        self.use_fused_mhc = config.use_fused_mhc
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor, h_post: torch.Tensor,
                 h_res: torch.Tensor) -> torch.Tensor:
@@ -342,7 +348,7 @@ class Xing40MhcPost(nn.Module):
             h_post: Post scale from :class:`Xing40MhcPre`.
             h_res: Residual mixing from :class:`Xing40MhcPre`.
         """
-        return mhc_post(x, residual, h_post, h_res, self.num_stream)
+        return mhc_post(x, residual, h_post, h_res, self.num_stream, use_fused=self.use_fused_mhc)
 
 
 def _hyper_head(config: Xing40Config) -> DeepseekV4HyperHead:
