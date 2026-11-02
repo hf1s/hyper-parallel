@@ -31,7 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import swiglu
+from hyper_parallel.components import functional
 
 
 @module_replacement
@@ -177,7 +177,7 @@ class SwiGLUMLP(nn.Module):
         """Apply the fused Gate/Up projection, SwiGLU, and Down projection."""
         intermediate_parallel = self.linear_fc1(x)
         if intermediate_parallel.device.type == "npu":
-            intermediate_parallel = swiglu(  # pylint: disable=not-callable
+            intermediate_parallel = functional.swiglu(  # pylint: disable=not-callable
                 intermediate_parallel
             )
         else:

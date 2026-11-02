@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from torch import nn
 
+from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
@@ -279,6 +280,7 @@ class ShardingPlanner:
         _finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
         self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
+        self._finalize_swiglu_tp_guard(plan, model, tp_size=tp_size)
 
     @staticmethod
     def _log_explanation(plan: ShardingPlan, enabled: bool) -> None:
@@ -1053,6 +1055,54 @@ class ShardingPlanner:
         )
         self._set_extended_ep_contract(spec, ep_extend)
 
+
+    @staticmethod
+    def _finalize_swiglu_tp_guard(plan: ShardingPlan, model: nn.Module, *, tp_size: int) -> None:
+        """Reject layouts incompatible with the native packed SwiGLU forward.
+
+        Ordinary output-channel sharding splits the packed gate/up sections
+        instead of assigning matched channels to each rank. Replicating the
+        weights also requires a complete-output contract, not a TP sum.
+        Final declarations are checked so explicit overrides are respected.
+        """
+        if tp_size <= 1:
+            return
+        placements = {
+            (f"{owner}.{name}" if owner else name): named.get(TP)
+            for owner, spec in plan.modules.items()
+            for name, named in (spec.params or {}).items()
+        }
+        modules = dict(model.named_modules())
+        for owner, module in modules.items():
+            if not isinstance(module, SwiGLUMLP):
+                continue
+            prefix = f"{owner}." if owner else ""
+            weight_name = prefix + "linear_fc1.weight"
+            placement = placements.get(weight_name)
+            if isinstance(placement, Shard) and placement.dim in (0, -module.linear_fc1.weight.ndim):
+                raise ValueError(
+                    f"{weight_name}: native SwiGLUMLP packs [gate, up] along output channels; "
+                    "ordinary TP output-channel sharding does not preserve matched gate/up sections. "
+                    "Chunk-aware packed TP is not supported. Use TP Replicate for the packed projection "
+                    "with compatible input/output contracts, or use separate gate/up projections."
+                )
+            for boundary, spec in plan.modules.items():
+                if boundary != owner and not boundary.startswith(prefix):
+                    continue
+                if spec.local_compute_fn is not None:
+                    continue
+                current = modules.get(boundary)
+                if current is None or not (isinstance(current, (SwiGLUMLP, nn.Linear))):
+                    continue
+                boundary_prefix = f"{boundary}." if boundary else ""
+                params = [placements.get(boundary_prefix + name) for name, _ in current.named_parameters()]
+                replicated = params and all(value is None or isinstance(value, Replicate) for value in params)
+                if replicated and any(isinstance(value.get(TP), Partial) for value in (spec.out_src or {}).values()):
+                    raise ValueError(
+                        f"{boundary}: TP-replicated SwiGLU computation produces a complete output, "
+                        "but out_src declares TP Partial. A sum would duplicate the result; "
+                        "override out_src to TP Replicate together with the parameter layout."
+                    )
 
     @staticmethod
     def _finalize_fused_expert_tp_guard(plan: ShardingPlan, *, tp_size: int) -> None:
