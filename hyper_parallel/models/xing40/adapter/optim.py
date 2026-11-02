@@ -29,18 +29,19 @@ from torch import nn
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.models.xing40.adapter.muon_layout import Xing40MuonLayout
 
 __all__ = ["build_optimizer", "clip_qk"]
 
 
 def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_config: dict[str, Any],
-                    qk_clip_threshold: float = 0.0) -> Muon:
+                    qk_clip_threshold: float = 0.0, muon_layout: str = "native") -> Muon:
     """Build the framework Muon with the MindFormers AdamW decay groups.
 
-    Muon orthogonalizes every matrix parameter whole, as the framework does for any model;
-    this adapter does not reproduce MindFormers' per-block or per-head Newton-Schulz
-    splits. As in MindFormers, AdamW does not decay one-dimensional parameters (norm
-    weights, mHC gates and biases) or biases.
+    The default keeps the framework's native parameter matrices. The opt-in
+    ``mindformers_pynative`` layout declares independent logical MLA and gate/up
+    matrices using existing framework callbacks, with native NS and per-matrix
+    scaling. AdamW does not decay one-dimensional parameters or biases.
 
     Args:
         model: Model whose parameters are optimized.
@@ -48,14 +49,30 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
         adamw_config: Hyperparameters of the AdamW fallback.
         qk_clip_threshold: Maximum attention logit enforced by QK clipping after every
             optimizer step; 0 disables clipping.
+        muon_layout: ``native`` or ``mindformers_pynative`` logical matrix boundaries.
 
     Returns:
         The optimizer builder whose chained optimizer the Trainer steps.
     """
+    if muon_layout not in ("native", "mindformers_pynative"):
+        raise ValueError(f"Unknown Xing40 muon_layout: {muon_layout}")
+    options = dict(muon_config)
+    if muon_layout == "mindformers_pynative":
+        hooks = ("reshape_fn", "ns_transform_fn", "muon_reshape_fn", "muon_ns_transform_fn")
+        if any(options.get(name) is not None for name in hooks):
+            raise ValueError("Xing40 muon_layout owns the reshape and NS transform callbacks")
+        layout = Xing40MuonLayout.from_config(model.config)
+        options.update(reshape_fn=layout.reshape_fn, ns_transform_fn=layout.ns_transform_fn)
     # The AdamW grouping matches name fragments; full names select exactly the 1-D parameters.
     no_decay = ["bias", *(name for name, parameter in model.named_parameters() if parameter.ndim == 1)]
-    builder = Muon(muon_config=dict(muon_config), adamw_config=dict(adamw_config), model=model,
+    builder = Muon(muon_config=options, adamw_config=dict(adamw_config), model=model,
                    no_decay_params=no_decay)
+    if muon_layout == "mindformers_pynative":
+        for optimizer in builder.get_optimizer():
+            if getattr(optimizer, "is_muon", False) and any(
+                    not getattr(parameter, "model_name", None)
+                    for group in optimizer.param_groups for parameter in group["params"]):
+                raise ValueError("Xing40 logical Muon requires model parameter names")
     if qk_clip_threshold > 0:
         # The MLA modules: the NPU Xing40MLAAttention replacement or, unreplaced, Transformers attention.
         attention = [module for module in model.modules()
