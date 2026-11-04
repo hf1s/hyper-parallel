@@ -1,0 +1,341 @@
+# Xing4.0-29B: DeepSeek-V3 architecture with mHC (40 layers, 64 routed experts, 4 residual
+# streams; 29.5B parameters plus a 0.77B MTP depth), 4k pretraining on 8 NPUs with FSDP.
+# Expert parallelism: add --accelerator.ep_size=<n>. One MTP depth, as in the MindFormers 29B
+# reference; --model.config.num_nextn_predict_layers=0 trains without MTP and builds no MTP module.
+# Weights: random initialization, or a HyperParallel checkpoint this recipe saved, through
+# checkpoint.restore_from; that path reads HyperParallel DCP only, not Hugging Face weights.
+# Every module the released Xing4.0 repository implements is built from it, vendored as
+# modeling_xing4_0.py. The model constructs and runs without any replacement; plan_overrides
+# then selects the NPU modules: framework MLA, RMSNorm and grouped experts.
+model:
+  _target_: hyper_parallel.models.xing40.adapter.builder.build_model
+  config:
+    vocab_size: 131072
+    hidden_size: 3584
+    intermediate_size: 9216
+    moe_intermediate_size: 1024
+    num_hidden_layers: 40
+    first_k_dense_replace: 2
+    # YaRN extends from the pretrained 32768 by rotary_scaling_factor=16 to 524288, which is
+    # how the MindFormers 29B configuration expresses it. Sequences are still 4096 tokens;
+    # the schedule is a property of the rotary tables, not of the batch.
+    max_position_embeddings: 524288
+    num_attention_heads: 32
+    num_key_value_heads: 32
+    q_lora_rank: 768
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+    qk_nope_head_dim: 128
+    v_head_dim: 128
+    rms_norm_eps: 1.0e-06
+    hidden_act: silu
+    # The MindFormers 29B training configuration's rotary settings: rope_theta 100000 and a
+    # YaRN NTK-by-parts schedule extending the pretrained 32768 by rotary_scaling_factor=16.
+    # Transformers standardizes rope_theta and rope_scaling into config.rope_parameters, which
+    # Xing4_0RotaryEmbedding's rope_type-keyed dispatch and Xing4_0Attention's own scaling
+    # computation both read; no override is needed on either.
+    #
+    # These are the training values, and they differ from the released Xing4.0-29B-A4B
+    # config.json, which pretrains at 4096 and extends by factor=64 to 262144. The factor also
+    # feeds Xing4_0Attention.scaling through the YaRN mscale, so it sets the attention scale as
+    # well as the rotary tables.
+    rope_theta: 100000.0
+    rope_scaling:
+      type: yarn
+      factor: 16.0
+      beta_fast: 32
+      beta_slow: 1
+      mscale: 1
+      mscale_all_dim: 1
+      original_max_position_embeddings: 32768
+    n_routed_experts: 64
+    num_experts_per_tok: 4
+    n_shared_experts: 1
+    routed_scaling_factor: 2.0
+    norm_topk_prob: true
+    # MindFormers disables grouped routing with n_group=0/topk_group=0, and its router treats
+    # 0 and 1 the same way (`num_groups > 1` gates the grouped branch). The vendored released
+    # router stores these two fields and never reads them in its forward, so routing is a flat
+    # top-k over all experts either way; 1/1 is used because 0 would divide by zero on any
+    # implementation that does consult them.
+    n_group: 1
+    topk_group: 1
+    # MindFormers moe_router_load_balancing_type: seq_aux_loss, the sequence-wise objective
+    # Xing40MoE injects through the routing weights.
+    moe_aux_loss_coeff: 0.0005
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 0.0001
+    use_pad_tokens: true
+    # mHC block, under the released names Xing4_0HyperConnection reads, each MindFormers name in
+    # its comment. Only these spellings take effect: Xing4_0Config keeps any other key as a plain
+    # attribute, so a MindFormers name here would be ignored without an error. MindFormers also
+    # sets enable_hc_head: false, which is why the streams collapse by mean instead of through a
+    # learned head, and mhc_compute_dtype: bfloat16, which is the activation dtype here.
+    hc_mult: 4  # MindFormers num_residual_streams
+    hc_sinkhorn_iters: 20  # MindFormers mhc_sinkhorn_iterations
+    mhc_init_gating_factor: 0.01
+    mhc_h_res_clamp_min: -30  # MindFormers hc_sinkhorn_clamp: [-30, 30]
+    mhc_h_res_clamp_max: 30
+    hc_eps: 1.0e-06
+    num_nextn_predict_layers: 1
+    # MindFormers mtp_loss_scaling_factor.
+    mtp_loss_factor: 0.1
+    # MindFormers expresses this as chunk_loss_num: 8 over a 4096-token microbatch.
+    chunk_loss_size: 512
+    use_cache: false
+    tie_word_embeddings: false
+    # Deliberately not carried over from the reference training configuration, so that a reader
+    # comparing the two does not take these for omissions:
+    #   * experimental_attention_variant: dsa and the dsa_indexer_* block. This family runs MLA
+    #     with the framework's fused attention, owns no sparse-attention indexer and therefore
+    #     has no indexer loss to balance.
+    #   * fp32_residual_connection. Only MindFormers' graph-mode transformer layer reads it,
+    #     and this model is PyNative-only, so it is inert there too; an mHC model has no plain
+    #     residual add for it to widen.
+model_init_dtype: float32
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+training:
+  train_iters: 600
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+accelerator:
+  tp_size: 1
+  ep_size: 1
+  cp_size: 1
+  pp_size: 1
+fsdp_config:
+  dp_shard_size: 8
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+    # FSDP2MixedPrecisionConfig carries no per-parameter entry, so parameters that must keep
+    # a wider dtype are the model's responsibility rather than this block's. The router upcasts
+    # its input and weight to FP32 itself (router_dense_type: float32), and the mHC projection
+    # computes in the activation dtype by design (mhc_compute_dtype: bfloat16), so BF16 storage
+    # changes neither computation; the expert-load bias is the one piece of state that cannot
+    # survive BF16, and Xing40MoE keeps it in FP32 itself.
+activation_checkpoint:
+  mode: full
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  data_path: /path/to/mmap_deepseekv3_datasets_text_document
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+      tokenizer_type: pretokenized
+      vocab_size: 131072
+      # This is the document separator of the packed corpus, and therefore the token that
+      # defines where attention stops: IndexedBoundaryResolver splits the pack on tokenizer.eod
+      # to build cu_seq_lens. It must match the ID the corpus under data_path was written with,
+      # or the packs collapse into one document again and nothing reports it.
+      # 2 is that ID in every authority: the reference configuration this recipe follows sets
+      # eod_token: 2 (with pad_token: 3), both MindFormers telechat4 configurations of the
+      # formal v1.0 release do the same, and the released Xing4.0 configuration_xing4_0.py
+      # defaults eos_token_id=2.
+      # Note that it is NOT the DeepSeek-V3 end-of-sentence ID, which is 1. The corpus is
+      # pretokenized, so the tokenizer above supplies metadata rather than doing the
+      # tokenizing, and its 129280-token vocabulary does not match the 131072 declared here:
+      # the ID has to come from the corpus, not from that pointer.
+      eod_token_id: 2
+  data_config:
+    seq_length: 4096
+    split: 1, 0, 0
+    mock_data: false
+    distributed_walk: true
+    data_lazy_load: true
+    mmap_bin_files: true
+    skip_data_check: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    create_ltor_fields_in_dataloader: false
+    # No dense mask anywhere, as long as reset_position_ids below stays false. The documents
+    # packed into one sequence are separated by the cumulative document ends the fused attention
+    # consumes (actual_seq_len below), not by a [1, 4096, 4096] boolean mask:
+    # Xing40ForCausalLM.forward takes no attention_mask, and TextParallelBatch never forwards
+    # the dataset's own one to the model either.
+    create_attention_mask_in_dataloader: false
+    # Deliberately false where the reference configuration has reset_attention_mask: True.
+    # Both switches of that name -- this one, read by the Indexed Dataset's
+    # _get_ltor_masks_and_position_ids, and TextParallelBatch's, read by AttentionRuntime --
+    # only carve the EOD boundaries into a dense mask, which this model never receives, so
+    # the switch cannot carry the boundary here and actual_seq_len does that job instead.
+    # It stays false rather than mirroring the reference because a future change that made it
+    # live would produce exactly the mask the forward refuses.
+    reset_attention_mask: false
+    # MindFormers reset_position_ids: False. Positions run 0..4095 across the whole pack even
+    # though attention does not; the boundary lives in actual_seq_len alone. It must also stay
+    # false: the released Xing4_0Model.forward reads positions that restart inside a row as
+    # packed documents and builds a dense [batch, 1, seq, seq] mask for the backbone layers,
+    # while the MTP depths get none.
+    reset_position_ids: false
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    # 'compressed' keeps the cumulative document ends and builds no square dense mask.
+    # TextParallelBatch resolves them with IndexedBoundaryResolver (every eod_token_id in the
+    # pack) and keeps them as the batch's global cu_seq_lens; its own model inputs are only
+    # input_ids/labels/position_ids/shift_labels, so the adapter below is what carries them to
+    # the forward, as actual_seq_len. Without it the fused attention raises rather than
+    # attending across the documents of the pack.
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.xing40.adapter.data.runtime.Xing40PackedRuntime
+  # Sequential over the GPTDataset's own shuffled index (MindFormers shuffle: false).
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+optimizer:
+  _target_: hyper_parallel.models.xing40.adapter.optim.build_optimizer
+  fp32_main_params: true
+  muon_config:
+    muon_lr: 4.0e-05
+    muon_weight_decay: 0.1
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: legacy
+    matched_adamw_rms: 0.2
+  adamw_config:
+    adamw_lr: 4.0e-05
+    adamw_weight_decay: 0.1
+    # MindFormers adamw_betas: [0.9, 0.95].
+    adamw_betas:
+    - 0.9
+    - 0.95
+    adamw_eps: 1.0e-08
+  qk_clip_threshold: 100.0
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  # MindFormers CosineWithWarmUpLR, learning_rate 4.0e-5 decaying to lr_end 2.0e-5.
+  lr_decay_style: cosine
+  lr_config:
+    lr: 4.0e-05
+    min_lr: 2.0e-05
+    # The reference warms up over 1500 of its 7500 steps. Expressed as that ratio rather than
+    # as 1500 steps, because train_iters here is smaller and an absolute 1500 would leave the
+    # whole run inside the warmup.
+    lr_warmup_ratio: 0.2
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/xing40/checkpoints
+  save_steps: 100
+  restore_from: null
+plan_overrides:
+# NPU MLA: the framework MLAAttention (one fused linear_qkv down projection) with the
+# MindFormers FP32 RoPE and the logit maxima QK clipping consumes. It swaps its latent
+# norms for the NPU RMSNorm itself, so the norm entry below leaves them out. The guarded
+# source is the vendored released class: a repository-owned import path that no Transformers
+# release can move, and one this model does not subclass, so an exact-type guard is stable
+# here.
+- match: '*.self_attn'
+  replace:
+    kind: module
+    source_type: hyper_parallel.models.xing40.modeling_xing4_0.Xing4_0Attention
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.models.xing40.adapter.conversion.module_replacement.Xing40MLAAttention
+# Fused NPU RMSNorm, as in the MindFormers reference: the input and post-attention layernorms
+# and each MTP depth's final_layernorm ('*[!a]_layernorm' skips the attention's
+# q_a_/kv_a_layernorm, handled directly by Xing40MLAAttention instead), model.norm and each MTP
+# depth's enorm and hnorm. '[.eh]norm' is not widened to '_norm': that would also match the
+# input_norm inside every Xing4_0HyperConnection, whose FP32 arithmetic is part of the released
+# mHC and is deliberately left alone.
+# The released Xing4_0RMSNorm already multiplies its weight in FP32, so no precision patch is
+# needed and nothing subclasses it.
+- match:
+  - '*[!a]_layernorm'
+  - '*[.eh]norm'
+  replace:
+    kind: module
+    source_type: hyper_parallel.models.xing40.modeling_xing4_0.Xing4_0RMSNorm
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.components.modules.rms_norm.RMSNorm
+# Grouped-GEMM NPU experts: permute, grouped matmul and unpermute with the routing weights in
+# the activation dtype, as MindFormers. The expected-type guard is kept here because the
+# source is this repository's own Xing40ModuleListExperts: its per-expert gate/up/down
+# projections are what make_transforms() packs, and replacing a different structure would
+# silently mispack the weights.
+#
+# Known constraint, which is why tp_size is 1 below: GroupedExperts always sets
+# is_transposed, so the replaced tensors are [experts, in, out] -- gate_up_proj
+# [E, hidden, 2*inter] and down_proj [E, inter, hidden] -- while the planner's
+# _moe_expert_tp_placement assumes [experts, out, in] and nothing under distributed/_builder/
+# reads is_transposed. The two derived axes are therefore swapped, and both are 3584 here, so
+# every shape stays legal. Raising tp_size needs this, and the halves differ:
+#
+#   down_proj   silently wrong. The template derives Shard(2), the output axis; rowwise has to
+#               shard the contraction axis, Shard(1). down_proj is not a fused weight, so no
+#               guard sees it.
+#   gate_up_proj fails loudly. The template derives Shard(1), again the wrong axis, and colwise
+#               would have to shard Shard(2) -- which is the axis gate and up are concatenated
+#               along, so a contiguous shard would hand one rank all of gate and another all of
+#               up. _finalize_fused_expert_tp_guard refuses any TP Shard on a fused expert
+#               weight for exactly that reason and names the offender. Real TP on it needs
+#               chunk-aware sharding of the fused axis, in the framework.
+#
+# The planner owns both at the MoE boundary, model.layers.N.mlp, and a params override there
+# replaces the derived set instead of merging with it. On '*.mlp.experts' down_proj is then
+# declared by two boundaries, and on '*.mlp' the dense MLPs lose their sharding and fail the
+# coverage check. One entry per MoE glob -- model.layers.[2-9].mlp, model.layers.[1-9][0-9].mlp
+# and mtp.layers.*.transformer_layer.mlp -- restating every derived key plans at tp_size=2 with
+# the guard on, giving all 39 MoE boundaries down_proj Shard(1) and a replicated gate_up_proj:
+#     params: {experts.down_proj: {tp: shard(1)}, experts.gate_up_proj: {tp: replicate},
+#              gate.weight: {tp: replicate}}
+# It is not set below: tp_size is 1, and the form has been planned offline, never run.
+- match: '*.mlp.experts'
+  replace:
+    kind: module
+    source_type: hyper_parallel.models.xing40.adapter.model.Xing40ModuleListExperts
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.models.xing40.adapter.conversion.grouped_experts.Xing40GroupedExperts
+# The mHC mixings are replicated, token-wise parameters. The layers run the released
+# Xing4_0HyperConnection as it is: its residual mixing is torch.matmul(comb, streams), where
+# the framework's shared fused mHC post path contracts the transpose instead, so adopting
+# that kernel here would change the released arithmetic. Keeping the released form costs one
+# fused operator on NPU and is revisited with the mHC operator work, not here.
+- match: '*_hc'
+  params:
+    hc_fn:
+      tp: replicate
+    hc_base:
+      tp: replicate
+    hc_scale:
+      tp: replicate
+# The MTP fusion projection is a replicated, token-wise module.
+- match: mtp.layers.*.eh_proj
+  params:
+    weight:
+      tp: replicate
+# Routed MoE layers: decoder layers from first_k_dense_replace=2 on, and the MTP depths.
+- match: model.layers.[2-9].mlp.forward
+  when: ep
+  region_dispatch: false
+  replace:
+    kind: method
+    implementation: &moe_ep_compute
+      _target_: hyper_parallel.models.xing40.adapter.distributed.expert_parallel.xing40_ep_compute_fn
+- match: model.layers.[1-9][0-9].mlp.forward
+  when: ep
+  region_dispatch: false
+  replace:
+    kind: method
+    implementation: *moe_ep_compute
+- match: mtp.layers.*.transformer_layer.mlp.forward
+  when: ep
+  region_dispatch: false
+  replace:
+    kind: method
+    implementation: *moe_ep_compute
