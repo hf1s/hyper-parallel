@@ -134,6 +134,13 @@ class GroupedExperts(nn.Module):
             and getattr(source_apply_gate_func, "__name__", "") != "_default_apply_gate"
         ):
             raise ValueError("GroupedExperts custom _apply_gate requires a dedicated replacement")
+        clamp_limit = getattr(module, "limit", None)
+        compute_dtype = getattr(module, "activation_compute_dtype", None)
+        if clamp_limit is not None or compute_dtype is not None:
+            if not gated_linear_unit or hidden_act != "silu":
+                raise ValueError("Configured SwiGLU clamping and precision require a SiLU gated expert")
+            return partial(swiglu, dim=-1, clamp_limit=clamp_limit, compute_dtype=compute_dtype,
+                           use_fused=bool(getattr(config, "use_fused_swiglu", True)))
         if not gated_linear_unit:
             return activation_func
         if hidden_act == "silu" and bool(getattr(config, "use_fused_swiglu", True)):

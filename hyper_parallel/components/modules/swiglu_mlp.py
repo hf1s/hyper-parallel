@@ -22,7 +22,6 @@ from typing import Any
 # This package provides PyTorch-specific high-performance modules.
 # pylint: disable=forbidden-backend-import
 import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F
 from torch import nn
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
@@ -140,6 +139,8 @@ class SwiGLUMLP(nn.Module):
         if hidden_act is not None and hidden_act not in ("silu", "swiglu"):
             raise ValueError(f"SwiGLUMLP requires a SiLU activation, but got {hidden_act}")
         self.config = config
+        self.activation_clamp_value = getattr(module, "limit", None)
+        self.activation_compute_dtype = getattr(module, "activation_compute_dtype", None)
         self.hidden_size = gate_proj.in_features
         self.intermediate_size = gate_proj.out_features
 
@@ -176,11 +177,9 @@ class SwiGLUMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the fused Gate/Up projection, SwiGLU, and Down projection."""
         intermediate_parallel = self.linear_fc1(x)
-        if intermediate_parallel.device.type == "npu":
-            intermediate_parallel = swiglu(  # pylint: disable=not-callable
-                intermediate_parallel
-            )
-        else:
-            gate, up = intermediate_parallel.chunk(2, dim=-1)
-            intermediate_parallel = F.silu(gate) * up
+        intermediate_parallel = swiglu(  # pylint: disable=not-callable
+            intermediate_parallel,
+            clamp_limit=self.activation_clamp_value,
+            compute_dtype=self.activation_compute_dtype,
+        )
         return self.linear_fc2(intermediate_parallel)
