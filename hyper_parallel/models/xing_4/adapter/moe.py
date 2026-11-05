@@ -42,7 +42,9 @@ class Xing4Router(Xing4_0TopkRouter):
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.aux_loss_coeff = config.moe_aux_loss_coeff
         self.aux_loss_cp_group = None
-        self.register_buffer("_token_counts", torch.zeros(self.num_experts, dtype=torch.int64))
+        # Reset every optimizer step, so the checkpoint never needs to carry them.
+        self.register_buffer("_token_counts", torch.zeros(self.num_experts, dtype=torch.int64),
+                             persistent=False)
         self.input_jitter_eps = config.moe_input_jitter_eps
         self.last_aux_loss = None
         self.enable_expert_bias = config.moe_router_enable_expert_bias
@@ -60,7 +62,10 @@ class Xing4Router(Xing4_0TopkRouter):
             flat = flat * (1.0 + (2.0 * torch.rand_like(flat) - 1.0) * self.input_jitter_eps)
         logits, weights, indices = super().forward(flat)
         scores = logits.sigmoid()
-        weights = self._attach_balance_loss(weights, scores, batch_size=hidden_states.shape[0])
+        if self.training and self.aux_loss_coeff:
+            weights = self._attach_balance_loss(weights, scores, batch_size=hidden_states.shape[0])
+        else:
+            self.last_aux_loss = None
         if self.training and self.enable_expert_bias and not is_recomputing():
             counts = torch.zeros_like(self._token_counts).scatter_add_(
                 0, indices.reshape(-1), torch.ones_like(indices.reshape(-1), dtype=torch.int64))

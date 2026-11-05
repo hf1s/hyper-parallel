@@ -320,9 +320,21 @@ class Xing4FusedHyperConnection(Xing4_0HyperConnection):
 
     def __init__(self, *, module: Xing4_0HyperConnection, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None) -> None:
-        """Keep official parameter names, values and ownership."""
+        """Keep official parameter names, values and ownership.
+
+        Raises:
+            ValueError: If the configuration clamps the residual-mixing logits. ``mhc_pre`` takes
+                no bound, so selecting it on a clamped configuration would drop the clamp without
+                reporting it; nulling both bounds selects the unclamped operator explicitly.
+        """
         nn.Module.__init__(self)
-        del module_fqn, context
+        del context
+        if module.mhc_h_res_clamp_min is not None or module.mhc_h_res_clamp_max is not None:
+            raise ValueError(
+                f"the fused mHC operator has no clamp, but {module_fqn or 'this hyper-connection'} "
+                f"is configured with [{module.mhc_h_res_clamp_min}, {module.mhc_h_res_clamp_max}]; "
+                "set mhc_h_res_clamp_min and mhc_h_res_clamp_max to null to select it"
+            )
         self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps = module.hc_mult, module.hc_sinkhorn_iters, module.hc_eps
         self.input_norm = module.input_norm
         self.hc_fn, self.hc_base, self.hc_scale = module.hc_fn, module.hc_base, module.hc_scale

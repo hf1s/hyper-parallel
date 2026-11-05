@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Teacher-forced LM/MTP training over the official Xing4 backbone."""
+import math
 from functools import partial
 from typing import Any
 
@@ -21,7 +22,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperConnection
 from transformers.utils import ModelOutput
 
 from hyper_parallel.components.functional.mhc_post import mhc_post
@@ -36,39 +36,23 @@ from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
     Xing4_0Model, Xing4_0MoE, Xing4_0PreTrainedModel, Xing4_0RMSNorm,
 )
 
+#: mHC coefficient initialization of the reference implementation's ``reset_parameter``: a
+#: projection narrower than ``initializer_range``, and offsets whose mixing section starts the
+#: Sinkhorn input near the identity, so each stream initially carries its own residual.
+_MHC_PROJECTION_INIT_STD = 1e-4
 
-class Xing4HyperConnection(Xing4_0HyperConnection):
-    """Retain official parameters with the FP32 training mHC contract."""
 
-    def __init__(self, config: Any, source: Xing4_0HyperConnection) -> None:
-        """Adopt the official projection and coefficients without renaming parameters."""
-        nn.Module.__init__(self)
-        self.hc_mult = config.hc_mult
-        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
-        self.hc_eps = config.hc_eps
-        self.input_norm = source.input_norm
-        self.input_norm.eps = config.mhc_layernorm_epsilon
-        self.hc_fn, self.hc_base, self.hc_scale = source.hc_fn, source.hc_base, source.hc_scale
+def _mhc_bias(streams: int, like: torch.Tensor) -> torch.Tensor:
+    """Return the pre gates, post gates and flattened mixing matrix ``hc_base`` holds.
 
-    @property
-    def fn(self) -> nn.Parameter:
-        """Expose the shared portable mHC projection without a second weight owner."""
-        return self.hc_fn
-
-    @property
-    def base(self) -> nn.Parameter:
-        """Expose the coefficient offsets to the shared portable implementation."""
-        return self.hc_base
-
-    @property
-    def scale(self) -> nn.Parameter:
-        """Expose the three coefficient scales to the shared implementation."""
-        return self.hc_scale
-
-    def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Reuse FP32 projection and stabilized Sinkhorn from Transformers."""
-        return (*DeepseekV4HyperConnection.forward(self, hidden_streams), hidden_streams)
-
+    Args:
+        streams: Number of residual streams, ``config.hc_mult``.
+        like: Tensor supplying the device and dtype of the result.
+    """
+    options = {"device": like.device, "dtype": like.dtype}
+    return torch.cat((torch.full((streams,), -math.log(3.0), **options),
+                      torch.zeros(streams, **options),
+                      ((torch.eye(streams, **options) - 1.0) * 5.0).flatten()))
 
 
 class Xing4DecoderLayer(Xing4_0DecoderLayer):
@@ -84,8 +68,11 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
                     else adapt_mlp(source.mlp))
         self.input_layernorm = source.input_layernorm
         self.post_attention_layernorm = source.post_attention_layernorm
-        self.attn_hc = Xing4HyperConnection(config, source.attn_hc)
-        self.ffn_hc = Xing4HyperConnection(config, source.ffn_hc)
+        # The bundled hyper-connections run unchanged; the recipe may replace them with the fused
+        # operators. Only the norm epsilon is the training recipe's, not the inference default.
+        self.attn_hc, self.ffn_hc = source.attn_hc, source.ffn_hc
+        self.attn_hc.input_norm.eps = config.mhc_layernorm_epsilon
+        self.ffn_hc.input_norm.eps = config.mhc_layernorm_epsilon
         # The training recipe applies its norm epsilon to both MLA latent projections.
         self.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
         self.self_attn.kv_a_layernorm.variance_epsilon = config.rms_norm_eps
@@ -95,13 +82,28 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs: Any) -> torch.Tensor:
         """Call the official blocks through replaceable pre/post mHC operations."""
-        post, mix, collapsed, residual = self.attn_hc(hidden_states)
+        post, mix, collapsed, residual = self._pre(self.attn_hc, hidden_states)
         output = self.self_attn(hidden_states=self.input_layernorm(collapsed),
                                 position_embeddings=position_embeddings, attention_mask=attention_mask, **kwargs)[0]
         hidden_states = self._post(output, residual, post, mix)
-        post, mix, collapsed, residual = self.ffn_hc(hidden_states)
+        post, mix, collapsed, residual = self._pre(self.ffn_hc, hidden_states)
         output = self.mlp(self.post_attention_layernorm(collapsed))
         return self._post(output, residual, post, mix)
+
+    @staticmethod
+    def _pre(hyper_connection: nn.Module, streams: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Return the mHC coefficients plus the streams the matching post operation consumes.
+
+        The bundled module returns three values and the post operation can take the layer input.
+        The fused replacement returns a fourth instead: its own output, whose backward consumes
+        the post gradient through ``grad_x_post``, so the input cannot stand in for it.
+
+        Args:
+            hyper_connection: The layer's ``attn_hc`` or ``ffn_hc``.
+            streams: Residual streams entering the sublayer.
+        """
+        post, mix, collapsed, *fused = hyper_connection(streams)
+        return post, mix, collapsed, fused[0] if fused else streams
 
     @staticmethod
     def _post(output: torch.Tensor, residual: torch.Tensor,
@@ -112,22 +114,34 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
         return result.unflatten(-1, (streams, output.shape[-1]))
 
 
-@torch.no_grad()
-def initialize(owner: Any, module: nn.Module) -> None:
-    """Initialize training state and repair the bundled HC initializer's field lookup."""
-    if isinstance(module, Xing4_0HyperConnection):
-        nn.init.normal_(module.hc_fn, mean=0.0, std=1e-4)
-        module.hc_scale.fill_(owner.config.mhc_init_gating_factor)
-        module.hc_base.zero_()
-    elif isinstance(module, Xing4Router):
-        nn.init.normal_(module.weight, mean=0.0, std=owner.config.initializer_range)
-        module._token_counts.zero_()
-        module.e_score_correction_bias.zero_()
-    else:
-        Xing4_0PreTrainedModel._init_weights(owner, module)
+class _Xing4Initialization:
+    """Initialize training state and repair the bundled HC initializer's field lookup.
+
+    Mixed in by both the backbone and the causal LM: Transformers dispatches a nested
+    ``PreTrainedModel`` to its own ``_init_weights``.
+    """
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        """Initialize one module, delegating everything this model does not own.
+
+        Args:
+            module: Module to initialize.
+        """
+        if isinstance(module, Xing4_0HyperConnection):
+            nn.init.normal_(module.hc_fn, mean=0.0, std=_MHC_PROJECTION_INIT_STD)
+            module.hc_scale.fill_(self.config.mhc_init_gating_factor)
+            module.hc_base.copy_(_mhc_bias(module.hc_mult, module.hc_base))
+            return
+        if isinstance(module, Xing4Router):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            module.tokens_per_expert.zero_()
+            module.e_score_correction_bias.zero_()
+            return
+        super()._init_weights(module)
 
 
-class Xing4Model(Xing4_0Model):
+class Xing4Model(_Xing4Initialization, Xing4_0Model):
     """Use the unchanged HF backbone forward with training-aware decoder blocks."""
 
     config_class = Xing4_0Config
@@ -145,9 +159,6 @@ class Xing4Model(Xing4_0Model):
         for name in ("inv_freq", "original_inv_freq"):
             register_rebuildable_buffer(rotary, name, value=frequencies)
         self.post_init()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        initialize(self, module)
 
     @staticmethod
     def shift_tokens(tokens: torch.Tensor, pad_value: int) -> torch.Tensor:
@@ -175,7 +186,7 @@ class Xing4MTPBlock(Xing4DecoderLayer):
         return super().forward(streams, **kwargs).mean(dim=2)
 
 
-class Xing4ForCausalLM(Xing4_0ForCausalLM):
+class Xing4ForCausalLM(_Xing4Initialization, Xing4_0ForCausalLM):
     """Add teacher-forced LM/MTP losses to the official causal language model."""
 
     config_class = Xing4_0Config
@@ -211,9 +222,6 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
         if self.mtp is not None:
             self.mtp.gradient_checkpointing = False
         self.post_init()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        initialize(self, module)
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "Xing4ForCausalLM":
