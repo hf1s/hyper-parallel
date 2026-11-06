@@ -813,7 +813,8 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None
             else nullcontext()
         )
-        with micro_step_context, aux_loss_scale_context():
+        with micro_step_context, aux_loss_scale_context(
+                loss_parallel=self.mesh.loss_parallel, tp_size=self.mesh.tp_size):
             micro_batch = self.preforward(micro_batch)
             # TextTrainer passes loss-only fields separately. Keep the legacy
             # BaseTrainer/VLM one-dictionary call contract working as well.

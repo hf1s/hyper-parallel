@@ -32,6 +32,7 @@ class _AuxLossScaleState:
 
     scale: torch.Tensor | float = 1.0
     active: bool = False
+    tp_replicas: int = 1
     handles: list[Any] = field(default_factory=list)
 
 
@@ -39,14 +40,19 @@ _AUX_LOSS_STATE: ContextVar[_AuxLossScaleState | None] = ContextVar("aux_loss_st
 
 
 @contextmanager
-def aux_loss_scale_context() -> Iterator[None]:
+def aux_loss_scale_context(*, loss_parallel: bool = False, tp_size: int = 1) -> Iterator[None]:
     """Isolate auxiliary gradient scaling for one forward/backward microstep.
 
     Call :func:`bind_aux_loss_scale` on the local scalar task loss before
     weighting it. Keep this context active through backward so checkpoint
     recomputation observes the same scale. Nested contexts are independent.
+
+    Args:
+        loss_parallel: Whether the task loss has partitioned vocabulary gradients.
+        tp_size: Positive tensor-parallel degree. Only explicitly replicated
+            auxiliary means use this degree for gradient normalization.
     """
-    state = _AuxLossScaleState()
+    state = _AuxLossScaleState(tp_replicas=tp_size if loss_parallel else 1)
     token = _AUX_LOSS_STATE.set(state)
     try:
         yield
@@ -91,20 +97,23 @@ class _AuxLossAutoScaler(torch.autograd.Function):
     main_loss_backward_scale = torch.tensor(1.0)
 
     @staticmethod
-    def forward(ctx: Any, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+    def forward(ctx: Any, output: torch.Tensor, aux_loss: torch.Tensor,
+                tp_replicated: bool = False) -> torch.Tensor:
         """Save the auxiliary loss and return the output unchanged.
 
         Args:
             ctx: Autograd context for the auxiliary loss and scale state.
             output: Forward tensor carrying the injected gradient.
             aux_loss: Scalar objective whose gradient is injected in backward.
+            tp_replicated: Whether the auxiliary mean is replicated across TP ranks.
         """
         ctx.save_for_backward(aux_loss)
         ctx.scale_state = _AUX_LOSS_STATE.get()
+        ctx.tp_replicated = tp_replicated
         return output
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         """Pass through the output gradient and inject the auxiliary-loss gradient.
 
         Args:
@@ -118,8 +127,12 @@ class _AuxLossAutoScaler(torch.autograd.Function):
         )
         if isinstance(scale, torch.Tensor):
             scale = scale.to(device=aux_loss.device, dtype=aux_loss.dtype)
+        tp_replicas = ctx.scale_state.tp_replicas if ctx.tp_replicated and ctx.scale_state is not None else 1
+        if tp_replicas > 1:
+            scale = scale / tp_replicas
         aux_loss_grad = torch.ones_like(aux_loss) * scale
-        return grad_output, aux_loss_grad
+        gradients = (grad_output, aux_loss_grad)
+        return gradients + (None,) if len(ctx.needs_input_grad) == 3 else gradients
 
     @staticmethod
     def set_loss_scale(scale: torch.Tensor) -> None:
@@ -127,12 +140,17 @@ class _AuxLossAutoScaler(torch.autograd.Function):
         _AuxLossAutoScaler.main_loss_backward_scale = scale
 
 
-def aux_loss_auto_scale(output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+def aux_loss_auto_scale(output: torch.Tensor, aux_loss: torch.Tensor, *,
+                        tp_replicated: bool = False) -> torch.Tensor:
     """Attach an auxiliary-loss gradient to an unchanged forward tensor.
 
     Args:
         output: Main forward output.
         aux_loss: Scalar auxiliary loss whose gradient should be injected.
+        tp_replicated: The auxiliary mean represents the same objective on each
+            TP rank. Average its injected gradients when loss parallelism keeps
+            task-loss gradients partitioned; leave partial auxiliary objectives
+            at the default.
 
     Returns:
         ``output`` unchanged in value, with an autograd edge to ``aux_loss``.
@@ -140,7 +158,7 @@ def aux_loss_auto_scale(output: torch.Tensor, aux_loss: torch.Tensor) -> torch.T
     state = _AUX_LOSS_STATE.get()
     if state is not None:
         state.active = True
-    return _AuxLossAutoScaler.apply(output, aux_loss)
+    return _AuxLossAutoScaler.apply(output, aux_loss, tp_replicated)
 
 
 def set_aux_loss_scale(scale: torch.Tensor) -> None:
