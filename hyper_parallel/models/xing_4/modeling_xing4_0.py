@@ -41,7 +41,6 @@ from functools import partial
 from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 import torch_npu
 from torch import nn
@@ -56,6 +55,7 @@ from hyper_parallel.components.functional.mhc_pre import mhc_pre
 from hyper_parallel.components.functional.npu_fusion_attention import (
     _prepare_fusion_attention_context, PACKED_SEQUENCE_ARGUMENTS,
 )
+from hyper_parallel.components.functional.router_balance_loss import sequence_load_balancing_loss
 from hyper_parallel.components.functional.rotary_embedding import (
     apply_rotary_pos_emb_interleave as fused_rotary,
 )
@@ -65,12 +65,12 @@ from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.components.modules.mtp import MTPLayer, build_mtp
 from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
+from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.multicore.modules._precision import preserve_fp32_parameters
-from hyper_parallel.core.utils.communication import differentiable_all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.distributed.expert_parallel.experts import SHARED_MERGE_MODES
 from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
-from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.distributed.recipe_spec import inner_wrapper, local_compute
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 from hyper_parallel.models.xing_4.transformer.configuration_xing4_0 import Xing4_0Config
@@ -85,6 +85,7 @@ __all__ = [
     "build_model",
     "create_config",
     "xing4_ep_compute_fn",
+    "xing4_router_statistics",
 ]
 
 # MindFormers recipe options this model does not implement. Nothing here reads
@@ -187,7 +188,7 @@ class Xing4Router(Xing4_0TopkRouter):
         self.e_score_correction_bias = source.e_score_correction_bias
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.aux_loss_coeff = config.moe_aux_loss_coeff
-        self.aux_loss_cp_group = None
+        self.aux_loss_groups = ()
         self.register_buffer("_token_counts", torch.zeros(self.num_experts, dtype=torch.int64))
         self.input_jitter_eps = config.moe_input_jitter_eps
         self.last_aux_loss = None
@@ -276,25 +277,21 @@ class Xing4Router(Xing4_0TopkRouter):
         # Hash routing, the load bias and group limiting all leave the auxiliary
         # statistics on the raw affinities; only forced balance replaces them.
         selected = (indices if self.force_expert_balance
-                    else scores.topk(self.top_k, dim=-1, sorted=False).indices).reshape(batch_size, -1)
-        counts = scores.new_zeros(batch_size, self.num_experts).scatter_add_(
-            1, selected, torch.ones_like(selected, dtype=scores.dtype))
-        if self.aux_loss_cp_group is None:
+                    else scores.topk(self.top_k, dim=-1, sorted=False).indices)
+        if self.aux_loss_groups:
+            sequence_ids = torch.arange(batch_size, device=scores.device).repeat_interleave(
+                scores.shape[0] // batch_size)
+            loss = sequence_load_balancing_loss(
+                scores, selected, sequence_ids, batch_size,
+                sequence_partition_groups=self.aux_loss_groups, score_epsilon=1e-20)
+        else:
+            selected = selected.reshape(batch_size, -1)
+            counts = scores.new_zeros(batch_size, self.num_experts).scatter_add_(
+                1, selected, torch.ones_like(selected, dtype=scores.dtype))
             load = counts / selected.shape[1]
             affinity = (scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)).reshape(
                 batch_size, -1, self.num_experts).mean(dim=1)
-        else:
-            normalized = (scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)).reshape(
-                batch_size, -1, self.num_experts)
-            group = self.aux_loss_cp_group
-            with torch.no_grad():
-                counts = counts.detach()
-                dist.all_reduce(counts, group=group)
-                tokens = counts.new_tensor(normalized.shape[1])
-                dist.all_reduce(tokens, group=group)
-            load = counts / (tokens * self.top_k)
-            affinity = differentiable_all_reduce(normalized.sum(dim=1), "sum", group) / tokens
-        loss = (affinity * load).sum(dim=-1).mean() * self.num_experts
+            loss = (affinity * load).sum(dim=-1).mean() * self.num_experts
         self.last_aux_loss = loss.detach()
         return aux_loss_auto_scale(weights, loss * self.aux_loss_coeff)
 
@@ -616,9 +613,31 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
         return self.model.mean_loss(loss_sum, count)
 
 
+def _bind_router_statistics(module: Xing4MoE, input_placements: Mapping[str, Any],
+                            tp_mesh: Any, cp_mesh: Any) -> None:
+    """Pool only axes that still partition this sequence at the router boundary."""
+    hidden_layout, = input_placements.values()
+    module.gate.aux_loss_groups = tuple(
+        axis.get_group() for name, axis in (("cp", cp_mesh), ("tp", tp_mesh))
+        if axis is not None and axis.size() > 1
+        and isinstance(hidden_layout.get(name), Shard) and hidden_layout[name].dim % 3 == 1
+    )
+    if any(group is None for group in module.gate.aux_loss_groups):
+        raise ValueError("Router statistics require explicit sequence-partition process groups")
+
+
+@inner_wrapper
+def xing4_router_statistics(target_module: Xing4MoE, mesh: Any, tp_mesh: Any,
+                            cp_mesh: Any, ep_mesh: Any, input_placements: Mapping[str, Any]) -> list:
+    """Bind sequence statistics independently of attention or expert dispatch."""
+    del mesh, ep_mesh
+    _bind_router_statistics(target_module, input_placements, tp_mesh, cp_mesh)
+    return []
+
+
 @local_compute
 def xing4_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
-                        ep_mesh: Any, fix_router: bool = False) -> Callable:
+                        ep_mesh: Any, input_placements: Mapping[str, Any], fix_router: bool = False) -> Callable:
     """Dispatch routed experts while retaining local shared experts and router state.
 
     ``fix_router`` balances dispatch indices for benchmarks; safe-token padding
@@ -630,12 +649,14 @@ def xing4_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
         tp_mesh: Tensor parallel mesh, or None.
         cp_mesh: Context parallel mesh, or None.
         ep_mesh: Expert parallel mesh owning the routed experts.
+        input_placements: Resolved input destinations of this boundary.
         fix_router: Benchmark-only balanced destinations.
 
     Returns:
         The MoE forward that the rewriter binds to the module.
     """
-    del mesh, tp_mesh, cp_mesh
+    del mesh
+    _bind_router_statistics(module, input_placements, tp_mesh, cp_mesh)
     module.ep_executor = build_ep_compute(
         module, ep_mesh, router_fn=type(module).route, archetype_key="xing4",
         expected_attrs=["gate", "experts", "shared_experts"], combine=SHARED_MERGE_MODES["none"],

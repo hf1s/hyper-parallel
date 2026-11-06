@@ -32,7 +32,7 @@ from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLA
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
 from hyper_parallel.models.replacement import method_replacement
-from hyper_parallel.models.xing_4.modeling_xing4_0 import Xing4MoE, fusion_attention_with_logit_maxima
+from hyper_parallel.models.xing_4.modeling_xing4_0 import fusion_attention_with_logit_maxima
 
 
 def _rotary(tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] | None,
@@ -85,15 +85,6 @@ def xing4_mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any,
 
     requests[0] = _ForwardRewriteRequest(target_module, forward, requests[0].companion_attrs)
     return requests
-
-
-@inner_wrapper
-def xing4_moe_cp_wrapper(target_module: Xing4MoE, mesh: Any, tp_mesh: Any,
-                         cp_mesh: Any, ep_mesh: Any) -> list:
-    """Bind sequence-wise router statistics without replacing the MoE computation."""
-    del mesh, tp_mesh, ep_mesh
-    target_module.gate.aux_loss_cp_group = cp_mesh.get_group()
-    return []
 
 
 def _cp_mesh(context: Mapping[str, Any]) -> Any:

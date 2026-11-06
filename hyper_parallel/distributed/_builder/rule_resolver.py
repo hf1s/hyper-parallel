@@ -25,6 +25,7 @@ import fnmatch
 import functools
 import inspect
 import logging
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional, Tuple
 
 from hyper_parallel.core.dtensor.placement_types import Placement
@@ -617,8 +618,16 @@ def _require_region_dispatch(spec, *, source):
             "remove it")
 
 
+def _resolved_input_placements(spec):
+    """Snapshot the enclosing boundary's resolved input destinations."""
+    return MappingProxyType({
+        name: MappingProxyType(copy.deepcopy(named))
+        for name, named in spec.in_dst.items()
+    })
+
+
 def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
-                                 expert_mesh, *, configured=None, source):
+                                 expert_mesh, *, configured=None, source, input_placements=None):
     """Build a ``@local_compute`` factory into the region compute_fn (apply-time).
 
     The factory is invoked ONCE with the framework context filled BY NAME per
@@ -632,6 +641,8 @@ def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
     The returned compute fn is validated against the module's forward
     signature (validate_local_compute_signature: params must match the
     original forward) and bound to *module* by the caller.
+    Optional ``input_placements`` is a read-only snapshot of the enclosing
+    boundary's resolved input destinations, keyed by input and mesh-axis names.
     """
     # Lazy imports: applier and forward_rewriter both import rule_resolver
     # at module level — importing them here at module level would cycle.
@@ -649,6 +660,7 @@ def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
         "tp_mesh": _get_tp_submesh(mesh, mesh_dim_names),
         "cp_mesh": _get_cp_submesh(mesh, mesh_dim_names),
         "ep_mesh": expert_mesh,
+        "input_placements": input_placements,
     }
     build_kwargs = fill_context_kwargs(
         meta, context, configured or {}, source=source)
@@ -717,7 +729,8 @@ def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
             configured = None
         compute_fn = _build_local_compute_factory(
             factory, module, mesh, mesh_dim_names, expert_mesh,
-            configured=configured, source=source)
+            configured=configured, source=source,
+            input_placements=_resolved_input_placements(spec))
         return functools.partial(compute_fn, module)
     if spec.region_dispatch is False and spec.inner_wrapper is None:
         return module.forward
@@ -841,6 +854,7 @@ def _resolve_inner_wrapper(module, spec, cp_mesh, mesh, tp_mesh=None,
         "tp_mesh": tp_mesh,
         "cp_mesh": cp_mesh,
         "ep_mesh": ep_mesh,
+        "input_placements": _resolved_input_placements(spec),
     }
     if _is_delayed_target(custom):
         return _resolve_delayed_inner_wrapper(
