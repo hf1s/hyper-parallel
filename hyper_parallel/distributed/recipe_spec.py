@@ -515,8 +515,8 @@ INNER_WRAPPER = "inner_wrapper"        # inner-forward wrapper
 # Reserved framework-context names per kind (declaring one means the
 # framework fills it by name; configuring a key with the same name errors)
 _MESH_FAMILY = frozenset({"mesh", "tp_mesh", "cp_mesh", "ep_mesh"})
-FACTORY_CONTEXT = frozenset({"module"}) | _MESH_FAMILY
-WRAPPER_CONTEXT = frozenset({"target_module"}) | _MESH_FAMILY
+FACTORY_CONTEXT = frozenset({"module", "input_placements"}) | _MESH_FAMILY
+WRAPPER_CONTEXT = frozenset({"target_module", "input_placements"}) | _MESH_FAMILY
 
 # Required context per kind (the decorators enforce full declaration --
 # the mesh family is always passed by the framework and the user merely
