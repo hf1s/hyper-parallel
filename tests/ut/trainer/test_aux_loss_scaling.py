@@ -30,20 +30,22 @@ from tests.common.mark_utils import arg_mark
 class AuxiliaryModel(nn.Module):
     """Synthetic model with two independently injected auxiliary objectives."""
 
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, replicated_router: bool = False) -> None:
         """Create the scalar parameters for the main and auxiliary branches."""
         super().__init__()
         self.main = nn.Parameter(torch.tensor(2.0))
         self.router = nn.Parameter(torch.tensor(3.0))
         self.indexer = nn.Parameter(torch.tensor(4.0))
         self.enabled = enabled
+        self.replicated_router = replicated_router
 
     def forward(self, input_ids: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
         """Return the main scalar while attaching optional penalties."""
         del use_cache
         output = self.main.square() * input_ids.mean()
         if self.enabled:
-            output = aux_loss_auto_scale(output, self.router.square() * input_ids.mean())
+            output = aux_loss_auto_scale(output, self.router.square() * input_ids.mean(),
+                                         tp_replicated=self.replicated_router)
             output = aux_loss_auto_scale(output, self.indexer.square() * input_ids.mean())
         return output
 
@@ -59,17 +61,18 @@ class TestTrainerAuxLossScaling(unittest.TestCase):
         Description: Two microsteps contribute 1/4 and 3/4 to every gradient branch.
         Expectation: The actual Trainer backward matches the explicitly token-weighted reference.
         """
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled):
+        for enabled, loss_parallel in ((False, False), (True, False), (True, True)):
+            with self.subTest(enabled=enabled, loss_parallel=loss_parallel):
                 trainer = BaseTrainer.__new__(BaseTrainer)
                 trainer.device = torch.device("cpu")
-                trainer.model = AuxiliaryModel(enabled)
+                trainer.model = AuxiliaryModel(enabled, replicated_router=loss_parallel)
                 trainer.model_fwd_context = nullcontext()
                 trainer.model_bwd_context = nullcontext()
                 trainer.graph_compiler = None
                 trainer.model_integration = Mock()
                 trainer.config = SimpleNamespace(training=SimpleNamespace(empty_cache_before_backward=False))
-                trainer.mesh = SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False, dp_size=1, cp_size=1)
+                trainer.mesh = SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False, dp_size=1, cp_size=1,
+                                               loss_parallel=loss_parallel, tp_size=2)
                 trainer.loss_fn = lambda model_output, labels: model_output
                 trainer.step_token_counts = {"foundation_tokens": torch.tensor(4)}
                 prefix = "hyper_parallel.trainer.runtime.metrics.all_reduce"
@@ -80,7 +83,9 @@ class TestTrainerAuxLossScaling(unittest.TestCase):
                 weighted_input = 0.25 + 0.75 * 2
                 torch.testing.assert_close(trainer.model.main.grad, torch.tensor(4 * weighted_input))
                 if enabled:
-                    torch.testing.assert_close(trainer.model.router.grad, torch.tensor(6 * weighted_input))
+                    router_divisor = 2 if loss_parallel else 1
+                    torch.testing.assert_close(
+                        trainer.model.router.grad, torch.tensor(6 * weighted_input / router_divisor))
                     torch.testing.assert_close(trainer.model.indexer.grad, torch.tensor(8 * weighted_input))
                 else:
                     self.assertIsNone(trainer.model.router.grad)

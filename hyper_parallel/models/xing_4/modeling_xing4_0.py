@@ -296,7 +296,7 @@ class Xing4Router(Xing4_0TopkRouter):
             affinity = differentiable_all_reduce(normalized.sum(dim=1), "sum", group) / tokens
         loss = (affinity * load).sum(dim=-1).mean() * self.num_experts
         self.last_aux_loss = loss.detach()
-        return aux_loss_auto_scale(weights, loss * self.aux_loss_coeff)
+        return aux_loss_auto_scale(weights, loss * self.aux_loss_coeff, tp_replicated=True)
 
     @property
     def tokens_per_expert(self) -> torch.Tensor:
