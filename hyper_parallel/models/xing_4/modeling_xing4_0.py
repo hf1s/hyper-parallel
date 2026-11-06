@@ -100,6 +100,8 @@ _REQUIRED_OPTIONS = {
     "hc_sinkhorn_clamp": None,
     "mhc_h_res_clamp_min": None,
     "mhc_h_res_clamp_max": None,
+    "swiglu_limit": None,
+    "swiglu_compute_dtype": None,
 }
 
 
