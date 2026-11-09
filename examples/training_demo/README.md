@@ -125,10 +125,11 @@ top-8). The model has 3.40B parameters; FP32 parameters, FP32 gradients and the
 two FP32 AdamW moments take about 51 GiB before activations (estimated, not
 measured), which targets one 64 GB device such as 910B3.
 
-Module replacements and the packed-data path match the full
-[recipe](../../hyper_parallel/models/deepseek_v32/recipes/train.yaml): DSA reads
-packed document boundaries from `DeepseekV32PackedSequence` rather than a dense
-mask. DSA runs on the CANN backend, so load the CANN and ops-transformer
+Module replacements match the full
+[recipe](../../hyper_parallel/models/deepseek_v32/recipes/train.yaml). Unlike its
+one-line-per-row default data, this example packs documents into 4096-token rows,
+and DSA reads their boundaries from `DeepseekV32PackedSequence` rather than a
+dense mask. DSA runs on the CANN backend, so load the CANN and ops-transformer
 environment described in the
 [functional README](../../hyper_parallel/components/functional/README.md#deepseek-v32-dsa)
 before launching. Only `config.json` and the tokenizer files of the official

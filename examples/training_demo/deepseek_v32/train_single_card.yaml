@@ -5,8 +5,9 @@
 # top-8）的最小专家数。共 3.40B 参数，FP32 参数 + FP32 梯度 + AdamW 两个 FP32 动量
 # ≈ 16 B/param，约 51 GiB，再加激活（未实测），面向 64 GB 单卡（如 910B3）。
 #
-# 模块替换与 packed 数据路径和完整配方 hyper_parallel/models/deepseek_v32/recipes/train.yaml
-# 一致；单卡没有 TP/CP/EP，所以不带 `when: cp` / `when: ep` 条目。
+# 模块替换与完整配方 hyper_parallel/models/deepseek_v32/recipes/train.yaml 一致；数据用
+# TokenBatchLoader 把多个文档拼成 4096 token 的行，文档边界由 DeepseekV32PackedSequence
+# 传给 DSA。单卡没有 TP/CP/EP，所以不带 `when: cp` / `when: ep` 条目。
 #
 # 启动（只需要官方目录里的 config.json 和 tokenizer 文件，不需要权重）：
 #   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2
@@ -112,7 +113,6 @@ dataset:
   data_path: ./output/training_demo/deepseek_v32/single_card.jsonl
   data_config:
     labels_are_shifted: true
-    create_attention_mask_in_dataloader: false
     create_ltor_fields_in_dataloader: false
 
 dataloader:
@@ -123,7 +123,7 @@ dataloader:
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
-    # DSA 从累计序列长度推导因果与文档边界，不需要 [S, S] 稠密 mask。
+    # DSA 只检查 attention_mask 的形状、不读内容；文档边界由下面的 runtime adapter 以 cu_seq_lens 传入。
     attention_mode: compressed
     runtime_input_adapter:
       _target_: hyper_parallel.models.deepseek_v32.adapter.data.runtime.DeepseekV32PackedSequence
