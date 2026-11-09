@@ -18,20 +18,13 @@ from typing import Any
 
 
 def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
-    """Return DSA and MLA tensor-parallel naming-rule overrides.
-
-    The latent projections (``q_a_proj``/``kv_a_proj_with_mqa``, or their
-    fused ``linear_qkv`` form after the DSA replacement) feed every attention
-    head, so each TP rank keeps them whole; the head-major up-projections are
-    column-parallel. The indexer scores all of its heads on every TP rank so
-    each rank selects the same top-k tokens.
-    """
+    """Return DSA and MLA tensor-parallel naming-rule overrides."""
     from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
         ParamRole,
     )
 
     return [
-        (["q_a_proj", "kv_a_proj_with_mqa", "linear_qkv"], ParamRole.REPLICATED),
+        (["linear_qkv"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
         (
             [

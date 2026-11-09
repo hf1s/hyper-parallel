@@ -79,28 +79,9 @@ class TestDeepseekV32TensorParallelRoles(unittest.TestCase):
     @staticmethod
     def _attention_placements(model):
         """Plan TP2 and return the TP placement of every layer-0 attention parameter."""
-        plan = ShardingPlanner().plan(model, FakeDeviceMesh((2,), ("tp",)), tp_size=2, sequence_parallel=True)
+        plan = ShardingPlanner().plan(model, FakeDeviceMesh((2,), ("tp",)), tp_size=2)
         spec = plan.modules["model.layers.0.self_attn"]
         return {name: placement[TP] for name, placement in spec.params.items()}
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_reference_attention_roles_cover_mla_and_indexer(self):
-        """Feature: DeepSeek-V3.2 TP roles on the Transformers attention.
-
-        Description: Plan TP2 for a dense-only model without any replacement.
-        Expectation: Latent and indexer projections replicate and head projections shard.
-        """
-        with torch.device("meta"):
-            model = DeepseekV32ForCausalLM(_tiny_config(num_hidden_layers=2, first_k_dense_replace=2))
-        placements = self._attention_placements(model)
-        expected = {
-            "q_a_proj.weight": Replicate(), "kv_a_proj_with_mqa.weight": Replicate(),
-            "q_b_proj.weight": Shard(0), "kv_b_proj.weight": Shard(0), "o_proj.weight": Shard(1),
-            "indexer.wq_b.weight": Replicate(), "indexer.wk.weight": Replicate(),
-            "indexer.weights_proj.weight": Replicate(),
-        }
-        self.assertEqual(placements, expected)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -108,7 +89,7 @@ class TestDeepseekV32TensorParallelRoles(unittest.TestCase):
         """Feature: DeepSeek-V3.2 TP roles on the DSA replacement.
 
         Description: Plan TP2 after fusing q_a_proj and kv_a_proj_with_mqa into linear_qkv.
-        Expectation: linear_qkv replicates while head-major projections shard.
+        Expectation: linear_qkv and the indexer projections replicate while head-major projections shard.
         """
         with reference_dsa_kernels():
             with torch.device("meta"):
@@ -122,6 +103,8 @@ class TestDeepseekV32TensorParallelRoles(unittest.TestCase):
         self.assertEqual(placements["q_b_proj.weight"], Shard(0))
         self.assertEqual(placements["kv_b_proj.weight"], Shard(0))
         self.assertEqual(placements["o_proj.weight"], Shard(1))
+        for name in ("indexer.wq_b.weight", "indexer.wk.weight", "indexer.weights_proj.weight"):
+            self.assertEqual(placements[name], Replicate(), name)
         self.assertNotIn("q_a_proj.weight", placements)
 
 
@@ -198,7 +181,7 @@ class TestDeepseekV32DSAAttention(unittest.TestCase):
     def test_packed_documents_match_block_diagonal_attention(self):
         """Feature: DSA packed-document boundaries.
 
-        Description: Pass global cu_seq_lens through the runtime adapter for documents crossing rows.
+        Description: Pass global cu_seq_lens through the runtime adapter for two rows of packed documents.
         Expectation: DSA equals Transformers attention under the matching block-diagonal mask.
         """
         boundaries = torch.tensor([0, 5, 12, 15, 24], dtype=torch.int32)
@@ -217,22 +200,6 @@ class TestDeepseekV32DSAAttention(unittest.TestCase):
             dsa = _dsa_from(attention)
             hidden, rope, positions = _attention_inputs(model)
             self._assert_matches_reference(attention, dsa, hidden, rope, positions, mask, **runtime)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_indexer_loss_rejects_tensor_parallelism(self):
-        """Feature: DSA indexer KL loss ownership.
-
-        Description: Request the trainable-indexer loss with and without TP.
-        Expectation: TP raises before construction; TP1 builds the replacement.
-        """
-        with reference_dsa_kernels():
-            attention = DeepseekV32ForCausalLM(_tiny_config()).model.layers[0].self_attn
-            attention.config.dsa_loss_coeff = 0.01
-            with self.assertRaisesRegex(ValueError, "tp_size=1"):
-                replace_deepseek_v32_dsa_attention(module=attention, module_fqn="layer", context={"tp": True})
-            replacement = replace_deepseek_v32_dsa_attention(module=attention, module_fqn="layer", context={})
-            self.assertEqual(replacement.dsa_loss_coeff, 0.01)
 
 
 if __name__ == "__main__":

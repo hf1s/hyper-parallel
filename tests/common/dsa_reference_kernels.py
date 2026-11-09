@@ -272,9 +272,15 @@ def _restore_modules(
         previous_packages: dict[str, dict],
         stubs: dict[str, types.ModuleType],
 ) -> None:
-    """Evict modules bound to the stand-ins and restore the previous import state."""
+    """Return the stand-in namespaces to their state before the context.
+
+    Every refreshed module and lazy package first imported inside the context
+    is evicted, together with any other module that captured a stand-in, so a
+    lazily cached package symbol cannot keep a stand-in alive after exit.
+    """
     for name, module in list(sys.modules.items()):
-        if name not in previous_modules and (name in _DSA_MODULES or _binds_stub(module, stubs)):
+        if name not in previous_modules and (
+                _is_refreshed(name) or name in _LAZY_PACKAGES or _binds_stub(module, stubs)):
             del sys.modules[name]
             parent, _, child = name.rpartition(".")
             if getattr(sys.modules.get(parent), child, None) is module:
@@ -295,14 +301,13 @@ def _restore_modules(
 def reference_dsa_kernels() -> Iterator[None]:
     """Run the DSA replacement and its CP wrapper on CPU reference kernels.
 
-    The NPU-dependent modules are imported afresh against stand-in
-    ``torch_npu``, custom-operator and ``cann_ops_transformer`` modules, so a
-    stand-in left behind by another test cannot leak into them. The CANN
-    wrappers import their operators when called, so the stand-ins stay in
-    ``sys.modules`` until the context exits; their module specs keep
+    Cached NPU-dependent modules are dropped on entry, so they import afresh
+    against stand-in ``torch_npu``, custom-operator and ``cann_ops_transformer``
+    modules when the test first reaches them, in the same order as a real run.
+    The CANN wrappers import their operators when called, so the stand-ins stay
+    in ``sys.modules`` until the context exits; their module specs keep
     dependency probes such as ``importlib.util.find_spec`` working meanwhile.
-    On exit every module that captured a stand-in is evicted and the previous
-    modules and lazily cached package symbols are restored.
+    On exit the stand-in namespaces are restored to their state before entry.
     """
     previous_modules = dict(sys.modules)
     previous_packages = {
@@ -312,8 +317,6 @@ def reference_dsa_kernels() -> Iterator[None]:
     _forget_cached_dsa_modules(previous_packages)
     sys.modules.update(stubs)
     try:
-        for module_name in _DSA_MODULES:
-            __import__(module_name)
         yield
     finally:
         for name in _STUB_MODULES:

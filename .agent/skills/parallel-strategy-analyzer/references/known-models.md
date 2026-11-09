@@ -63,7 +63,7 @@ V3.2 keeps MLA and adds a Lightning Indexer that selects `index_topk` keys per q
 | index_head_dim | 128 |
 | index_topk | 2048 |
 
-**Impact on parallel strategy**: attention score memory and compute scale with `s × index_topk` instead of `s²` once `s > index_topk`; the indexer itself still scores `s²` pairs with `index_n_heads × index_head_dim`. Under CP the indexer keys (`index_head_dim` per token) are all-gathered alongside the MLA latent KV. The indexer heads stay replicated under TP, and the trainable indexer KL loss needs every attention head on one rank, so it is incompatible with `tp_size > 1`.
+**Impact on parallel strategy**: attention score memory and compute scale with `s × index_topk` instead of `s²` once `s > index_topk`; the indexer itself still scores `s²` pairs with `index_n_heads × index_head_dim`. Under CP the indexer keys (`index_head_dim` per token) are all-gathered alongside the MLA latent KV. The indexer heads stay replicated under TP. HyperParallel's fused indexer KL operator has no TP reduction, so training the indexer with the KL loss requires `tp_size=1`.
 
 ### GQA (Grouped Query Attention) — LLaMA-2/3, Qwen3/3.5
 
