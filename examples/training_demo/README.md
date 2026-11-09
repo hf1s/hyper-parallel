@@ -5,6 +5,7 @@ recipes, data preparation, launchers, and validation manifests are grouped by
 family:
 
 - `qwen3_moe/`: cropped and full-model Qwen3-MoE text demos;
+- `deepseek_v32/`: single-card cropped DeepSeek-V3.2 text demo;
 - `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling.
 
 ## Qwen3-MoE cropped Hugging Face demos
@@ -112,6 +113,44 @@ model/tokenizer loading into `local_files_only` mode. The Offline launcher also
 validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
+
+## DeepSeek-V3.2 single-card crop
+
+The [single-card configuration](deepseek_v32/train_single_card.yaml) builds
+DeepSeek-V3.2 with `HyperAutoModelForCausalLM.from_config` and random weights.
+It keeps the released hidden, MLA, indexer, and vocabulary dimensions and crops
+the model to two decoder layers (one dense, one MoE) and 16 routed experts, the
+fewest that keep the released group routing (`n_group=8`, `topk_group=4`,
+top-8). The model has 3.40B parameters; FP32 parameters, FP32 gradients and the
+two FP32 AdamW moments take about 51 GiB before activations (estimated, not
+measured), which targets one 64 GB device such as 910B3.
+
+Module replacements and the packed-data path match the full
+[recipe](../../hyper_parallel/models/deepseek_v32/recipes/train.yaml): DSA reads
+packed document boundaries from `DeepseekV32PackedSequence` rather than a dense
+mask. DSA runs on the CANN backend, so load the CANN and ops-transformer
+environment described in the
+[functional README](../../hyper_parallel/components/functional/README.md#deepseek-v32-dsa)
+before launching. Only `config.json` and the tokenizer files of the official
+checkpoint directory are read:
+
+```bash
+bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2
+
+# Supply an existing text JSONL instead of the generated data.
+bash examples/training_demo/deepseek_v32/run_single_card.sh \
+    /path/to/DeepSeek-V3.2 /path/to/text/train.jsonl
+```
+
+Without a dataset argument the launcher writes
+`output/training_demo/deepseek_v32/single_card.jsonl`. Each generated record
+tokenizes into two full 4096-token windows and a short tail: a full window is a
+single document longer than `index_topk=2048`, so the indexer's top-k selection
+is active, and tails from several records pack into one row to exercise the
+document boundaries. The Online dataset holds `train_iters × global_batch_size`
+records, so a JSONL whose records are much shorter than 4096 tokens packs
+several records into each step and can run out before `train_iters`. The log is
+written to `output/training_demo/deepseek_v32/run_single_card.log`.
 
 ## DeepSeek-V4.1 text pretraining
 

@@ -1,0 +1,165 @@
+# DeepSeek-V3.2 单卡裁剪示例：from_config 随机初始化，不加载 checkpoint。
+#
+# 保留官方 config 的 hidden、MLA、indexer 和词表维度，只裁成 2 层（第 0 层 dense、
+# 第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由（n_group=8、topk_group=4、
+# top-8）的最小专家数。共 3.40B 参数，FP32 参数 + FP32 梯度 + AdamW 两个 FP32 动量
+# ≈ 16 B/param，约 51 GiB，再加激活（未实测），面向 64 GB 单卡（如 910B3）。
+#
+# 模块替换与 packed 数据路径和完整配方 hyper_parallel/models/deepseek_v32/recipes/train.yaml
+# 一致；单卡没有 TP/CP/EP，所以不带 `when: cp` / `when: ep` 条目。
+#
+# 启动（只需要官方目录里的 config.json 和 tokenizer 文件，不需要权重）：
+#   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2
+
+model:
+  _target_: examples.training_demo.deepseek_v32.cropped_deepseek_v32.build_cropped_deepseek_v32
+  config_path: /path/to/DeepSeek-V3.2
+  num_hidden_layers: 2
+  first_k_dense_replace: 1
+  n_routed_experts: 16
+  local_files_only: true
+  torch_dtype: bfloat16
+  # DSA 替换不读取稠密 mask；sdpa 让 Transformers 只构建 bool 因果 mask。
+  attn_implementation: sdpa
+  validate_placement: false
+
+model_init_dtype: float32
+
+training:
+  train_iters: 10
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 1
+  edp_shard_size: 1
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - model.norm
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+  - match: "*.mlp.experts"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/DeepSeek-V3.2
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 4096
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  # run_single_card.sh 缺省时用 prepare_single_card_data.py 生成：每条记录切成两个完整
+  # 4096 窗口（单文档，超过 index_topk=2048，走稀疏选择）和一个短尾巴（多条尾巴拼成一行）。
+  data_path: ./output/training_demo/deepseek_v32/single_card.jsonl
+  data_config:
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 8
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    # DSA 从累计序列长度推导因果与文档边界，不需要 [S, S] 稠密 mask。
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v32.adapter.data.runtime.DeepseekV32PackedSequence
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./output/training_demo/deepseek_v32/checkpoints
+  restore_from: null
+
+debug:
+  check_nan_inf: false
+  check_dataset: null

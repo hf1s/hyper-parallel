@@ -24,6 +24,9 @@
 #   scripts/train_lm.py <this file> \
 #     --model.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2 \
 #     --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2
+#
+# 单卡裁剪示例（2 层、16 个路由专家、随机初始化）见
+# examples/training_demo/deepseek_v32/train_single_card.yaml。
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
