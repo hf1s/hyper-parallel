@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from typing import Any
 
 # This package provides PyTorch-specific high-performance modules.
@@ -97,6 +98,7 @@ def _deepseek_v32_dense_attention(
     key, value = projected_kv.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
     key_rope = key_rope.expand(-1, -1, module.num_heads, -1)
     need_stats = bool(module.training and not module.freeze_dsa and module.dsa_loss_coeff)
+    module.last_indexer_loss = None
     output, maximum, total = _dense_flash_attention(
         module, torch.cat((query, query_rope), dim=-1), torch.cat((key, key_rope), dim=-1),
         value, sequence_lengths, need_stats=need_stats,
@@ -115,13 +117,20 @@ def _deepseek_v32_dense_attention(
         indexer_stats = dsa_dense_indexer_lse(
             index_query, index_key, weights, query_lengths=query_lengths, key_lengths=key_lengths,
         )
+        teacher = (query, key, query_rope, key_rope)
+        group = module._kl_head_group()  # pylint: disable=protected-access
+        if group is not None:
+            teacher = tuple(_gather_heads(tensor.detach(), 2, group) for tensor in teacher)
+            maximum, total = (_gather_heads(tensor.detach(), 0, group) for tensor in (maximum, total))
+        query, key, query_rope, key_rope = teacher
         loss = dsa_dense_indexer_kl_loss(
             index_query, index_key, weights, query.flatten(0, 1), key.flatten(0, 1),
             maximum, total, indexer_stats, scale=module.scaling,
             query_rope=query_rope.flatten(0, 1), key_rope=key_rope.flatten(0, 1),
             query_lengths=query_lengths, key_lengths=key_lengths, loss_coefficient=module.dsa_loss_coeff,
         )
-        output = aux_loss_auto_scale(output, loss)
+        module.last_indexer_loss = loss.detach()
+        output = aux_loss_auto_scale(output, loss / module.kl_loss_tp_replicas)
     return output
 
 
@@ -193,6 +202,31 @@ def _apply_index_rope(
     rotary_op = apply_rotary_pos_emb_interleave if interleaved else apply_rotary_pos_emb
     query_rot, key_rot = rotary_op(query_rot, key_rot, cos, sin, unsqueeze_dim=2)
     return torch.cat((query_rot, query_pass), dim=-1), torch.cat((key_rot, key_pass), dim=-1)
+
+
+@lru_cache(maxsize=8)
+def _hadamard_matrix(size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Return the Sylvester-ordered ``size`` x ``size`` Hadamard matrix."""
+    matrix = torch.ones(1, 1, dtype=torch.float32)
+    while matrix.shape[0] < size:
+        matrix = torch.cat((torch.cat((matrix, matrix), dim=1), torch.cat((matrix, -matrix), dim=1)), dim=0)
+    return matrix.to(dtype=dtype, device=device)
+
+
+def _rotate_activation(states: torch.Tensor) -> torch.Tensor:
+    """Apply the orthonormal Hadamard rotation over the last dimension."""
+    size = states.shape[-1]
+    if size & (size - 1):
+        raise ValueError(f"Hadamard rotation requires a power-of-two width, got {size}")
+    matrix = _hadamard_matrix(size, states.dtype, states.device)
+    return F.linear(states, matrix) * size**-0.5  # pylint: disable=not-callable
+
+
+def _gather_heads(tensor: torch.Tensor, dim: int, group: Any) -> torch.Tensor:
+    """Concatenate tensor-parallel head shards along ``dim`` in rank order."""
+    shards = [torch.empty_like(tensor) for _ in range(torch.distributed.get_world_size(group))]
+    torch.distributed.all_gather(shards, tensor.contiguous(), group=group)
+    return torch.cat(shards, dim=dim)
 
 
 def _absorb_query_projection(
@@ -304,6 +338,12 @@ class DeepseekV32DSAAttention(nn.Module):
         self.dsa_dense_warm_up = bool(
             getattr(module, "dsa_dense_warm_up", getattr(config, "dsa_dense_warm_up", False))
         )
+        self.index_rotate_activation = bool(getattr(config, "index_rotate_activation", False))
+        # Group of the tensor-parallel attention-head shards, set by the model builder,
+        # and the TP ranks whose identical KL gradients the Trainer sums.
+        self.kl_head_group = None
+        self.kl_loss_tp_replicas = 1
+        self.last_indexer_loss = None
         if getattr(module, "param_sink_number", 0) > 0:
             raise ValueError("DeepseekV32DSAAttention does not support the parameter-sink path")
         if getattr(module, "use_mome", False):
@@ -509,7 +549,21 @@ class DeepseekV32DSAAttention(nn.Module):
             index_head_dim=self.index_head_dim,
             interleaved=self.index_rotary_interleaved,
         )
+        if self.index_rotate_activation:
+            index_query, index_key = _rotate_activation(index_query), _rotate_activation(index_key)
         return index_query, index_key, merge_weight
+
+    def _kl_head_group(self) -> Any:
+        """Return the group holding the other heads of the KL teacher when TP shards them."""
+        full_heads = getattr(self, "_hp_full_head_counts", {}).get("num_heads")
+        if full_heads is None or full_heads == self.num_heads:
+            return None
+        if self.kl_head_group is None:
+            raise RuntimeError(
+                "Tensor parallelism shards the attention heads; the DSA indexer loss "
+                "needs kl_head_group set to the tensor-parallel group"
+            )
+        return self.kl_head_group
 
     def _apply_auxiliary_loss(
         self,
@@ -521,20 +575,30 @@ class DeepseekV32DSAAttention(nn.Module):
         actual_q_len: torch.Tensor,
         actual_kv_len: torch.Tensor,
     ) -> torch.Tensor:
-        """Attach the DSA KL auxiliary loss when training enables it."""
+        """Attach the DSA KL auxiliary loss when training enables it.
+
+        The teacher sums the attention distribution over all heads, so heads
+        sharded by tensor parallelism are gathered first.
+        """
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
+            self.last_indexer_loss = None
             return attn_output
         query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
+        group = self._kl_head_group()
+        if group is not None:
+            query_tnd, q_rot_tnd = (_gather_heads(tensor.detach(), 1, group) for tensor in (query_tnd, q_rot_tnd))
+            softmax_stats = tuple(_gather_heads(tensor.detach(), -1, group) for tensor in softmax_stats)
         aux_loss = dsa_kl_loss(
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
             backend="cann",
         )
-        return aux_loss_auto_scale(attn_output, aux_loss)
+        self.last_indexer_loss = aux_loss.detach()
+        return aux_loss_auto_scale(attn_output, aux_loss / self.kl_loss_tp_replicas)
 
     def _prepare_attention_states(self, hidden_states, position_embeddings):
         """Project attention states and apply their rotary embeddings."""
