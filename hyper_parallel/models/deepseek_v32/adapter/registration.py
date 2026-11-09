@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Architecture and lazy provider registration for DeepSeek-V3.2."""
+"""Architecture and lazy provider registration for DeepSeek-V3.2.
 
-from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+``DeepseekV32ForCausalLM`` checkpoints build
+:class:`~hyper_parallel.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32TrainingForCausalLM`
+unless a recipe forces the Transformers class.
+"""
+
+from typing import Any
+
+from hyper_parallel.models.adapter_spec import ModelAdapterSpec, RecomputePolicy
+from hyper_parallel.models.deepseek_v32.adapter.materialization import register_rotary_materialization
 from hyper_parallel.models.deepseek_v32.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
-from hyper_parallel.models.registry import register_model_adapter
+from hyper_parallel.models.registry import register_custom_model, register_model_adapter
 
 
 def _load_replacements():
@@ -39,11 +47,37 @@ def _load_context_parallel():
     return context_parallel
 
 
+def build_recompute_policy() -> RecomputePolicy:
+    """Expose trunk decoder layers and MTP depths as recompute regions."""
+    return RecomputePolicy(region_patterns=("model.layers.*", "mtp.layers.*"))
+
+
+def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
+    """Make each MTP depth its own FSDP unit."""
+    mtp = getattr(model, "mtp", None)
+    return () if mtp is None else tuple(f"mtp.layers.{name}" for name, _ in mtp.layers.named_children())
+
+
+def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
+    """Keep decoder discovery out of the MTP branch, which declares its own units."""
+    return () if getattr(model, "mtp", None) is None else ("mtp",)
+
+
+register_custom_model(
+    "DeepseekV32ForCausalLM",
+    "hyper_parallel.models.deepseek_v32.modeling_deepseek_v32",
+    "DeepseekV32TrainingForCausalLM",
+)
+
 DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV32ForCausalLM",
     model_type="deepseek_v32",
     replacements=_load_replacements,
+    materialization=register_rotary_materialization,
     context_parallel=_load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
+    fsdp_wrap_modules=get_fsdp_wrap_modules,
+    fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
+    recompute=build_recompute_policy,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)

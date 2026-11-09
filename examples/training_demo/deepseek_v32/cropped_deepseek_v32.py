@@ -20,7 +20,7 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 
-from hyper_parallel.models import HyperAutoModelForCausalLM
+from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import build_model
 
 # ``DeepseekV32Config.__post_init__`` derives these per-layer lists from the
 # layer count and ``first_k_dense_replace``. Copying the released 61-entry
@@ -35,6 +35,7 @@ def build_cropped_deepseek_v32_config(
         num_hidden_layers: int,
         first_k_dense_replace: int,
         n_routed_experts: int,
+        num_nextn_predict_layers: int = 0,
         local_files_only: bool = True,
 ) -> PretrainedConfig:
     """Return the released DeepSeek-V3.2 configuration cropped in depth and experts.
@@ -52,6 +53,7 @@ def build_cropped_deepseek_v32_config(
             routing scores each of ``n_group`` groups by its top-2 experts and
             keeps ``topk_group`` groups, so every group needs two experts and
             the kept groups must hold ``num_experts_per_tok`` experts.
+        num_nextn_predict_layers: MTP depth; 0 disables MTP.
         local_files_only: Disable implicit Hub downloads when true.
 
     Returns:
@@ -88,6 +90,7 @@ def build_cropped_deepseek_v32_config(
         num_hidden_layers=num_hidden_layers,
         first_k_dense_replace=first_k_dense_replace,
         n_routed_experts=n_routed_experts,
+        num_nextn_predict_layers=num_nextn_predict_layers,
         use_cache=False,
     )
     return type(released).from_dict(values)
@@ -99,6 +102,7 @@ def build_cropped_deepseek_v32(
         num_hidden_layers: int = 2,
         first_k_dense_replace: int = 1,
         n_routed_experts: int = 16,
+        num_nextn_predict_layers: int = 0,
         local_files_only: bool = True,
         **build_kwargs: Any,
 ) -> PreTrainedModel:
@@ -113,10 +117,11 @@ def build_cropped_deepseek_v32(
         num_hidden_layers: Decoder layers retained in the cropped model.
         first_k_dense_replace: Leading dense-MLP layers.
         n_routed_experts: Routed experts per MoE layer.
+        num_nextn_predict_layers: MTP depth; 0 disables MTP.
         local_files_only: Disable implicit Hub downloads when true.
-        **build_kwargs: ``HyperAutoModelForCausalLM.from_config`` options, both
-            those set in YAML (``torch_dtype``, ``attn_implementation``,
-            ``validate_placement``) and those the Trainer injects
+        **build_kwargs: Model build options, both those set in YAML
+            (``torch_dtype``, ``attn_implementation``, ``validate_placement``,
+            training objectives) and those the Trainer injects
             (``distributed_setup``, ``activation_checkpoint``, ...).
 
     Returns:
@@ -127,6 +132,7 @@ def build_cropped_deepseek_v32(
         num_hidden_layers=num_hidden_layers,
         first_k_dense_replace=first_k_dense_replace,
         n_routed_experts=n_routed_experts,
+        num_nextn_predict_layers=num_nextn_predict_layers,
         local_files_only=local_files_only,
     )
-    return HyperAutoModelForCausalLM.from_config(config, **build_kwargs)
+    return build_model(config=config, **build_kwargs)

@@ -117,11 +117,14 @@ class TestDeepseekV32RecipeTopology(unittest.TestCase):
         """Feature: DeepSeek-V3.2 EP plan overrides.
 
         Description: Activate the recipe at EP>1 and match its MLP globs against the released depth.
-        Expectation: Only MoE layers receive the EP compute; CP and EP stay off at size one.
+        Expectation: Only MoE layers, including the MTP depth, receive the EP compute; CP and EP stay
+        off at size one.
         """
         released = DeepseekV32Config()
         mlps = [f"model.layers.{index}.mlp" for index in range(released.num_hidden_layers)]
         sparse = [name for name, kind in zip(mlps, released.mlp_layer_types) if kind == "sparse"]
+        mlps.append("mtp.layers.0.mtp_block.mlp")
+        sparse.append("mtp.layers.0.mtp_block.mlp")
         with reference_dsa_kernels():
             from hyper_parallel.trainer.config import (  # pylint: disable=import-outside-toplevel
                 entries_to_plan_overrides,
@@ -130,7 +133,7 @@ class TestDeepseekV32RecipeTopology(unittest.TestCase):
                 parse_training_args,
             )
             entries = parse_training_args([str(_RECIPE)]).plan_overrides
-            self.assertEqual(entries_to_plan_overrides(entries), {})
+            self.assertEqual(set(entries_to_plan_overrides(entries)), {"mtp.layers.*.eh_proj"})
             active = entries_to_plan_overrides(entries, cp_size=2, ep_size=2)
             ep_globs = [key for key, spec in active.items() if spec.local_compute_fn is not None]
             matched = [name for name in mlps if any(fnmatch.fnmatchcase(name, glob) for glob in ep_globs)]

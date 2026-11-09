@@ -5,8 +5,8 @@
 #   专家区域：ep 64 × edp 8（edp = dp*cp*tp/ep）。每个 EP rank 持有 256/64 = 4 个专家，
 #     edp 内按 edp_shard 4 × 副本 2 做 HSDP，每卡每个 MoE 层恰好 1 个专家。
 # 显存估算：FP32 参数 + FP32 梯度
-# + AdamW 两个 FP32 动量 ≈ 16 B/param。58 个 MoE 层 × 每卡 1 个专家 ≈ 2.55B 参数
-# （≈ 41 GB）；dense 部分约 18B 参数切到 512 卡上约 35M（≈ 0.6 GB）；激活另计。
+# + AdamW 两个 FP32 动量 ≈ 16 B/param。主干 58 个 MoE 层加 MTP 层，每卡每层 1 个专家
+# ≈ 2.6B 参数（≈ 42 GB）；dense 部分约 18B 参数切到 512 卡上约 35M（≈ 0.6 GB）；激活另计。
 #
 # 其它并行维度用命令行覆盖打开：
 #   TP/loss parallel：--accelerator.tp_size=2 --accelerator.loss_parallel=true
@@ -31,12 +31,21 @@
 # examples/training_demo/deepseek_v32/train_single_card.yaml。
 
 model:
-  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  # 训练模型：在 Transformers 的 DeepSeek-V3.2 上加 MTP、MoE 负载均衡和 DSA indexer 训练，并绑定并行通信组。
+  _target_: hyper_parallel.models.deepseek_v32.modeling_deepseek_v32.build_model
   pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
   torch_dtype: bfloat16
   # DSA 替换不读取稠密 mask；sdpa 让 Transformers 只构建 bool 因果 mask。
   attn_implementation: sdpa
-  force_hf: true
+  # MTP 深度取 config 的 num_nextn_predict_layers（1）；MTP loss 按 0.3 / 深度加权。
+  mtp_loss_scaling_factor: 0.3
+  # 序列级负载均衡 loss 与无辅助损失的专家 bias 更新（每个优化步按负载 ±1e-3）。
+  moe_aux_loss_coeff: 1.0e-4
+  moe_router_enable_expert_bias: true
+  moe_router_bias_update_rate: 1.0e-3
+  # 稀疏阶段的 indexer KL loss；indexer q/k 在打分前做 Hadamard 旋转。
+  dsa_loss_coeff: 1.0
+  index_rotate_activation: true
 
 model_init_dtype: float32
 
@@ -76,10 +85,17 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
+  # MTP 融合投影（[embedding; hidden] -> hidden）在 TP 下保持完整副本。
+  - match: mtp.layers.*.eh_proj
+    params:
+      weight: {tp: replicate}
   - match:
       - "*.input_layernorm"
       - "*.post_attention_layernorm"
       - model.norm
+      - "mtp.layers.*.enorm"
+      - "mtp.layers.*.hnorm"
+      - "mtp.layers.*.post_norm"
     replace:
       kind: module
       implementation:
@@ -111,8 +127,9 @@ plan_overrides:
         _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
         # null follows dsa_dense_warm_up; true/false forces one path for the full run.
         dense_warmup: null
-  # EP：DeepSeek-V3.2 的 router 与 DeepSeek-V3 相同，直接用框架内置的 V3 EP 工厂。
-  # 只匹配 MoE 层：first_k_dense_replace=3，层 0-2 为稠密 MLP，层 3-60 为 MoE；
+  # EP：DeepSeek-V3.2 的 router 与 DeepSeek-V3 相同，用框架内置的 V3 EP 工厂；
+  # router_fn 取训练 router 返回的专家与门控值，负载均衡 loss 挂在门控值上。
+  # 只匹配 MoE 层：first_k_dense_replace=3，层 0-2 为稠密 MLP，层 3-60 与 MTP 层为 MoE；
   # fnmatch 不支持数值区间，因此分两条 glob 覆盖 3-9 与 10-99。
   # 裁剪模型改变稠密层数时需要同步调整这两条 glob。
   - match: "model.layers.[3-9].mlp.forward"
@@ -121,6 +138,7 @@ plan_overrides:
       kind: method
       implementation:
         _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        router_fn: topk_router_module
         use_grouped_gemm: true
         overlap_shared_expert: true
   - match: "model.layers.[1-9][0-9].mlp.forward"
@@ -129,6 +147,16 @@ plan_overrides:
       kind: method
       implementation:
         _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        router_fn: topk_router_module
+        use_grouped_gemm: true
+        overlap_shared_expert: true
+  - match: "mtp.layers.*.mtp_block.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        router_fn: topk_router_module
         use_grouped_gemm: true
         overlap_shared_expert: true
 
@@ -206,8 +234,8 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_config:
     lr: 1.0e-5
-    lr_warmup_steps: 1
-    min_lr: 0.0
+    lr_warmup_steps: 0
+    min_lr: 1.0e-7
 
 checkpoint:
   save_ckpt: false

@@ -343,6 +343,7 @@ def deepseekv3_ep_compute_fn(
     overlap_shared_expert: bool = False,
     fix_router: bool = False,
     capacity_factor: Optional[float] = None,
+    router_fn: str = "deepseekv3",
 ) -> Callable:
     """Archetype ``deepseekv3_sigmoid_group_shared``: sigmoid group-limited
     routing (with e_score_correction_bias / routed_scaling_factor, already
@@ -370,6 +371,10 @@ def deepseekv3_ep_compute_fn(
     happened to route. Loss / grad_norm / expert-load metrics are meaningless
     in that mode and it must not be used to report an efficiency number —
     see ``routing.make_balanced_router``. Correctness runs keep it off.
+
+    ``router_fn="topk_router_module"`` takes the expert indices and gate values
+    returned by ``module.gate`` instead of recomputing them from its logits, so
+    a training router can attach auxiliary losses to the gate values.
     """
     del mesh, tp_mesh, cp_mesh
 
@@ -390,7 +395,7 @@ def deepseekv3_ep_compute_fn(
     return build_ep_compute(
         module,
         ep_mesh,
-        router_fn="deepseekv3",
+        router_fn=router_fn,
         fix_router=fix_router,
         archetype_key="deepseekv3_sigmoid_group_shared",
         expected_attrs=["gate", "experts", "shared_experts"],
