@@ -5,10 +5,12 @@
 #   MoE：sigmoid 分组路由，序列级负载均衡 loss 1e-4，专家 bias 每步按负载 ±1e-3；
 #   MTP：1 层，loss 系数 0.3；
 #   优化器：AdamW lr 1e-5，cosine 衰减到 1e-7，无 warmup，weight decay 0.01，
-#     betas (0.9, 0.999)，梯度裁剪 1.0；RMSNorm 权重保持 FP32（对应 --init-norm-weight-in-fp32）；
+#     betas (0.9, 0.999)，梯度裁剪 1.0；层间 RMSNorm 权重保持 FP32（对应 --init-norm-weight-in-fp32，
+#     DSA 内部的 q_a/kv_a/k_norm 仍为 BF16）；
 #   数据：两边读同一份 Megatron .bin/.idx，seed 1234、split 100,0,0、seq_length 4096，
 #     每个 4096 窗口是一条完整的因果序列（不按文档隔离，对应未开 --reset-attention-mask）。
-# 两边需要一致的设置、MindSpeed 侧命令和日志指标的对应关系见同目录 README 的对齐小节。
+# 两边需要一致的设置（权重与数据转换、确定性开关）和日志指标的对应关系见
+# examples/training_demo/README.md 的 MindSpeed-LLM 对比小节。
 #
 # 拓扑与完整配方相同（512 卡，ep 64 × edp 8）；并行方式不改变计算语义，可以按机器调整。
 

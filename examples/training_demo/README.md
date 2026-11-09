@@ -168,13 +168,18 @@ the same samples:
 1. Dequantize the released FP8 checkpoint to BF16 once (for example with
    DeepSeek's `inference/fp8_cast_bf16.py`). HyperParallel loads this directory;
    MindSpeed converts it with `ckpt_convert_deepseek32_hf2mcore.sh`, whose
-   converter does not dequantize FP8.
+   converter does not dequantize FP8. Convert to the training script's layout
+   (`--target-tensor-parallel-size 4 --target-pipeline-parallel-size 8
+   --target-expert-parallel-size 64 --num-layers-per-virtual-pipeline-stage 2
+   --noop-layers 7,62,63 --mtp-num-layers 1`); the shipped conversion script
+   uses TP 1 and `--noop-layers 61,62,63`, which do not match it.
 2. Build the Megatron `.bin/.idx` dataset with MindSpeed's
    `data_convert_deepseek32_pretrain.sh` and point both sides at its prefix.
-   HyperParallel's indexed dataset reproduces Megatron's `GPTDataset` sample
-   order when the seed (MindSpeed default 1234), `--split 100,0,0`,
-   `--seq-length 4096`, `--train-iters` and `--global-batch-size` are equal.
-   Neither side isolates documents inside a 4096-token window.
+   Both sides derive the document, sample and shuffle indices from the seed
+   (MindSpeed default 1234), the split (`--split 100,0,0`), `--seq-length 4096`
+   and the sample count (`--train-iters` × `--global-batch-size`), so keep them
+   equal; compare the first step's `lm loss` before a long run. Neither side
+   isolates documents inside a 4096-token window.
 3. Keep MindSpeed's model and optimizer flags from its script and enable its
    deterministic mode (`--npu-deterministic` and `HCCL_DETERMINISTIC=true`);
    `enable_full_determinism` does the same on the HyperParallel side.
