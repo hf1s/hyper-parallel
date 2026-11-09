@@ -1,19 +1,19 @@
-# DeepSeek-V3.2 完整训练配方（唯一对外交付的 DeepSeek-V3.2 recipe）。
+# DeepSeek-V3.2 训练配方。
 #
 # 主线拓扑：64 节点 / 512 卡 Ascend NPU（hccl backend）。
 #   dense 区域：tp 1 × cp 1 × dp 512，FSDP 在 512 卡上切分；
 #   专家区域：ep 64 × edp 8（edp = dp*cp*tp/ep）。每个 EP rank 持有 256/64 = 4 个专家，
 #     edp 内按 edp_shard 4 × 副本 2 做 HSDP，每卡每个 MoE 层恰好 1 个专家。
-# 显存估算（未在本配方上实测，按需在目标集群确认）：FP32 参数 + FP32 梯度
+# 显存估算：FP32 参数 + FP32 梯度
 # + AdamW 两个 FP32 动量 ≈ 16 B/param。58 个 MoE 层 × 每卡 1 个专家 ≈ 2.55B 参数
 # （≈ 41 GB）；dense 部分约 18B 参数切到 512 卡上约 35M（≈ 0.6 GB）；激活另计。
 #
-# 其它并行维度都通过 CLI dotted override 打开，无需维护第二份配置：
+# 其它并行维度用命令行覆盖打开：
 #   TP/loss parallel：--accelerator.tp_size=2 --accelerator.loss_parallel=true
 #                     --fsdp_config.dp_shard_size=256（dp 随 TP 减半）；DSA 暂不支持
 #                     sequence parallel。
 #     MoE 层在 TP 下走 TP-extend-EP（专家只按 ep 切），因此 tp_size>1 时 ep_size
-#     必须 >1；fused gate_up 专家不能直接做 TP 切分（planner 会给出明确报错）。
+#     必须 >1；fused gate_up 专家不能直接做 TP 切分。
 #   CP：--accelerator.cp_size=2，下方 `when: cp` 的 DSA CP wrapper 自动生效；
 #   EP：--accelerator.ep_size 与 --fsdp_config.edp_shard_size 一起调整。
 # 修改拓扑时保持 world_size = tp*cp*dp、dp*cp 可被 dp_shard_size 整除、
@@ -21,8 +21,8 @@
 # 256/ep_size 可被 edp_shard_size 整除（否则 FSDP 按第 0 维切专家时会补齐空数据），
 # 且 global_batch_size 可被 micro_batch_size*dp 整除。
 #
-# 默认加载公开 Hugging Face 资源（模型、tokenizer、dataset）。默认数据是 wikitext-2
-# 的逐行文本，每行一个样本，只用于跑通流程。本地或离线资源用命令行覆盖，例如：
+# 默认加载公开 Hugging Face 资源（模型、tokenizer、dataset），默认数据为 wikitext-2，
+# 每行一个样本。本地或离线资源用命令行覆盖，例如：
 #   scripts/train_lm.py <this file> \
 #     --model.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2 \
 #     --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2

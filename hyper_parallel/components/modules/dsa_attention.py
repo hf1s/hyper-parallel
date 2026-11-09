@@ -30,9 +30,8 @@ from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.functional import aux_loss_auto_scale
 from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
-# Exports that share their submodule's name come from the submodule: once that
-# submodule is imported elsewhere first (the DeepSeek-V3.2 CP wrapper does), the
-# package attribute of that name is the module object, not the function.
+# Exports named like their submodule come from the submodule: once that submodule
+# is imported, the package attribute of that name is the module, not the function.
 from hyper_parallel.components.functional.aggregate_hidden import aggregate_hidden
 from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
 from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
