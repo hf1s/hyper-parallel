@@ -14,15 +14,25 @@
 # ============================================================================
 """Single-card DeepSeek-V3.2 crop: per-layer MLP pattern and routing constraints."""
 
+import importlib.util
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 from transformers import DeepseekV32Config, DeepseekV32ForCausalLM
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32MLP, DeepseekV32MoE
 
-from examples.training_demo.deepseek_v32.cropped_deepseek_v32 import build_cropped_deepseek_v32_config
 from tests.common.mark_utils import arg_mark
+
+# Load the example by path: `examples` is also the RL package name that
+# tests/ut/rl/conftest.py puts on sys.path, so importing it by name would
+# bind whichever package a pytest session imports first.
+_BUILDER = Path(__file__).resolve().parents[5] / "examples/training_demo/deepseek_v32/cropped_deepseek_v32.py"
+_SPEC = importlib.util.spec_from_file_location("_cropped_deepseek_v32_example", _BUILDER)
+_EXAMPLE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_EXAMPLE)
+build_cropped_deepseek_v32_config = _EXAMPLE.build_cropped_deepseek_v32_config
 
 
 def _save_released_shape(directory: str) -> None:
