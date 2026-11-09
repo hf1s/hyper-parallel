@@ -98,11 +98,11 @@ def _config() -> DeepseekV32Config:
 def _reference_model():
     """Build the unsharded training model with nonzero expert-selection biases."""
     from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import (  # pylint: disable=import-outside-toplevel
-        DeepseekV32TrainingForCausalLM,
+        DeepseekV32ForCausalLM,
     )
 
     torch.manual_seed(7)
-    model = DeepseekV32TrainingForCausalLM(
+    model = DeepseekV32ForCausalLM(
         _config(), moe_aux_loss_coeff=0.1, moe_router_enable_expert_bias=True,
     ).float().train()
     with torch.no_grad():

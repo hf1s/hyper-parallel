@@ -14,8 +14,8 @@
 # ============================================================================
 """Architecture and lazy provider registration for DeepSeek-V3.2.
 
-``DeepseekV32ForCausalLM`` checkpoints build
-:class:`~hyper_parallel.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32TrainingForCausalLM`
+``DeepseekV32ForCausalLM`` checkpoints build the training model
+:class:`~hyper_parallel.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32ForCausalLM`
 unless a recipe forces the Transformers class.
 """
 
@@ -66,7 +66,7 @@ def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
 register_custom_model(
     "DeepseekV32ForCausalLM",
     "hyper_parallel.models.deepseek_v32.modeling_deepseek_v32",
-    "DeepseekV32TrainingForCausalLM",
+    "DeepseekV32ForCausalLM",
 )
 
 DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(

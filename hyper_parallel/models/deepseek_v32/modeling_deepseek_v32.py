@@ -39,7 +39,7 @@ from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32DecoderLayer,
-    DeepseekV32ForCausalLM,
+    DeepseekV32ForCausalLM as TransformersDeepseekV32ForCausalLM,
     DeepseekV32MoE,
     DeepseekV32RMSNorm,
     DeepseekV32TopkRouter,
@@ -56,7 +56,7 @@ from hyper_parallel.models.deepseek_v32.adapter.conversion.checkpoint_mapping im
 
 __all__ = [
     "DeepseekV32Router",
-    "DeepseekV32TrainingForCausalLM",
+    "DeepseekV32ForCausalLM",
     "DeepseekV32TrainingOutput",
     "bind_parallel_groups",
     "build_model",
@@ -207,8 +207,11 @@ def _mtp_layer_config(config: Any, layer_idx: int) -> Any:
     return layer_config
 
 
-class DeepseekV32TrainingForCausalLM(DeepseekV32ForCausalLM):
+class DeepseekV32ForCausalLM(TransformersDeepseekV32ForCausalLM):
     """DeepSeek-V3.2 causal LM with MoE balancing, MTP and DSA indexer training.
+
+    It keeps the released architecture name, so checkpoints it saves load like
+    the released one.
 
     Args:
         config: DeepSeek-V3.2 configuration. ``num_nextn_predict_layers`` sets
@@ -275,7 +278,7 @@ class DeepseekV32TrainingForCausalLM(DeepseekV32ForCausalLM):
         self.post_init()
 
     @classmethod
-    def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV32TrainingForCausalLM":
+    def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV32ForCausalLM":
         """Construct from a configuration through the shared custom-model builder."""
         return cls._from_config(config, **kwargs)
 
@@ -410,7 +413,7 @@ def bind_parallel_groups(model: nn.Module, mesh: Any) -> None:
     tp_group = mesh.device_mesh["tp"].get_group() if mesh.tp_size > 1 else None
     tp_replicas = mesh.tp_size if mesh.loss_parallel else 1
     for module in model.modules():
-        if isinstance(module, DeepseekV32TrainingForCausalLM):
+        if isinstance(module, DeepseekV32ForCausalLM):
             module.sequence_group = cp_group
         elif isinstance(module, DeepseekV32Router):
             module.sequence_partition_group = cp_group
@@ -427,7 +430,7 @@ def build_model(**options: Any) -> nn.Module:
         **options: ``pretrained_model_name_or_path`` loads a checkpoint; otherwise
             ``config`` builds from a configuration. The remaining options go to
             ``HyperAutoModelForCausalLM`` and, for the training options of
-            :class:`DeepseekV32TrainingForCausalLM`, to the model constructor.
+            :class:`DeepseekV32ForCausalLM`, to the model constructor.
 
     Returns:
         The constructed and parallelized model.

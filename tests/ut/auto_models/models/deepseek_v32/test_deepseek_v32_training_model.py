@@ -14,20 +14,22 @@
 # ============================================================================
 """DeepSeek-V3.2 training objectives: balance loss, expert bias, MTP and checkpoint names."""
 
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import DeepseekV32Config
 from transformers.masking_utils import create_causal_mask
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32TopkRouter
 
 from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import (
+    DeepseekV32ForCausalLM,
     DeepseekV32Router,
-    DeepseekV32TrainingForCausalLM,
 )
 from tests.common.dsa_reference_kernels import reference_dsa_kernels
 from tests.common.mark_utils import arg_mark
@@ -145,7 +147,7 @@ class TestDeepseekV32MultiTokenPrediction(unittest.TestCase):
         Expectation: Equal losses, scaled by 0.3, with the LM loss under ``foundation_loss``.
         """
         torch.manual_seed(2)
-        model = DeepseekV32TrainingForCausalLM(_tiny_config()).float().train()
+        model = DeepseekV32ForCausalLM(_tiny_config()).float().train()
         tokens = torch.randint(1, 96, (2, 13))
         inputs, labels = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
         captured = {}
@@ -171,16 +173,17 @@ class TestDeepseekV32MultiTokenPrediction(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_released_mtp_layer_loads_into_mtp(self):
+    def test_released_mtp_layer_round_trips(self):
         """Feature: DeepSeek-V3.2 MTP checkpoint names.
 
         Description: Save the MTP depth under the released layer names, with per-expert
-        weights and its own embedding and head copies, then load the training model.
-        Expectation: Every MTP parameter is loaded and the copies are not.
+        weights and its own embedding and head copies, load the training model and save it.
+        Expectation: Every MTP parameter is loaded and the copies are not; the saved
+        checkpoint has the released architecture and weight names.
         """
         config = _tiny_config()
         torch.manual_seed(3)
-        source = DeepseekV32TrainingForCausalLM(config).float()
+        source = DeepseekV32ForCausalLM(config).float()
         layer = config.num_hidden_layers
         state = {}
         for name, tensor in source.state_dict().items():
@@ -202,14 +205,22 @@ class TestDeepseekV32MultiTokenPrediction(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config.save_pretrained(directory)
             save_file(state, f"{directory}/model.safetensors")
-            loaded, info = DeepseekV32TrainingForCausalLM.from_pretrained(
+            loaded, info = DeepseekV32ForCausalLM.from_pretrained(
                 directory, torch_dtype=torch.float32, output_loading_info=True,
             )
+            loaded.save_pretrained(f"{directory}/export")
+            with open(f"{directory}/export/config.json", encoding="utf-8") as handle:
+                architectures = json.load(handle)["architectures"]
+            with safe_open(f"{directory}/export/model.safetensors", "pt") as handle:
+                exported = set(handle.keys())
         self.assertEqual(info["missing_keys"], set())
         expected = source.state_dict()
         for name, tensor in loaded.state_dict().items():
             if name.startswith("mtp.") or name.startswith("model.embed_tokens"):
                 torch.testing.assert_close(tensor, expected[name], msg=name)
+        self.assertEqual(architectures, ["DeepseekV32ForCausalLM"])
+        copies = {f"model.layers.{layer}.embed_tokens.weight", f"model.layers.{layer}.shared_head.head.weight"}
+        self.assertEqual(exported, set(state) - copies)
 
 
 class TestDeepseekV32IndexerOptions(unittest.TestCase):
