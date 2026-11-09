@@ -28,14 +28,16 @@ from hyper_parallel.components.checkpoint.weight_conversion import WeightConvert
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import aggregate_hidden, aux_loss_auto_scale
+from hyper_parallel.components.functional import aux_loss_auto_scale
 from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
-from hyper_parallel.components.functional import (
-    dsa_indexer,
-    dsa_kl_loss,
-    dsa_sparse_attention,
-    dsa_sparse_attention_rescale,
-)
+# Exports that share their submodule's name come from the submodule: once that
+# submodule is imported elsewhere first (the DeepSeek-V3.2 CP wrapper does), the
+# package attribute of that name is the module object, not the function.
+from hyper_parallel.components.functional.aggregate_hidden import aggregate_hidden
+from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
+from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
+from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
+from hyper_parallel.components.functional.dsa_sparse_attention_rescale import dsa_sparse_attention_rescale
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
 
 
