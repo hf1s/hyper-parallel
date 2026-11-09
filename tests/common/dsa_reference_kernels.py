@@ -29,6 +29,7 @@ calling it raises.
 from __future__ import annotations
 
 import contextlib
+import importlib.machinery
 import sys
 import types
 from collections.abc import Iterator
@@ -214,21 +215,28 @@ def rotary_mul(
     return tensor * cos + rotated * sin
 
 
+def _stub_module(name: str, *, is_package: bool = False) -> types.ModuleType:
+    """Return an empty stand-in whose spec satisfies ``importlib.util.find_spec`` probes."""
+    module = types.ModuleType(name)
+    module.__spec__ = importlib.machinery.ModuleSpec(name, None, is_package=is_package)
+    return module
+
+
 def _stub_modules() -> dict[str, types.ModuleType]:
     """Build import stand-ins exposing only what the DSA path calls."""
-    torch_npu = types.ModuleType("torch_npu")
+    torch_npu = _stub_module("torch_npu")
     torch_npu.npu_rotary_mul = rotary_mul
     torch_npu.npu_sparse_flash_attention = sparse_flash_attention
     torch_npu.npu_sparse_lightning_indexer_grad_kl_loss = _unsupported_indexer_loss
-    ops = types.ModuleType("cann_ops_transformer.ops")
+    ops = _stub_module("cann_ops_transformer.ops")
     ops.lightning_indexer = lightning_indexer
     ops.lightning_indexer_metadata = lightning_indexer_metadata
     ops.sparse_flash_attention_grad = sparse_flash_attention_grad
-    cann_ops_transformer = types.ModuleType("cann_ops_transformer")
+    cann_ops_transformer = _stub_module("cann_ops_transformer", is_package=True)
     cann_ops_transformer.ops = ops
     return {
         "torch_npu": torch_npu,
-        "omni_training_custom_ops": types.ModuleType("omni_training_custom_ops"),
+        "omni_training_custom_ops": _stub_module("omni_training_custom_ops"),
         "cann_ops_transformer": cann_ops_transformer,
         "cann_ops_transformer.ops": ops,
     }
@@ -291,9 +299,10 @@ def reference_dsa_kernels() -> Iterator[None]:
     ``torch_npu``, custom-operator and ``cann_ops_transformer`` modules, so a
     stand-in left behind by another test cannot leak into them. The CANN
     wrappers import their operators when called, so the stand-ins stay in
-    ``sys.modules`` until the context exits. On exit every module that
-    captured a stand-in is evicted and the previous modules and lazily cached
-    package symbols are restored.
+    ``sys.modules`` until the context exits; their module specs keep
+    dependency probes such as ``importlib.util.find_spec`` working meanwhile.
+    On exit every module that captured a stand-in is evicted and the previous
+    modules and lazily cached package symbols are restored.
     """
     previous_modules = dict(sys.modules)
     previous_packages = {
