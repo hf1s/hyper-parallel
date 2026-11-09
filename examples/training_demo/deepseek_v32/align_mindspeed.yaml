@@ -1,0 +1,242 @@
+# DeepSeek-V3.2 与 MindSpeed-LLM 预训练做 loss 对比的配置。
+#
+# 训练语义对应 MindSpeed-LLM examples/mcore/deepseek32/pretrain_deepseek32_671b_4k_A3_ptd.sh：
+#   DSA：index_topk 1024，indexer KL 系数 1.0，indexer q/k 打分前做 Hadamard 旋转；
+#   MoE：sigmoid 分组路由，序列级负载均衡 loss 1e-4，专家 bias 每步按负载 ±1e-3；
+#   MTP：1 层，loss 系数 0.3；
+#   优化器：AdamW lr 1e-5，cosine 衰减到 1e-7，无 warmup，weight decay 0.01，
+#     betas (0.9, 0.999)，梯度裁剪 1.0；RMSNorm 权重保持 FP32（对应 --init-norm-weight-in-fp32）；
+#   数据：两边读同一份 Megatron .bin/.idx，seed 1234、split 100,0,0、seq_length 4096，
+#     每个 4096 窗口是一条完整的因果序列（不按文档隔离，对应未开 --reset-attention-mask）。
+# 两边需要一致的设置、MindSpeed 侧命令和日志指标的对应关系见同目录 README 的对齐小节。
+#
+# 拓扑与完整配方相同（512 卡，ep 64 × edp 8）；并行方式不改变计算语义，可以按机器调整。
+
+model:
+  _target_: hyper_parallel.models.deepseek_v32.modeling_deepseek_v32.build_model
+  # 官方 FP8 权重反量化后的 BF16 Hugging Face 目录，MindSpeed 侧转换同一份。
+  pretrained_model_name_or_path: /path/to/DeepSeek-V3.2-bf16
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  config_overrides:
+    index_topk: 1024
+  mtp_loss_scaling_factor: 0.3
+  moe_aux_loss_coeff: 1.0e-4
+  moe_router_enable_expert_bias: true
+  moe_router_bias_update_rate: 1.0e-3
+  dsa_loss_coeff: 1.0
+  index_rotate_activation: true
+
+model_init_dtype: float32
+
+training:
+  # 与 MindSpeed 的 --train-iters / --global-batch-size 保持一致：样本顺序由总样本数决定。
+  train_iters: 2000
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 7680
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 1234
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 64
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 512
+  edp_shard_size: 4
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+    custom_params:
+      "*.input_layernorm.weight": {param_dtype: float32}
+      "*.post_attention_layernorm.weight": {param_dtype: float32}
+      model.norm.weight: {param_dtype: float32}
+      mtp.layers.*.enorm.weight: {param_dtype: float32}
+      mtp.layers.*.hnorm.weight: {param_dtype: float32}
+      mtp.layers.*.post_norm.weight: {param_dtype: float32}
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match: mtp.layers.*.eh_proj
+    params:
+      weight: {tp: replicate}
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - model.norm
+      - "mtp.layers.*.enorm"
+      - "mtp.layers.*.hnorm"
+      - "mtp.layers.*.post_norm"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+  - match: "*.mlp.experts"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+        dense_warmup: false
+  - match: "model.layers.[3-9].mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        router_fn: topk_router_module
+        use_grouped_gemm: true
+        overlap_shared_expert: true
+  - match: "model.layers.[1-9][0-9].mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        router_fn: topk_router_module
+        use_grouped_gemm: true
+        overlap_shared_expert: true
+  - match: "mtp.layers.*.mtp_block.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        router_fn: topk_router_module
+        use_grouped_gemm: true
+        overlap_shared_expert: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/DeepSeek-V3.2-bf16
+      tokenizer_type: pretokenized
+      vocab_size: 129280
+      eod_token_id: 1
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  # MindSpeed data_convert_deepseek32_pretrain.sh 输出的前缀（不带 .bin/.idx 后缀）。
+  data_path: /path/to/dataset/deepseek32_text_document
+  data_config:
+    seq_length: 4096
+    split: "100,0,0"
+    mock_data: false
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    data_lazy_load: true
+    skip_data_check: true
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_default_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    # 不配 runtime_input_adapter：每行是一条因果序列，与 MindSpeed 未开 --reset-attention-mask 一致。
+    attention_mode: compressed
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 0
+    min_lr: 1.0e-7
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/deepseek_v32_align/checkpoints
+  save_steps: 2000
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiler:
+  enable: false
+  start_step: 3
+  stop_step: 3
+  output_path: ./outputs/deepseek_v32_align/profiling
+  memory: false
+  with_stack: false
+  rank_ids: [0]

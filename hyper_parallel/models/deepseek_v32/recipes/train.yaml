@@ -28,7 +28,8 @@
 #     --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2
 #
 # 单卡裁剪示例（2 层、16 个路由专家、随机初始化）见
-# examples/training_demo/deepseek_v32/train_single_card.yaml。
+# examples/training_demo/deepseek_v32/train_single_card.yaml；与 MindSpeed-LLM 做精度对比的配置见
+# examples/training_demo/deepseek_v32/align_mindspeed.yaml。
 
 model:
   # 训练模型：在 Transformers 的 DeepSeek-V3.2 上加 MTP、MoE 负载均衡和 DSA indexer 训练，并绑定并行通信组。

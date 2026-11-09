@@ -5,7 +5,7 @@
 ## 支持模型
 
 - [x] Qwen3-30B-A3B
-- [x] DeepSeek-V3.2（DSA + MoE；TP/CP/EP/FSDP 在 CPU/Gloo 上与单卡结果对齐，NPU 端到端未验证）
+- [x] DeepSeek-V3.2（DSA + MoE + MTP，含 indexer KL、序列级负载均衡 loss 与专家 bias 更新；TP/CP/EP/FSDP 在 CPU/Gloo 上与单卡结果对齐，NPU 端到端未验证）
 
 ## HyperShard
 
