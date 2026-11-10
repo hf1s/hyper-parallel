@@ -63,6 +63,23 @@ def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
     return () if getattr(model, "mtp", None) is None else ("mtp",)
 
 
+def bind_training_parallel_groups(model: Any, context: Any) -> None:
+    """Bind the CP and TP groups of the training objectives once the model is sharded.
+
+    The framework calls the external-state provider after planning with the run's
+    ``MeshContext``; DeepSeek-V3.2 owns no external state, so this returns None.
+
+    Args:
+        model: Sharded model before FSDP.
+        context: ``ExternalBuildContext`` of the build.
+    """
+    from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import (  # pylint: disable=C0415
+        bind_parallel_groups,
+    )
+
+    bind_parallel_groups(model, context.mesh_context)
+
+
 register_custom_model(
     "DeepseekV32ForCausalLM",
     "hyper_parallel.models.deepseek_v32.modeling_deepseek_v32",
@@ -75,6 +92,7 @@ DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     replacements=_load_replacements,
     materialization=register_rotary_materialization,
     context_parallel=_load_context_parallel,
+    external_state=bind_training_parallel_groups,
     sharding_rules=build_parameter_sharding_rules,
     fsdp_wrap_modules=get_fsdp_wrap_modules,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,

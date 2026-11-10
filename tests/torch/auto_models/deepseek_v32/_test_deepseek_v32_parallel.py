@@ -174,10 +174,10 @@ def _build_parallel_model(reference, config):
     from hyper_parallel.distributed.apply import apply_sharding_plan
     from hyper_parallel.models._transformers.model_builder import (
         _apply_fsdp2_with_external,
+        _create_external_state,
         _maybe_apply_module_replacements,
         instantiate_infrastructure,
     )
-    from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import bind_parallel_groups
     from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
     from hyper_parallel.trainer.runtime.distributed import create_distributed_setup_from_config
 
@@ -201,8 +201,11 @@ def _build_parallel_model(reference, config):
         sequence_parallel=False, loss_parallel=mesh.loss_parallel,
     )
     model, source_shard_info = apply_sharding_plan(model, plan, mesh)
-    model = _apply_fsdp2_with_external(model, fsdp_manager, source_shard_info, None)
-    bind_parallel_groups(model, mesh)
+    # The adapter binds the CP/TP groups of the training objectives at this build stage.
+    external = _create_external_state(
+        model, mesh, source_shard_info, None, False, None, False, False, setup, fsdp_manager,
+    )
+    model = _apply_fsdp2_with_external(model, fsdp_manager, source_shard_info, external)
     return model, mesh, source_shard_info or {}
 
 

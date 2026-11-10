@@ -20,7 +20,7 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 
-from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import build_model
+from hyper_parallel.models import HyperAutoModelForCausalLM
 
 # ``DeepseekV32Config.__post_init__`` derives these per-layer lists from the
 # layer count and ``first_k_dense_replace``. Copying the released 61-entry
@@ -119,10 +119,10 @@ def build_cropped_deepseek_v32(
         n_routed_experts: Routed experts per MoE layer.
         num_nextn_predict_layers: MTP depth; 0 disables MTP.
         local_files_only: Disable implicit Hub downloads when true.
-        **build_kwargs: Model build options, both those set in YAML
-            (``torch_dtype``, ``attn_implementation``, ``validate_placement``,
-            training objectives) and those the Trainer injects
-            (``distributed_setup``, ``activation_checkpoint``, ...).
+        **build_kwargs: ``HyperAutoModelForCausalLM.from_config`` options, both
+            those set in YAML (``torch_dtype``, ``attn_implementation``,
+            ``validate_placement``, training objectives) and those the Trainer
+            injects (``distributed_setup``, ``activation_checkpoint``, ...).
 
     Returns:
         A parallelized, randomly initialized cropped DeepSeek-V3.2 model.
@@ -135,4 +135,4 @@ def build_cropped_deepseek_v32(
         num_nextn_predict_layers=num_nextn_predict_layers,
         local_files_only=local_files_only,
     )
-    return build_model(config=config, **build_kwargs)
+    return HyperAutoModelForCausalLM.from_config(config, **build_kwargs)

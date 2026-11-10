@@ -59,7 +59,6 @@ __all__ = [
     "DeepseekV32ForCausalLM",
     "DeepseekV32TrainingOutput",
     "bind_parallel_groups",
-    "build_model",
 ]
 
 
@@ -88,7 +87,7 @@ class DeepseekV32Router(DeepseekV32TopkRouter):
         self.aux_loss_coeff = float(aux_loss_coeff)
         self.enable_expert_bias = bool(enable_expert_bias)
         self.expert_bias_update_rate = float(expert_bias_update_rate)
-        # Context-parallel group over which one sequence is split; bound by build_model.
+        # Context-parallel group over which one sequence is split; bound after sharding.
         self.sequence_partition_group = None
         # TP ranks that compute this same loss and whose gradients the Trainer sums.
         self.aux_loss_tp_replicas = 1
@@ -268,7 +267,7 @@ class DeepseekV32ForCausalLM(TransformersDeepseekV32ForCausalLM):
         for module in list(self.modules()):
             if isinstance(module, DeepseekV32MoE):
                 module.gate = DeepseekV32Router.from_router(module.gate, config, **router_options)
-        # Context-parallel group of the trunk sequence; bound by build_model.
+        # Context-parallel group of the trunk sequence; bound after sharding.
         self.sequence_group = None
         self._pre_norm_capture: Optional[tuple[nn.Module, Any]] = None
         self._pre_norm_hidden: Optional[torch.Tensor] = None
@@ -421,26 +420,3 @@ def bind_parallel_groups(model: nn.Module, mesh: Any) -> None:
         elif hasattr(module, "kl_head_group"):
             module.kl_head_group = tp_group
             module.kl_loss_tp_replicas = tp_replicas
-
-
-def build_model(**options: Any) -> nn.Module:
-    """Build the DeepSeek-V3.2 training model and bind its parallel groups.
-
-    Args:
-        **options: ``pretrained_model_name_or_path`` loads a checkpoint; otherwise
-            ``config`` builds from a configuration. The remaining options go to
-            ``HyperAutoModelForCausalLM`` and, for the training options of
-            :class:`DeepseekV32ForCausalLM`, to the model constructor.
-
-    Returns:
-        The constructed and parallelized model.
-    """
-    from hyper_parallel.models import HyperAutoModelForCausalLM  # pylint: disable=C0415
-
-    pretrained = options.pop("pretrained_model_name_or_path", None)
-    if pretrained is not None:
-        model = HyperAutoModelForCausalLM.from_pretrained(pretrained, **options)
-    else:
-        model = HyperAutoModelForCausalLM.from_config(options.pop("config"), **options)
-    bind_parallel_groups(model, getattr(options.get("distributed_setup"), "mesh_context", None))
-    return model

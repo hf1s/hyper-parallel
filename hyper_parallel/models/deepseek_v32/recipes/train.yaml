@@ -32,8 +32,9 @@
 # examples/training_demo/deepseek_v32/align_mindspeed.yaml。
 
 model:
-  # 训练模型：在 Transformers 的 DeepSeek-V3.2 上加 MTP、MoE 负载均衡和 DSA indexer 训练，并绑定并行通信组。
-  _target_: hyper_parallel.models.deepseek_v32.modeling_deepseek_v32.build_model
+  # DeepSeek-V3.2 注册了训练模型（MTP、MoE 负载均衡、DSA indexer 训练），框架入口直接构建它；
+  # 随机初始化可改用 from_config 并传入 config。
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
   torch_dtype: bfloat16
   # DSA 替换不读取稠密 mask；sdpa 让 Transformers 只构建 bool 因果 mask。

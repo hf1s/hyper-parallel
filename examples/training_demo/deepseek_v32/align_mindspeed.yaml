@@ -15,7 +15,7 @@
 # 拓扑与完整配方相同（512 卡，ep 64 × edp 8）；并行方式不改变计算语义，可以按机器调整。
 
 model:
-  _target_: hyper_parallel.models.deepseek_v32.modeling_deepseek_v32.build_model
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
   # 官方 FP8 权重反量化后的 BF16 Hugging Face 目录，MindSpeed 侧转换同一份。
   pretrained_model_name_or_path: /path/to/DeepSeek-V3.2-bf16
   torch_dtype: bfloat16
