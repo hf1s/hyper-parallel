@@ -1,14 +1,15 @@
 # DeepSeek-V3.2 与 MindSpeed-LLM 预训练做 loss 对比的配置。
 #
 # 训练语义对应 MindSpeed-LLM examples/mcore/deepseek32/pretrain_deepseek32_671b_4k_A3_ptd.sh：
-#   DSA：index_topk 1024，indexer KL 系数 1.0，indexer q/k 打分前做 Hadamard 旋转；
+#   DSA：index_topk 1024，indexer KL 系数 1.0；
 #   MoE：sigmoid 分组路由，序列级负载均衡 loss 1e-4，专家 bias 每步按负载 ±1e-3；
-#   MTP：1 层，loss 系数 0.3；
 #   优化器：AdamW lr 1e-5，cosine 衰减到 1e-7，无 warmup，weight decay 0.01，
 #     betas (0.9, 0.999)，梯度裁剪 1.0；层间 RMSNorm 权重保持 FP32（对应 --init-norm-weight-in-fp32，
 #     DSA 内部的 q_a/kv_a/k_norm 仍为 BF16）；
 #   数据：两边读同一份 Megatron .bin/.idx，seed 1234、split 100,0,0、seq_length 4096，
 #     每个 4096 窗口是一条完整的因果序列（不按文档隔离，对应未开 --reset-attention-mask）。
+# 本配置不训练 MTP：MindSpeed 侧去掉 --mtp-num-layers 与 --mtp-loss-scaling-factor。
+# MindSpeed 在 indexer 打分前对 q/k 做 Hadamard 旋转；正交变换不改变打分，两边只差 BF16 舍入。
 # 两边需要一致的设置（权重与数据转换、确定性开关）和日志指标的对应关系见
 # examples/training_demo/README.md 的 MindSpeed-LLM 对比小节。
 #
@@ -22,12 +23,6 @@ model:
   attn_implementation: sdpa
   config_overrides:
     index_topk: 1024
-  mtp_loss_scaling_factor: 0.3
-  moe_aux_loss_coeff: 1.0e-4
-  moe_router_enable_expert_bias: true
-  moe_router_bias_update_rate: 1.0e-3
-  dsa_loss_coeff: 1.0
-  index_rotate_activation: true
 
 model_init_dtype: float32
 
@@ -65,9 +60,6 @@ fsdp_config:
       "*.input_layernorm.weight": {param_dtype: float32}
       "*.post_attention_layernorm.weight": {param_dtype: float32}
       model.norm.weight: {param_dtype: float32}
-      mtp.layers.*.enorm.weight: {param_dtype: float32}
-      mtp.layers.*.hnorm.weight: {param_dtype: float32}
-      mtp.layers.*.post_norm.weight: {param_dtype: float32}
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
@@ -76,16 +68,10 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  - match: mtp.layers.*.eh_proj
-    params:
-      weight: {tp: replicate}
   - match:
       - "*.input_layernorm"
       - "*.post_attention_layernorm"
       - model.norm
-      - "mtp.layers.*.enorm"
-      - "mtp.layers.*.hnorm"
-      - "mtp.layers.*.post_norm"
     replace:
       kind: module
       implementation:
@@ -97,6 +83,16 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+        dsa_loss_coeff: 1.0
+  - match: "*.mlp.gate"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_router
+        aux_loss_coeff: 1.0e-4
+        enable_expert_bias: true
+        expert_bias_update_rate: 1.0e-3
   - match: "*.mlp.experts"
     replace:
       kind: module
@@ -119,14 +115,6 @@ plan_overrides:
         use_grouped_gemm: true
         overlap_shared_expert: true
   - match: "model.layers.[1-9][0-9].mlp.forward"
-    when: ep
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.expert_parallel.deepseek_v32_ep_compute_fn
-        use_grouped_gemm: true
-        overlap_shared_expert: true
-  - match: "mtp.layers.*.mtp_block.mlp.forward"
     when: ep
     replace:
       kind: method

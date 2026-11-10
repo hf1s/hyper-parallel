@@ -9,28 +9,25 @@
 # TokenBatchLoader 把多个文档拼成 4096 token 的行，文档边界由 DeepseekV32PackedSequence
 # 传给 DSA。单卡没有 TP/CP/EP，所以不带 `when: cp` / `when: ep` 条目。
 #
-# 启动（只需要官方目录里的 config.json 和 tokenizer 文件，不需要权重）：
-#   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2
+# 启动（只读取官方目录里的 config.json 和 tokenizer 文件，不需要权重）：
+#   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2 /path/to/train.jsonl
 
 model:
-  _target_: examples.training_demo.deepseek_v32.cropped_deepseek_v32.build_cropped_deepseek_v32
-  config_path: /path/to/DeepSeek-V3.2
-  num_hidden_layers: 2
-  first_k_dense_replace: 1
-  n_routed_experts: 16
-  # MTP 层（DSA + 16 专家 MoE + 融合投影）再加约 1B 参数，单卡显存放不下，这里关闭。
-  num_nextn_predict_layers: 0
-  local_files_only: true
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: /path/to/DeepSeek-V3.2
+    local_files_only: true
+    num_hidden_layers: 2
+    first_k_dense_replace: 1
+    n_routed_experts: 16
+    # Transformers 按读入时的 61 层推导逐层类型，覆盖层数后不会重新推导，因此一并给出。
+    mlp_layer_types: [dense, sparse]
+    layer_types: [indexed_attention, indexed_attention]
   torch_dtype: bfloat16
   # DSA 替换不读取稠密 mask；sdpa 让 Transformers 只构建 bool 因果 mask。
   attn_implementation: sdpa
   validate_placement: false
-  # 训练目标与完整配方相同：序列级负载均衡 loss、专家 bias 更新、indexer KL loss。
-  moe_aux_loss_coeff: 1.0e-4
-  moe_router_enable_expert_bias: true
-  moe_router_bias_update_rate: 1.0e-3
-  dsa_loss_coeff: 1.0
-  index_rotate_activation: true
 
 model_init_dtype: float32
 
@@ -86,6 +83,16 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+        dsa_loss_coeff: 1.0
+  - match: "*.mlp.gate"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_router
+        aux_loss_coeff: 1.0e-4
+        enable_expert_bias: true
+        expert_bias_update_rate: 1.0e-3
   - match: "*.mlp.experts"
     replace:
       kind: module
@@ -116,9 +123,8 @@ dataset:
     text_keys: text
     max_seq_len: 4096
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  # run_single_card.sh 缺省时用 prepare_single_card_data.py 生成：每条记录切成两个完整
-  # 4096 窗口（单文档，超过 index_topk=2048，走稀疏选择）和一个短尾巴（多条尾巴拼成一行）。
-  data_path: ./output/training_demo/deepseek_v32/single_card.jsonl
+  # 由 run_single_card.sh 的第二个参数传入：每行一个 JSON，正文在 text 字段。
+  data_path: /path/to/train.jsonl
   data_config:
     labels_are_shifted: true
     create_ltor_fields_in_dataloader: false
@@ -160,8 +166,8 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_config:
     lr: 1.0e-5
-    lr_warmup_steps: 0
-    min_lr: 1.0e-7
+    lr_warmup_steps: 1
+    min_lr: 0.0
 
 checkpoint:
   save_ckpt: false

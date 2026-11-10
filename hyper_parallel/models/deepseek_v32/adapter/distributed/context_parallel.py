@@ -215,9 +215,6 @@ def _run_cp_dsa_kernels(
     absorbed_query, kv_nope, q_rot, k_rot = attention_states
     actual_q_len, actual_kv_len = sequence_lengths
     if use_dense:
-        check_dense_indexer_loss = getattr(module, "check_dense_indexer_loss", None)
-        if check_dense_indexer_loss is not None:
-            check_dense_indexer_loss()
         return _deepseek_v32_dense_attention(module, index_states, attention_states, sequence_lengths)
 
     topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(  # pylint: disable=not-callable

@@ -14,17 +14,17 @@
 # ============================================================================
 """CPU/Gloo DeepSeek-V3.2 TP/CP/EP/FSDP parity against a single-process reference.
 
-Each case builds one small DeepSeek-V3.2 training model with fixed weights,
-one MTP depth and the sequence-wise balance loss, converts a copy through the
-Trainer chain (recipe ``plan_overrides`` -> module replacement ->
-``ShardingPlanner`` -> ``apply_sharding_plan`` -> FSDP2) and runs one
+Each case builds one small DeepSeek-V3.2 model with fixed weights and the
+training router (sequence-wise balance loss and expert-load counts), converts a
+copy through the Trainer chain (recipe ``plan_overrides`` -> module replacement
+-> ``ShardingPlanner`` -> ``apply_sharding_plan`` -> FSDP2) and runs one
 forward/backward on the same tokens. DSA runs the NPU sparse-attention
 replacement on the CPU reference kernels of ``tests.common.dsa_reference_kernels``;
 the NPU-only RMSNorm and grouped-expert kernels stay native.
 
 FSDP2 owns the Trainer's gradient reduction (SUM over the DP x CP domain and
 over TP replicas, scaled by 1 / (dp * cp * (1 if loss_parallel else tp))), so
-the raw losses are backpropagated and every gradient must equal the
+the raw loss is backpropagated and every gradient must equal the
 single-process gradient. Expert loads summed over the DP x CP domain must equal
 the single-process loads.
 """
@@ -80,7 +80,7 @@ class _GlooAllGather(torch.autograd.Function):
 
 
 def _config() -> DeepseekV32Config:
-    """Return one dense layer followed by two MoE layers and one MoE MTP depth."""
+    """Return one dense layer followed by two MoE layers."""
     config = DeepseekV32Config.from_dict({
         "vocab_size": 128, "hidden_size": 64, "intermediate_size": 96, "moe_intermediate_size": 32,
         "num_hidden_layers": 3, "first_k_dense_replace": 1, "num_attention_heads": 4,
@@ -89,22 +89,30 @@ def _config() -> DeepseekV32Config:
         "qk_rope_head_dim": 8, "v_head_dim": 16, "qk_nope_head_dim": 16, "index_topk": 6,
         "index_head_dim": 16, "index_n_heads": 4, "max_position_embeddings": 64,
         "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0}, "attn_implementation": "sdpa",
-        "num_nextn_predict_layers": 1,
     })
     config.architectures = ["DeepseekV32ForCausalLM"]
     return config
 
 
+_ROUTER_OPTIONS = {"aux_loss_coeff": 0.1, "enable_expert_bias": True}
+
+
 def _reference_model():
-    """Build the unsharded training model with nonzero expert-selection biases."""
-    from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import (  # pylint: disable=import-outside-toplevel
-        DeepseekV32ForCausalLM,
+    """Build the unsharded model with training routers and nonzero expert-selection biases."""
+    # pylint: disable=import-outside-toplevel
+    from transformers import DeepseekV32ForCausalLM
+
+    from hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement import (
+        replace_deepseek_v32_router,
     )
 
     torch.manual_seed(7)
-    model = DeepseekV32ForCausalLM(
-        _config(), moe_aux_loss_coeff=0.1, moe_router_enable_expert_bias=True,
-    ).float().train()
+    model = DeepseekV32ForCausalLM(_config()).float().train()
+    for layer in model.model.layers:
+        if hasattr(layer.mlp, "gate"):
+            layer.mlp.gate = replace_deepseek_v32_router(
+                module=layer.mlp.gate, module_fqn="", context={}, **_ROUTER_OPTIONS,
+            )
     with torch.no_grad():
         for name, buffer in model.named_buffers():
             if name.endswith("e_score_correction_bias"):
@@ -113,13 +121,19 @@ def _reference_model():
 
 
 def _plan_overrides() -> list:
-    """Return the recipe's DSA, MTP, CP and EP entries; NPU-only norm and expert kernels stay native."""
+    """Return the recipe's DSA, router, CP and EP entries; NPU-only norm and expert kernels stay native."""
     return [
-        {"match": "mtp.layers.*.eh_proj", "params": {"weight": {"tp": "replicate"}}},
         {
             "match": "*.self_attn",
             "replace": {"kind": "module", "implementation": {
                 "_target_": f"{_ADAPTER}.conversion.module_replacement.replace_deepseek_v32_dsa_attention",
+            }},
+        },
+        {
+            "match": "*.mlp.gate",
+            "replace": {"kind": "module", "implementation": {
+                "_target_": f"{_ADAPTER}.conversion.module_replacement.replace_deepseek_v32_router",
+                **_ROUTER_OPTIONS,
             }},
         },
         {
@@ -130,13 +144,6 @@ def _plan_overrides() -> list:
         },
         {
             "match": "model.layers.[1-9].mlp.forward", "when": "ep",
-            "replace": {"kind": "method", "implementation": {
-                "_target_": f"{_ADAPTER}.distributed.expert_parallel.deepseek_v32_ep_compute_fn",
-                "overlap_shared_expert": True,
-            }},
-        },
-        {
-            "match": "mtp.layers.*.mtp_block.mlp.forward", "when": "ep",
             "replace": {"kind": "method", "implementation": {
                 "_target_": f"{_ADAPTER}.distributed.expert_parallel.deepseek_v32_ep_compute_fn",
                 "overlap_shared_expert": True,
@@ -188,9 +195,7 @@ def _build_parallel_model(reference, config):
     model, _ = _maybe_apply_module_replacements(
         model, None, setup, None, False, get_model_conversion_mapping(model)
     )
-    replaced_layers = [*model.model.layers, *(layer.mtp_block for layer in model.mtp.layers)]
-    source_layers = [*reference.model.layers, *(layer.mtp_block for layer in reference.mtp.layers)]
-    for replaced, source in zip(replaced_layers, source_layers):
+    for replaced, source in zip(model.model.layers, reference.model.layers):
         with torch.no_grad():
             replaced.self_attn.linear_qkv.weight.copy_(torch.cat([
                 source.self_attn.q_a_proj.weight, source.self_attn.kv_a_proj_with_mqa.weight,
@@ -247,7 +252,7 @@ def _block_diagonal_mask(boundaries):
 
 def _expert_loads(model):
     """Return each training router's routed-token counts by module name."""
-    from hyper_parallel.models.deepseek_v32.modeling_deepseek_v32 import (  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.models.deepseek_v32.adapter.router import (  # pylint: disable=import-outside-toplevel
         DeepseekV32Router,
     )
 
@@ -282,7 +287,7 @@ def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False, packed=False):
             reference_mask = {"attention_mask": _block_diagonal_mask(_PACKED_BOUNDARIES)} if packed else {}
             expected = reference(input_ids=inputs, labels=labels, shift_labels=labels,
                                  position_ids=positions, use_cache=False, **reference_mask)
-            sum(expected.loss.values()).backward()
+            expected.loss.backward()
 
             local = slice(mesh.cp_rank * _SEQ_LEN // cp, (mesh.cp_rank + 1) * _SEQ_LEN // cp)
             boundaries = {}
@@ -299,15 +304,12 @@ def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False, packed=False):
                     shift_labels=labels[:, local].contiguous(), position_ids=positions[:, local],
                     use_cache=False, **boundaries,
                 )
-                sum(output.loss.values()).backward()
+                output.loss.backward()
 
-            same_keys = set(output.loss) == set(expected.loss) == {"foundation_loss", "foundation_loss/mtp"}
-            assert same_keys, f"loss keys differ: {set(output.loss)} vs {set(expected.loss)}"
-            for key, value in output.loss.items():
-                loss = value.detach().reshape(()).clone()
-                if cp > 1:
-                    dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=mesh.device_mesh["cp"].get_group())
-                torch.testing.assert_close(loss, expected.loss[key].detach(), rtol=1e-5, atol=1e-6, msg=key)
+            loss = output.loss.detach().reshape(()).clone()
+            if cp > 1:
+                dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=mesh.device_mesh["cp"].get_group())
+            torch.testing.assert_close(loss, expected.loss.detach(), rtol=1e-5, atol=1e-6)
             compared = 0
             for name, grad, reference_grad in _compared_gradients(model, reference, source_shard_info):
                 torch.testing.assert_close(grad, reference_grad, rtol=1e-4, atol=1e-6, msg=name)

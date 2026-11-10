@@ -39,7 +39,6 @@ import torch
 _STUB_MODULES = ("torch_npu", "omni_training_custom_ops", "cann_ops_transformer", "cann_ops_transformer.ops")
 _DSA_MODULES = (
     "hyper_parallel.components.modules.dsa_attention",
-    "hyper_parallel.models.deepseek_v32.adapter.conversion.dsa_attention",
     "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel",
 )
 # Lazy export packages cache resolved symbols in their globals.
