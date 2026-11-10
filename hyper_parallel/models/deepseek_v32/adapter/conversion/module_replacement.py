@@ -42,10 +42,13 @@ def replace_deepseek_v32_dsa_attention(
     module_fqn: str,
     context: Mapping[str, Any],
 ) -> nn.Module:
-    """Replace DeepSeek-V3.2 MLA/indexer attention with the fused DSA module."""
-    from hyper_parallel.components.modules import DeepseekV32DSAAttention  # pylint: disable=C0415
+    """Replace DeepSeek-V3.2 MLA/indexer attention with the fused DSA module and its indexer training options."""
+    # pylint: disable=import-outside-toplevel
+    from hyper_parallel.models.deepseek_v32.adapter.conversion.dsa_attention import (
+        DeepseekV32TrainingDSAAttention,
+    )
 
-    return DeepseekV32DSAAttention(module=module, module_fqn=module_fqn, context=context)
+    return DeepseekV32TrainingDSAAttention(module=module, module_fqn=module_fqn, context=context)
 
 
 @module_replacement

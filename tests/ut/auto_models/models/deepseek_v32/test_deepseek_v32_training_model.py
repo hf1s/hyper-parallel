@@ -237,12 +237,15 @@ class TestDeepseekV32IndexerOptions(unittest.TestCase):
         """
         with reference_dsa_kernels():
             # pylint: disable=import-outside-toplevel,protected-access
-            from hyper_parallel.components.modules.dsa_attention import _hadamard_matrix, _rotate_activation
+            from hyper_parallel.models.deepseek_v32.adapter.conversion.dsa_attention import (
+                _hadamard_matrix,
+                rotate_activation,
+            )
 
             matrix = _hadamard_matrix(16, torch.float64, torch.device("cpu"))
             torch.testing.assert_close(matrix @ matrix.T, 16 * torch.eye(16, dtype=torch.float64))
             query, key = torch.randn(5, 3, 16, dtype=torch.float64), torch.randn(7, 16, dtype=torch.float64)
-            torch.testing.assert_close(_rotate_activation(query) @ _rotate_activation(key).T, query @ key.T)
+            torch.testing.assert_close(rotate_activation(query) @ rotate_activation(key).T, query @ key.T)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -255,9 +258,11 @@ class TestDeepseekV32IndexerOptions(unittest.TestCase):
         """
         with reference_dsa_kernels():
             # pylint: disable=import-outside-toplevel,protected-access
-            from hyper_parallel.components.modules.dsa_attention import DeepseekV32DSAAttention
+            from hyper_parallel.models.deepseek_v32.adapter.conversion.dsa_attention import (
+                DeepseekV32TrainingDSAAttention,
+            )
 
-            resolve = DeepseekV32DSAAttention._kl_head_group
+            resolve = DeepseekV32TrainingDSAAttention._kl_head_group
             self.assertIsNone(resolve(SimpleNamespace(num_heads=4, kl_head_group=None)))
             sharded = SimpleNamespace(num_heads=2, kl_head_group=None, _hp_full_head_counts={"num_heads": 4})
             with self.assertRaises(RuntimeError):
