@@ -128,8 +128,8 @@ plan_overrides:
         _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
         # null follows dsa_dense_warm_up; true/false forces one path for the full run.
         dense_warmup: null
-  # EP：DeepSeek-V3.2 的 router 与 DeepSeek-V3 相同，用框架内置的 V3 EP 工厂；
-  # router_fn 取训练 router 返回的专家与门控值，负载均衡 loss 挂在门控值上。
+  # EP：模型自己的 EP 工厂直接使用 router 返回的专家与门控值（负载均衡 loss 挂在门控值上），
+  # token 分发、专家计算与合并沿用框架通用的 EP 骨架。
   # 只匹配 MoE 层：first_k_dense_replace=3，层 0-2 为稠密 MLP，层 3-60 与 MTP 层为 MoE；
   # fnmatch 不支持数值区间，因此分两条 glob 覆盖 3-9 与 10-99。
   # 裁剪模型改变稠密层数时需要同步调整这两条 glob。
@@ -138,8 +138,7 @@ plan_overrides:
     replace:
       kind: method
       implementation:
-        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
-        router_fn: topk_router_module
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.expert_parallel.deepseek_v32_ep_compute_fn
         use_grouped_gemm: true
         overlap_shared_expert: true
   - match: "model.layers.[1-9][0-9].mlp.forward"
@@ -147,8 +146,7 @@ plan_overrides:
     replace:
       kind: method
       implementation:
-        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
-        router_fn: topk_router_module
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.expert_parallel.deepseek_v32_ep_compute_fn
         use_grouped_gemm: true
         overlap_shared_expert: true
   - match: "mtp.layers.*.mtp_block.mlp.forward"
@@ -156,8 +154,7 @@ plan_overrides:
     replace:
       kind: method
       implementation:
-        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
-        router_fn: topk_router_module
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.expert_parallel.deepseek_v32_ep_compute_fn
         use_grouped_gemm: true
         overlap_shared_expert: true
 

@@ -131,15 +131,15 @@ def _plan_overrides() -> list:
         {
             "match": "model.layers.[1-9].mlp.forward", "when": "ep",
             "replace": {"kind": "method", "implementation": {
-                "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-                "router_fn": "topk_router_module", "overlap_shared_expert": True,
+                "_target_": f"{_ADAPTER}.distributed.expert_parallel.deepseek_v32_ep_compute_fn",
+                "overlap_shared_expert": True,
             }},
         },
         {
             "match": "mtp.layers.*.mtp_block.mlp.forward", "when": "ep",
             "replace": {"kind": "method", "implementation": {
-                "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-                "router_fn": "topk_router_module", "overlap_shared_expert": True,
+                "_target_": f"{_ADAPTER}.distributed.expert_parallel.deepseek_v32_ep_compute_fn",
+                "overlap_shared_expert": True,
             }},
         },
     ]
