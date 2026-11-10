@@ -15,13 +15,12 @@
 """DeepSeek-V3.2 training router: sequence-wise balance loss and expert-bias update."""
 
 import unittest
-from unittest.mock import patch
 
 import torch
 from transformers import DeepseekV32Config
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32TopkRouter
 
-from hyper_parallel.models.deepseek_v32.adapter.aux_loss import DeepseekV32Router
+from hyper_parallel.models.deepseek_v32.adapter.conversion.router import DeepseekV32Router
 from tests.common.mark_utils import arg_mark
 
 
@@ -100,16 +99,18 @@ class TestDeepseekV32Router(unittest.TestCase):
     def test_expert_bias_update(self):
         """Feature: Loss-free expert-bias update.
 
-        Description: Count routed tokens in training, skip a recomputed forward, then update.
-        Expectation: Each bias moves by the rate toward the mean load and the counts reset.
+        Description: Route a microbatch twice in training, backpropagate one of the two
+        graphs as checkpoint recomputation does, then update.
+        Expectation: The loads count the microbatch once, each bias moves by the rate toward
+        the mean load and the counts reset.
         """
         config = _tiny_config()
         _, router = _router(config, enable_expert_bias=True)
         router.train()
         hidden = torch.randn(1, 5, config.hidden_size)
-        _, _, indices = router(hidden)
-        with patch("hyper_parallel.models.deepseek_v32.adapter.aux_loss.is_recomputing", return_value=True):
-            router(hidden)
+        router(hidden)
+        _, weights, indices = router(hidden)
+        weights.sum().backward()
         counts = torch.bincount(indices.reshape(-1), minlength=config.n_routed_experts)
         torch.testing.assert_close(router.tokens_per_expert, counts)
         before = router.e_score_correction_bias.clone()
