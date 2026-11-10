@@ -14,9 +14,10 @@
 # ============================================================================
 """DeepSeek-V3.2 training router: sequence-wise balance loss and expert-load counts.
 
-The Transformers router implements inference only. This router keeps its
-expert selection and checkpoint names and adds the Megatron-Core
-``seq_aux_loss`` and the counts of the loss-free expert-bias update.
+The Transformers router implements inference only: it selects the experts but
+neither trains their balance nor updates ``e_score_correction_bias``. This
+router runs the same forward and, in training, adds the Megatron-Core
+``seq_aux_loss`` and the expert loads of the loss-free bias update.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ from typing import Any, Optional
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32TopkRouter
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
@@ -87,39 +87,15 @@ class DeepseekV32Router(DeepseekV32TopkRouter):
         trained.train(router.training)
         return trained
 
-    def _select_experts(self, scores: torch.Tensor) -> torch.Tensor:
-        """Return the biased, group-limited top-k expert indices."""
-        scores_for_choice = scores + self.e_score_correction_bias
-        group_scores = (
-            scores_for_choice.view(-1, self.num_group, self.num_experts // self.num_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
-        )
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, self.num_group, self.num_experts // self.num_group)
-            .reshape(-1, self.num_experts)
-        )
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
-        return torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return router logits, gate values and expert indices for ``[B, S, H]`` tokens."""
         batch_size = hidden_states.shape[0] if hidden_states.ndim == 3 else 1
-        hidden_states = hidden_states.view(-1, self.hidden_dim)
-        router_logits = F.linear(  # pylint: disable=not-callable
-            hidden_states.type(torch.float32), self.weight.type(torch.float32))
-        scores = router_logits.sigmoid()
-        topk_indices = self._select_experts(scores)
-        topk_weights = scores.gather(1, topk_indices)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
+        router_logits, topk_weights, topk_indices = super().forward(hidden_states)
         if self.training:
             if self.aux_loss_coeff:
-                topk_weights = self._attach_balance_loss(topk_weights, scores, topk_indices, batch_size)
+                topk_weights = self._attach_balance_loss(
+                    topk_weights, router_logits.sigmoid(), topk_indices, batch_size,
+                )
             if self.enable_expert_bias and not is_recomputing():
                 counts = self.tokens_per_expert
                 counts.scatter_add_(0, topk_indices.reshape(-1),
