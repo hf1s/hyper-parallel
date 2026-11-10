@@ -21,7 +21,7 @@ import torch
 from transformers import DeepseekV32Config
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32TopkRouter
 
-from hyper_parallel.models.deepseek_v32.adapter.router import DeepseekV32Router
+from hyper_parallel.models.deepseek_v32.adapter.aux_loss import DeepseekV32Router
 from tests.common.mark_utils import arg_mark
 
 
@@ -108,7 +108,7 @@ class TestDeepseekV32Router(unittest.TestCase):
         router.train()
         hidden = torch.randn(1, 5, config.hidden_size)
         _, _, indices = router(hidden)
-        with patch("hyper_parallel.models.deepseek_v32.adapter.router.is_recomputing", return_value=True):
+        with patch("hyper_parallel.models.deepseek_v32.adapter.aux_loss.is_recomputing", return_value=True):
             router(hidden)
         counts = torch.bincount(indices.reshape(-1), minlength=config.n_routed_experts)
         torch.testing.assert_close(router.tokens_per_expert, counts)

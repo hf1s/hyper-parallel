@@ -77,7 +77,7 @@ def replace_deepseek_v32_router(
         expert_bias_update_rate: Bias step per optimizer step.
     """
     del module_fqn, context
-    from hyper_parallel.models.deepseek_v32.adapter.router import DeepseekV32Router  # pylint: disable=C0415
+    from hyper_parallel.models.deepseek_v32.adapter.aux_loss import DeepseekV32Router  # pylint: disable=C0415
 
     return DeepseekV32Router.from_router(
         module, aux_loss_coeff=aux_loss_coeff, enable_expert_bias=enable_expert_bias,

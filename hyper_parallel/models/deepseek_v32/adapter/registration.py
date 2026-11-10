@@ -54,7 +54,7 @@ def bind_training_parallel_groups(model: Any, context: Any) -> None:
         model: Sharded model before FSDP.
         context: ``ExternalBuildContext`` of the build.
     """
-    from hyper_parallel.models.deepseek_v32.adapter.router import (  # pylint: disable=C0415
+    from hyper_parallel.models.deepseek_v32.adapter.aux_loss import (  # pylint: disable=C0415
         bind_router_parallel_groups,
     )
 

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V3.2 training router: sequence-wise balance loss and expert-load counts.
+"""DeepSeek-V3.2 sequence balancing and expert loads of the bias update.
 
 The Transformers router implements inference only: it selects the experts but
-neither trains their balance nor updates ``e_score_correction_bias``. This
-router runs the same forward and, in training, adds the Megatron-Core
-``seq_aux_loss`` and the expert loads of the loss-free bias update.
+neither trains their balance nor updates ``e_score_correction_bias``. The
+training router defined here runs the same forward and, in training, adds the
+Megatron-Core ``seq_aux_loss`` and the expert loads of the loss-free bias update.
 """
 
 from __future__ import annotations

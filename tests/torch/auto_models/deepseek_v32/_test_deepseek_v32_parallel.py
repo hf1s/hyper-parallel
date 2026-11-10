@@ -252,7 +252,7 @@ def _block_diagonal_mask(boundaries):
 
 def _expert_loads(model):
     """Return each training router's routed-token counts by module name."""
-    from hyper_parallel.models.deepseek_v32.adapter.router import (  # pylint: disable=import-outside-toplevel
+    from hyper_parallel.models.deepseek_v32.adapter.aux_loss import (  # pylint: disable=import-outside-toplevel
         DeepseekV32Router,
     )
 
