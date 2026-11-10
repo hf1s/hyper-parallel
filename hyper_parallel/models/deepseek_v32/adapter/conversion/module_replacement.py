@@ -15,7 +15,7 @@
 """DeepSeek-V3.2 replacements backed by shared high-performance components."""
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Optional
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
@@ -41,11 +41,48 @@ def replace_deepseek_v32_dsa_attention(
     module: nn.Module,
     module_fqn: str,
     context: Mapping[str, Any],
+    dsa_loss_coeff: Optional[float] = None,
 ) -> nn.Module:
-    """Replace DeepSeek-V3.2 MLA/indexer attention with the fused DSA module."""
+    """Replace DeepSeek-V3.2 MLA/indexer attention with the fused DSA module.
+
+    ``dsa_loss_coeff`` sets the weight of the indexer KL loss; ``None`` keeps
+    the configuration's value, which the released configuration does not set.
+    """
     from hyper_parallel.components.modules import DeepseekV32DSAAttention  # pylint: disable=C0415
 
-    return DeepseekV32DSAAttention(module=module, module_fqn=module_fqn, context=context)
+    attention = DeepseekV32DSAAttention(module=module, module_fqn=module_fqn, context=context)
+    if dsa_loss_coeff is not None:
+        attention.dsa_loss_coeff = float(dsa_loss_coeff)
+    return attention
+
+
+@module_replacement
+def replace_deepseek_v32_router(
+    *,
+    module: nn.Module,
+    module_fqn: str,
+    context: Mapping[str, Any],
+    aux_loss_coeff: float = 0.0,
+    enable_expert_bias: bool = False,
+    expert_bias_update_rate: float = 1e-3,
+) -> nn.Module:
+    """Replace the MoE router with the training router, sharing its weight and bias.
+
+    Args:
+        module: Transformers ``DeepseekV32TopkRouter``.
+        module_fqn: Unused.
+        context: Unused.
+        aux_loss_coeff: Weight of the sequence-wise balance loss; 0 disables it.
+        enable_expert_bias: Whether the selection bias follows the routed load.
+        expert_bias_update_rate: Bias step per optimizer step.
+    """
+    del module_fqn, context
+    from hyper_parallel.models.deepseek_v32.adapter.conversion.router import DeepseekV32Router  # pylint: disable=C0415
+
+    return DeepseekV32Router.from_router(
+        module, aux_loss_coeff=aux_loss_coeff, enable_expert_bias=enable_expert_bias,
+        expert_bias_update_rate=expert_bias_update_rate,
+    )
 
 
 @module_replacement
@@ -71,4 +108,5 @@ __all__ = [
     "replace_deepseek_v32_dsa_attention",
     "replace_deepseek_v32_grouped_experts",
     "replace_deepseek_v32_rms_norm",
+    "replace_deepseek_v32_router",
 ]

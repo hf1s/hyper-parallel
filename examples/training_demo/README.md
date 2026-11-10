@@ -5,6 +5,7 @@ recipes, data preparation, launchers, and validation manifests are grouped by
 family:
 
 - `qwen3_moe/`: cropped and full-model Qwen3-MoE text demos;
+- `deepseek_v32/`: single-card cropped DeepSeek-V3.2 text demo;
 - `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling.
 
 ## Qwen3-MoE cropped Hugging Face demos
@@ -112,6 +113,91 @@ model/tokenizer loading into `local_files_only` mode. The Offline launcher also
 validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
+
+## DeepSeek-V3.2 single-card crop
+
+The [single-card configuration](deepseek_v32/train_single_card.yaml) builds
+DeepSeek-V3.2 with `HyperAutoModelForCausalLM.from_config` and random weights.
+It keeps the released hidden, MLA, indexer, and vocabulary dimensions and crops
+the model to two decoder layers (one dense, one MoE) and 16 routed experts, the
+fewest that keep the released group routing (`n_group=8`, `topk_group=4`,
+top-8). The per-layer type lists are given with the layer count because
+Transformers derives them from the released 61 layers before the override. The
+model has 3.40B parameters; FP32 parameters, FP32 gradients and the two FP32
+AdamW moments take about 51 GiB before activations (estimated, not measured),
+which targets one 64 GB device such as 910B3.
+
+Module replacements, the training router (sequence-wise balance loss and
+expert-bias update) and the indexer KL weight match the full
+[recipe](../../hyper_parallel/models/deepseek_v32/recipes/train.yaml). Unlike its
+one-line-per-row default data, this example packs documents into 4096-token rows,
+and DSA reads their boundaries from `DeepseekV32PackedSequence` rather than a
+dense mask. DSA runs on the CANN backend, so load the CANN and ops-transformer
+environment described in the
+[functional README](../../hyper_parallel/components/functional/README.md#deepseek-v32-dsa)
+before launching. Only `config.json` and the tokenizer files of the official
+checkpoint directory are read; the data is a text JSONL with a `text` field:
+
+```bash
+bash examples/training_demo/deepseek_v32/run_single_card.sh \
+    /path/to/DeepSeek-V3.2 /path/to/text/train.jsonl
+```
+
+The indexer keeps every key of a document shorter than `index_topk` (2048), so
+its top-k selection only takes effect on longer documents. The Online dataset
+holds `train_iters × global_batch_size` records, so a JSONL whose records are
+much shorter than 4096 tokens packs several records into each step and can run
+out before `train_iters`. The log is written to
+`output/training_demo/deepseek_v32/run_single_card.log`.
+
+## DeepSeek-V3.2 loss comparison with MindSpeed-LLM
+
+[`align_mindspeed.yaml`](../../hyper_parallel/models/deepseek_v32/recipes/align_mindspeed.yaml)
+trains the same objectives as MindSpeed-LLM
+`examples/mcore/deepseek32/pretrain_deepseek32_671b_4k_A3_ptd.sh` except MTP:
+indexer top-k 1024 with KL weight 1.0, the sequence-wise balance loss (1e-4),
+the expert-bias update (1e-3 per step), AdamW at 1e-5 with cosine decay to 1e-7
+and no warmup, and FP32 RMSNorm weights. Remove `--mtp-num-layers` and
+`--mtp-loss-scaling-factor` from the MindSpeed script. MindSpeed rotates the
+indexer query and key with a Hadamard matrix before scoring; the rotation is
+orthogonal, so the scores differ only by BF16 rounding. Both sides must start
+from the same weights and read the same samples:
+
+1. Dequantize the released FP8 checkpoint to BF16 once (for example with
+   DeepSeek's `inference/fp8_cast_bf16.py`). HyperParallel loads this directory;
+   MindSpeed converts it with `ckpt_convert_deepseek32_hf2mcore.sh`, whose
+   converter does not dequantize FP8. Convert to the training script's layout
+   (`--target-tensor-parallel-size 4 --target-pipeline-parallel-size 8
+   --target-expert-parallel-size 64 --num-layers-per-virtual-pipeline-stage 2
+   --noop-layers 7,62,63`); the shipped conversion script uses TP 1 and
+   `--noop-layers 61,62,63`, which do not match it.
+2. Build the Megatron `.bin/.idx` dataset with MindSpeed's
+   `data_convert_deepseek32_pretrain.sh` and point both sides at its prefix.
+   Both sides derive the document, sample and shuffle indices from the seed
+   (MindSpeed default 1234), the split (`--split 100,0,0`), `--seq-length 4096`
+   and the sample count (`--train-iters` × `--global-batch-size`), so keep them
+   equal; compare the first step's `lm loss` before a long run. Neither side
+   isolates documents inside a 4096-token window.
+3. Keep MindSpeed's other model and optimizer flags from its script and enable
+   its deterministic mode (`--npu-deterministic` and `HCCL_DETERMINISTIC=true`);
+   `enable_full_determinism` does the same on the HyperParallel side.
+
+Launch it like the full recipe, on every node with its torchrun arguments:
+
+```bash
+scripts/train_lm.py hyper_parallel/models/deepseek_v32/recipes/align_mindspeed.yaml \
+    --model.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2-bf16 \
+    --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2-bf16 \
+    --dataset.data_path=/path/to/dataset/deepseek32_text_document
+```
+
+Compare MindSpeed's `lm loss` with HyperParallel's `foundation_loss`.
+MindSpeed's `load_balancing_loss` and HyperParallel's `router_aux_loss` are both
+one data-parallel replica's balance loss averaged over micro-batches and MoE
+layers, so they are noisier than the language-model loss. HyperParallel does not
+log the indexer KL loss. The DSA-internal norms (`q_a_layernorm`,
+`kv_a_layernorm` and the indexer `k_norm`) run with BF16 weights on the
+HyperParallel side, so the two runs differ by BF16 rounding there.
 
 ## DeepSeek-V4.1 text pretraining
 
