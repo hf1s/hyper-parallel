@@ -3,7 +3,6 @@
 # 拓扑：tp 2 × cp 2 × dp 2，FSDP 在 dp 上切分；MoE 层 ep 4 × edp 2（edp = dp*cp*tp/ep），
 # 每个 EP rank 持有 16/4 = 4 个专家，edp 内按 edp_shard 2 切分。loss parallel 按 TP 切词表。
 # 用同一份数据分别跑单卡和 8 卡，逐步比较 foundation_loss 与 grad_norm，检查两者自洽。
-# TP 下不能开启 indexer KL loss，见 hyper_parallel/models/deepseek_v32/README.md。
 #
 # 启动：
 #   bash examples/training_demo/deepseek_v32/run_8card.sh /path/to/DeepSeek-V3.2-crop /path/to/data_prefix

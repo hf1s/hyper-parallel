@@ -130,12 +130,11 @@ of two 4096-token windows from a Megatron `.bin/.idx` dataset, and the optimizer
 so the two runs can be compared step by step.
 
 Training follows the Transformers model: the router keeps its selection bias
-fixed, there is no balance loss or MTP, and the indexer KL loss is off. The
+fixed, there is no balance loss or MTP, and the indexer is not trained. The
 [family README](../../hyper_parallel/models/deepseek_v32/README.md) shows how to
 build the cropped checkpoint and the dataset, how to check that the two runs
-agree, how to enable the indexer KL loss, and the settings for a loss comparison
-with MindSpeed-LLM. DSA runs on the CANN backend, so load the CANN and
-ops-transformer environment described in the
+agree, and the settings for a loss comparison with MindSpeed-LLM. DSA runs on
+the CANN backend, so load the CANN and ops-transformer environment described in the
 [functional README](../../hyper_parallel/components/functional/README.md#deepseek-v32-dsa)
 before launching:
 

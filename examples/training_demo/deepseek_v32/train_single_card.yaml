@@ -9,7 +9,7 @@
 # 与 train_8card.yaml 只差 accelerator、fsdp_config 和 optimizer.swap，两者的结果应当自洽：
 # 两边加载同一份 checkpoint；数据是 Megatron .bin/.idx，每个 4096 窗口是一条完整的因果序列，
 # 两边每步读同样的 2 个样本。训练语义与 Transformers 一致（router bias 不更新，没有负载均衡
-# loss 和 MTP，indexer KL 默认关闭），见同一 README。
+# loss 和 MTP，不训练 indexer），见 hyper_parallel/models/deepseek_v32/README.md。
 #
 # 启动：
 #   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2-crop /path/to/data_prefix

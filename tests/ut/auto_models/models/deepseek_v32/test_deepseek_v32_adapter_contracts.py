@@ -179,28 +179,6 @@ class TestDeepseekV32DSAAttention(unittest.TestCase):
                 causal = torch.ones(12, 12, dtype=torch.bool).tril().expand(2, 1, 12, 12)
                 self._assert_matches_reference(attention, dsa, hidden, rope, positions, causal)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_indexer_loss_rejects_tensor_parallelism(self):
-        """Feature: DSA indexer KL loss option.
-
-        Description: Request the indexer KL loss through the replacement option with and without TP.
-        Expectation: TP raises; TP1 carries the coefficient; TP without the loss builds.
-        """
-        with reference_dsa_kernels():
-            attention = DeepseekV32ForCausalLM(_tiny_config()).model.layers[0].self_attn
-            with self.assertRaisesRegex(ValueError, "tp_size=1"):
-                replace_deepseek_v32_dsa_attention(
-                    module=copy.deepcopy(attention), module_fqn="layer", context={"tp": True}, dsa_loss_coeff=1.0,
-                )
-            replacement = replace_deepseek_v32_dsa_attention(
-                module=copy.deepcopy(attention), module_fqn="layer", context={}, dsa_loss_coeff=1.0,
-            )
-            self.assertEqual(replacement.dsa_loss_coeff, 1.0)
-            replace_deepseek_v32_dsa_attention(
-                module=copy.deepcopy(attention), module_fqn="layer", context={"tp": True},
-            )
-
 
 class TestDeepseekV32Materialization(unittest.TestCase):
     """A meta-device build must recover the rotary frequencies that checkpoints do not store."""

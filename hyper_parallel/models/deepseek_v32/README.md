@@ -51,7 +51,7 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
 | 专家 bias | FP32 buffer，训练中保持初始值 | `--moe-router-enable-expert-bias`，每步按专家负载 ±1e-3 更新 |
 | 负载均衡 loss | 无 | `--moe-router-load-balancing-type seq_aux_loss`，系数 1e-4 |
 | MTP | Transformers 加载时忽略第 61 层（`_keys_to_ignore_on_load_unexpected`），不训练 | `--mtp-num-layers 1`，loss 系数 0.3 |
-| indexer KL loss | 默认关闭，indexer 参数不更新；可以开启，见[开启 indexer KL loss](#开启-indexer-kl-loss) | `--indexer-loss-coeff 1.0` |
+| indexer KL loss | 无，indexer 参数不更新 | `--indexer-loss-coeff 1.0` |
 | indexer Hadamard 旋转 | 不做 | 默认在打分前对 q/k 做 Hadamard 旋转，`--no-use-sparse-c8-indexer` 关闭 |
 
 几点说明：
@@ -60,7 +60,7 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
   DeepSeek 官方推理代码（`DeepSeek-V3.2-Exp/inference/convert.py`）同样跳过第 61 层。需要这些
   目标时要在模型侧新增代码，本族不包含。
 - **indexer**：indexer 的输出只用于 top-k 选择，这一步不可导，所以语言模型 loss 不会给 indexer
-  梯度。DSA 替换中 indexer 的输入是 detach 的，开启 KL loss 后它只更新 indexer，不影响主干。
+  梯度，indexer 保持 checkpoint 中的值。
 - **Hadamard 旋转**：官方推理代码在 indexer 打分前对 q/k 乘归一化的 Hadamard 矩阵，配合 FP8
   量化打分。它是正交变换，不改变 q·k，Transformers 按 BF16 计算时跳过了这一步（见其
   `DeepseekV32Indexer` 的注释）。两种做法只差 BF16 舍入，在 top-k 边界上可能选出不同的 key。
@@ -72,7 +72,7 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
   | 匹配 | 替换为 | 说明 |
   |---|---|---|
   | `*.input_layernorm`、`*.post_attention_layernorm`、`model.norm` | 框架 `RMSNorm` | NPU 融合 RMSNorm |
-  | `*.self_attn` | 框架 `DeepseekV32DSAAttention` | `q_a_proj` 与 `kv_a_proj_with_mqa` 合并为 `linear_qkv`，加载时由替换模块声明的转换拼接权重；indexer 与稀疏 attention 使用 CANN 融合算子；可选的 indexer KL loss |
+  | `*.self_attn` | 框架 `DeepseekV32DSAAttention` | `q_a_proj` 与 `kv_a_proj_with_mqa` 合并为 `linear_qkv`，加载时由替换模块声明的转换拼接权重；indexer 与稀疏 attention 使用 CANN 融合算子 |
   | `*.mlp.experts` | 框架 `GroupedExperts` | grouped GEMM |
 
   DSA 替换只按因果关系计算 attention，不读取 `attention_mask` 的内容，不支持 padding mask、dropout
@@ -81,7 +81,7 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
   [functional README](../../components/functional/README.md#deepseek-v32-dsa)。
 - **CP**（`adapter/distributed/context_parallel.py`，YAML 中 `when: cp` 的条目，`cp_size > 1` 时生效）：
   query 留在本 rank，异步 all-gather indexer key 与 MLA 压缩 KV，每个 rank 只使用到本地 query 结尾的
-  因果前缀。开启 indexer KL loss 时，CP 下同样计算。
+  因果前缀。
 - **EP**（YAML 中 `when: ep` 的条目，`ep_size > 1` 时生效）：直接使用框架内置的
   `deepseekv3_ep_compute_fn`（`deepseekv3_sigmoid_group_shared` 原型）。它的路由与 Transformers
   router 相同；token 分发、本地 grouped GEMM 和合并由框架 EP 骨架完成，shared experts 与分发通信
@@ -180,30 +180,6 @@ bash examples/training_demo/deepseek_v32/run_8card.sh /path/to/DeepSeek-V3.2-cro
 loss 绝对或相对误差不超过 5e-3、grad norm 相对误差不超过 5e-3（或绝对误差不超过 0.125），可以作为
 参考。
 
-### 开启 indexer KL loss
-
-在 DSA 替换条目上设置 `dsa_loss_coeff`：
-
-```yaml
-plan_overrides:
-  - match: "*.self_attn"
-    replace:
-      kind: module
-      implementation:
-        _target_: >-
-          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
-        dsa_loss_coeff: 1.0
-```
-
-- KL loss 让 indexer 的打分分布逼近主 attention 在所有 head 上求和后的分布。TP 会把 head 切到不同
-  rank，而 KL 融合算子不做跨 rank 归约，所以 `tp_size > 1` 时开启会在构建阶段报错。8 卡示例使用
-  TP2，开启 KL 时改用 `--accelerator.tp_size=1 --accelerator.loss_parallel=false
-  --fsdp_config.dp_shard_size=4 --training.global_batch_size=4`，单卡同样改用
-  `--training.global_batch_size=4` 再比较。
-- KL 只有 CANN 实现。
-- Transformers 的 config 不认识 `dsa_loss_coeff`，`config_overrides` 和 `AutoConfig` 的同名参数都会被
-  忽略，所以要写在替换条目上。
-
 ### 与 MindSpeed-LLM 做 loss 对比
 
 两边从同一份权重开始：HyperParallel 侧直接用单卡示例和上面生成的裁剪 checkpoint，MindSpeed 侧用
@@ -218,7 +194,7 @@ HyperParallel 侧在启动命令末尾加 `--model.config_overrides='{index_topk
 | MTP | 不训练 | 训练与权重转换脚本都去掉 `--mtp-num-layers`，训练脚本再去掉 `--mtp-loss-scaling-factor` |
 | 负载均衡 loss | 无 | `--moe-router-load-balancing-type none`，去掉 `--moe-aux-loss-coeff` |
 | 专家 bias | 用于选择，不更新 | 保留 `--moe-router-enable-expert-bias`，加 `--moe-router-bias-update-rate 0` |
-| indexer KL | 替换条目设 `dsa_loss_coeff: 1.0`（`tp_size=1`） | `--indexer-loss-coeff 1.0` |
+| indexer KL | 无 | `--indexer-loss-coeff 0` |
 | `index_topk` | `--model.config_overrides='{index_topk: 1024}'` | `--index-topk 1024` |
 | Hadamard 旋转 | 不做 | 加 `--no-use-sparse-c8-indexer`，否则两边只差 BF16 舍入 |
 | norm 权重精度 | 前向使用 BF16 参数 | 去掉 `--init-norm-weight-in-fp32`；它让 MindSpeed 的 `RMSNorm` 与 indexer `k_norm` 的权重保持 FP32 |
@@ -230,7 +206,6 @@ MindSpeed 的 `lm loss` 对应 HyperParallel 的 `foundation_loss`。先比较�
 
 - 不支持 PP：Trainer 目前不支持流水线并行。
 - 不支持 sequence parallel：DSA 替换不支持 SP。
-- indexer KL loss 要求 `tp_size=1`，且只有 CANN 实现。
 - 专家 bias 不更新、没有负载均衡 loss、不训练 MTP（与 Transformers 一致）。
 - 验证范围是 2 层裁剪模型：CPU/Gloo 上的并行一致性见下表；NPU 上的融合算子与单卡、8 卡运行没有
   在本地验证。完整规格（61 层）和官方 FP8 权重的完整加载不在验证范围内。
@@ -239,6 +214,6 @@ MindSpeed 的 `lm loss` 对应 HyperParallel 的 `foundation_loss`。先比较�
 
 | 测试 | 覆盖内容 |
 |---|---|
-| `tests/ut/auto_models/models/deepseek_v32/test_deepseek_v32_adapter_contracts.py` | TP 角色（`linear_qkv` 与 indexer 复制、`q_b_proj` / `kv_b_proj` 列切）；两个示例的 EP 条目只命中 MoE 层、CP 条目作用于 attention；DSA 替换在稀疏选择和稠密选择下的输出与梯度对齐 Transformers attention；KL loss 与 TP 互斥；加载 checkpoint 时 RoPE buffer 与 CPU 构建一致 |
+| `tests/ut/auto_models/models/deepseek_v32/test_deepseek_v32_adapter_contracts.py` | TP 角色（`linear_qkv` 与 indexer 复制、`q_b_proj` / `kv_b_proj` 列切）；两个示例的 EP 条目只命中 MoE 层、CP 条目作用于 attention；DSA 替换在稀疏选择和稠密选择下的输出与梯度对齐 Transformers attention；加载 checkpoint 时 RoPE buffer 与 CPU 构建一致 |
 | `tests/torch/auto_models/deepseek_v32/test_deepseek_v32_parallel.py` | CPU/Gloo，经 Trainer 链路（`plan_overrides` → 模块替换 → `ShardingPlanner` → `apply_sharding_plan` → FSDP2）：CP2、TP2 + EP2 + loss parallel、TP2 × CP2 × EP4，loss 与全部梯度对齐单进程模型 |
 | `tests/common/dsa_reference_kernels.py` | CPU 参考 DSA kernel（替代 CANN 入口），供上面两个测试使用 |
