@@ -203,13 +203,4 @@ MindSpeed 的 `lm loss` 对应 HyperParallel 的 `foundation_loss`。先比较�
 - 不支持 PP：Trainer 目前不支持流水线并行。
 - 不支持 sequence parallel：DSA 替换不支持 SP。
 - 专家 bias 不更新、没有负载均衡 loss、不训练 MTP（与 Transformers 一致）。
-- 验证范围是 2 层裁剪模型：CPU/Gloo 上的并行一致性见下表；NPU 上的融合算子与单卡、8 卡运行没有
-  在本地验证。完整规格（61 层）和官方 FP8 权重的完整加载不在验证范围内。
-
-## 测试
-
-| 测试 | 覆盖内容 |
-|---|---|
-| `tests/ut/auto_models/models/deepseek_v32/test_deepseek_v32_adapter_contracts.py` | TP 角色（`linear_qkv` 与 indexer 复制、`q_b_proj` / `kv_b_proj` 列切）；两个示例的 EP 条目只命中 MoE 层、CP 条目作用于 attention；DSA 替换在稀疏选择和稠密选择下的输出与梯度对齐 Transformers attention；加载 checkpoint 时 RoPE buffer 与 CPU 构建一致 |
-| `tests/torch/auto_models/deepseek_v32/test_deepseek_v32_parallel.py` | CPU/Gloo，经 Trainer 链路（`plan_overrides` → 模块替换 → `ShardingPlanner` → `apply_sharding_plan` → FSDP2）：CP2、TP2 + EP2 + loss parallel、TP2 × CP2 × EP4，loss 与全部梯度对齐单进程模型 |
-| `tests/common/dsa_reference_kernels.py` | CPU 参考 DSA kernel（替代 CANN 入口），供上面两个测试使用 |
+- 验证范围是 2 层裁剪模型的单卡与 8 卡运行；完整规格（61 层）和官方 FP8 权重的完整加载不在验证范围内。
