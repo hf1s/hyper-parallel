@@ -5,7 +5,7 @@
 ## 支持模型
 
 - [x] Qwen3-30B-A3B
-- [x] DeepSeek-V3.2（Transformers 原生模型 + DSA/MoE 适配；TP/CP/EP/FSDP 在 CPU/Gloo 上与单进程结果对齐，NPU 端到端未验证）
+- [x] DeepSeek-V3.2（Transformers 原生模型 + DSA/MoE 适配，2 层裁剪模型的单卡 / 8 卡示例；TP/CP/EP/FSDP 在 CPU/Gloo 上与单进程结果对齐，NPU 未验证）
 
 ## HyperShard
 

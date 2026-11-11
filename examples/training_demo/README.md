@@ -5,7 +5,7 @@ recipes, data preparation, launchers, and validation manifests are grouped by
 family:
 
 - `qwen3_moe/`: cropped and full-model Qwen3-MoE text demos;
-- `deepseek_v32/`: single-card cropped DeepSeek-V3.2 text demo;
+- `deepseek_v32/`: cropped DeepSeek-V3.2 text demos for one and eight devices;
 - `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling.
 
 ## Qwen3-MoE cropped Hugging Face demos
@@ -114,45 +114,40 @@ validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
 
-## DeepSeek-V3.2 single-card crop
+## DeepSeek-V3.2 cropped demos
 
-The [single-card configuration](deepseek_v32/train_single_card.yaml) builds
-DeepSeek-V3.2 with `HyperAutoModelForCausalLM.from_config` and random weights.
-It keeps the released hidden, MLA, indexer, and vocabulary dimensions and crops
-the model to two decoder layers (one dense, one MoE) and 16 routed experts, the
-fewest that keep the released group routing (`n_group=8`, `topk_group=4`,
-top-8). The per-layer type lists are given with the layer count because
-Transformers derives them from the released 61 layers before the override. The
-model has 3.40B parameters; FP32 parameters, FP32 gradients and the two FP32
-AdamW moments take about 51 GiB before activations (estimated, not measured),
-which targets one 64 GB device such as 910B3.
+[`train_single_card.yaml`](deepseek_v32/train_single_card.yaml) and
+[`train_8card.yaml`](deepseek_v32/train_8card.yaml) load the same cropped BF16
+checkpoint: the released hidden, MLA, indexer, and vocabulary dimensions with two
+decoder layers (one dense, one MoE) and 16 routed experts, the fewest that keep
+the released group routing (`n_group=8`, `topk_group=4`, top-8). The model has
+3.40B parameters; FP32 parameters, FP32 gradients and the two FP32 AdamW moments
+take about 51 GiB before activations (estimated, not measured). The single-card
+configuration swaps the optimizer states to host memory for a 64 GB device such
+as 910B3; the eight-device configuration runs TP2 × CP2 × DP2 with EP4 and loss
+parallelism. Everything else is identical, including the seed, the global batch
+of two 4096-token windows from a Megatron `.bin/.idx` dataset, and the optimizer,
+so the two runs can be compared step by step.
 
-Module replacements match the full
-[recipe](../../hyper_parallel/models/deepseek_v32/recipes/train.yaml), and
-training follows the Transformers model: the router keeps its selection bias
+Training follows the Transformers model: the router keeps its selection bias
 fixed, there is no balance loss or MTP, and the indexer KL loss is off. The
-[family README](../../hyper_parallel/models/deepseek_v32/README.md) describes
-these semantics, how to enable the indexer KL loss, and the settings for a loss
-comparison with MindSpeed-LLM. Unlike the recipe's one-line-per-row default
-data, this example packs documents into 4096-token rows, and DSA reads their
-boundaries from `DeepseekV32PackedSequence` rather than a dense mask. DSA runs
-on the CANN backend, so load the CANN and ops-transformer environment described
-in the
+[family README](../../hyper_parallel/models/deepseek_v32/README.md) shows how to
+build the cropped checkpoint and the dataset, how to check that the two runs
+agree, how to enable the indexer KL loss, and the settings for a loss comparison
+with MindSpeed-LLM. DSA runs on the CANN backend, so load the CANN and
+ops-transformer environment described in the
 [functional README](../../hyper_parallel/components/functional/README.md#deepseek-v32-dsa)
-before launching. Only `config.json` and the tokenizer files of the official
-checkpoint directory are read; the data is a text JSONL with a `text` field:
+before launching:
 
 ```bash
 bash examples/training_demo/deepseek_v32/run_single_card.sh \
-    /path/to/DeepSeek-V3.2 /path/to/text/train.jsonl
+    /path/to/DeepSeek-V3.2-crop /path/to/dataset/deepseek32_text_document
+bash examples/training_demo/deepseek_v32/run_8card.sh \
+    /path/to/DeepSeek-V3.2-crop /path/to/dataset/deepseek32_text_document
 ```
 
-The indexer keeps every key of a document shorter than `index_topk` (2048), so
-its top-k selection only takes effect on longer documents. The Online dataset
-holds `train_iters × global_batch_size` records, so a JSONL whose records are
-much shorter than 4096 tokens packs several records into each step and can run
-out before `train_iters`. The log is written to
-`output/training_demo/deepseek_v32/run_single_card.log`.
+The logs are written to `output/training_demo/deepseek_v32/run_single_card.log`
+and `run_8card.log`.
 
 ## DeepSeek-V4.1 text pretraining
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V3.2 adapter contracts: TP roles, recipe topology, DSA math and materialization."""
+"""DeepSeek-V3.2 adapter contracts: TP roles, example topology, DSA math and materialization."""
 
 import copy
 import fnmatch
@@ -29,13 +29,14 @@ from hyper_parallel.models._transformers.model_builder import _apply_materializa
 from hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement import (
     replace_deepseek_v32_dsa_attention,
 )
-from hyper_parallel.models.deepseek_v32.adapter.data.runtime import DeepseekV32PackedSequence
 from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
 from tests.common.dsa_reference_kernels import reference_dsa_kernels
 from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
-_RECIPE = Path(__file__).resolve().parents[5] / "hyper_parallel/models/deepseek_v32/recipes/train.yaml"
+_EXAMPLES = Path(__file__).resolve().parents[5] / "examples/training_demo/deepseek_v32"
+# MLP layer types of the cropped checkpoint the family README builds for the examples.
+_CROPPED_MLP_LAYER_TYPES = ("dense", "sparse")
 
 
 def _tiny_config(**overrides) -> DeepseekV32Config:
@@ -110,20 +111,19 @@ class TestDeepseekV32TensorParallelRoles(unittest.TestCase):
         self.assertNotIn("q_a_proj.weight", placements)
 
 
-class TestDeepseekV32RecipeTopology(unittest.TestCase):
-    """Recipe parallel entries must target exactly the intended modules."""
+class TestDeepseekV32ExampleTopology(unittest.TestCase):
+    """Example parallel entries must target exactly the intended modules."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_ep_entries_target_exactly_the_moe_layers(self):
         """Feature: DeepSeek-V3.2 EP plan overrides.
 
-        Description: Activate the recipe at EP>1 and match its MLP globs against the released depth.
-        Expectation: Only MoE layers receive the EP compute; CP and EP stay off at size one.
+        Description: Activate each example at CP>1 and EP>1 and match its MLP globs against the cropped depth.
+        Expectation: Only MoE layers receive the EP compute and attention receives the CP wrapper.
         """
-        released = DeepseekV32Config()
-        mlps = [f"model.layers.{index}.mlp" for index in range(released.num_hidden_layers)]
-        sparse = [name for name, kind in zip(mlps, released.mlp_layer_types) if kind == "sparse"]
+        mlps = [f"model.layers.{index}.mlp" for index in range(len(_CROPPED_MLP_LAYER_TYPES))]
+        sparse = [mlp for mlp, kind in zip(mlps, _CROPPED_MLP_LAYER_TYPES) if kind == "sparse"]
         with reference_dsa_kernels():
             from hyper_parallel.trainer.config import (  # pylint: disable=import-outside-toplevel
                 entries_to_plan_overrides,
@@ -131,25 +131,26 @@ class TestDeepseekV32RecipeTopology(unittest.TestCase):
             from hyper_parallel.trainer.config.parser import (  # pylint: disable=import-outside-toplevel
                 parse_training_args,
             )
-            entries = parse_training_args([str(_RECIPE)]).plan_overrides
-            self.assertEqual(entries_to_plan_overrides(entries), {})
-            active = entries_to_plan_overrides(entries, cp_size=2, ep_size=2)
-            ep_globs = [key for key, spec in active.items() if spec.local_compute_fn is not None]
-            matched = [name for name in mlps if any(fnmatch.fnmatchcase(name, glob) for glob in ep_globs)]
-            self.assertEqual(matched, sparse)
-            self.assertIsNotNone(active["*.self_attn"].inner_wrapper)
+            for name in ("train_single_card.yaml", "train_8card.yaml"):
+                with self.subTest(example=name):
+                    entries = parse_training_args([str(_EXAMPLES / name)]).plan_overrides
+                    active = entries_to_plan_overrides(entries, cp_size=2, ep_size=4)
+                    ep_globs = [key for key, spec in active.items() if spec.local_compute_fn is not None]
+                    matched = [mlp for mlp in mlps if any(fnmatch.fnmatchcase(mlp, glob) for glob in ep_globs)]
+                    self.assertEqual(matched, sparse)
+                    self.assertIsNotNone(active["*.self_attn"].inner_wrapper)
 
 
 class TestDeepseekV32DSAAttention(unittest.TestCase):
     """The DSA replacement must reproduce Transformers DeepSeek-V3.2 attention."""
 
-    def _assert_matches_reference(self, attention, dsa, hidden, rope, positions, reference_mask, **kwargs):
+    def _assert_matches_reference(self, attention, dsa, hidden, rope, positions, reference_mask):
         """Compare outputs, input gradients and mapped parameter gradients in FP32."""
         reference_input = hidden.clone().requires_grad_(True)
         expected, _ = attention(reference_input, position_embeddings=rope, attention_mask=reference_mask)
         expected.square().sum().backward()
         candidate_input = hidden.clone().requires_grad_(True)
-        actual, _ = dsa(candidate_input, position_embeddings=rope, position_ids=positions, **kwargs)
+        actual, _ = dsa(candidate_input, position_embeddings=rope, position_ids=positions)
         actual.square().sum().backward()
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(candidate_input.grad, reference_input.grad, rtol=1e-4, atol=1e-6)
@@ -180,31 +181,6 @@ class TestDeepseekV32DSAAttention(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_packed_documents_match_block_diagonal_attention(self):
-        """Feature: DSA packed-document boundaries.
-
-        Description: Pass global cu_seq_lens through the runtime adapter for two rows of packed documents.
-        Expectation: DSA equals Transformers attention under the matching block-diagonal mask.
-        """
-        boundaries = torch.tensor([0, 5, 12, 15, 24], dtype=torch.int32)
-        runtime = DeepseekV32PackedSequence().build_runtime_inputs(
-            batch={"cu_seq_lens": boundaries}, context=None
-        )
-        mask = torch.zeros(2, 1, 12, 12, dtype=torch.bool)
-        for start, end in zip(boundaries[:-1].tolist(), boundaries[1:].tolist()):
-            row, first = divmod(start, 12)
-            last = end - row * 12
-            mask[row, 0, first:last, first:last] = torch.ones(last - first, last - first, dtype=torch.bool).tril()
-        with reference_dsa_kernels():
-            torch.manual_seed(1)
-            model = DeepseekV32ForCausalLM(_tiny_config(index_topk=3))
-            attention = model.model.layers[0].self_attn
-            dsa = _dsa_from(attention)
-            hidden, rope, positions = _attention_inputs(model)
-            self._assert_matches_reference(attention, dsa, hidden, rope, positions, mask, **runtime)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_indexer_loss_rejects_tensor_parallelism(self):
         """Feature: DSA indexer KL loss option.
 
@@ -231,11 +207,12 @@ class TestDeepseekV32Materialization(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_meta_build_rebuilds_yarn_frequencies(self):
+    def test_checkpoint_load_rebuilds_yarn_frequencies(self):
         """Feature: DeepSeek-V3.2 RoPE materialization.
 
         Description: Build with the released YaRN parameters on the meta device, then materialize
-            empty storage and rebuild the declared state as the model builder does.
+            empty storage and rebuild the declared state as the model builder does when it loads a
+            checkpoint instead of running the Transformers weight initialization.
         Expectation: Every rotary buffer equals the one of a model built on the CPU.
         """
         config = _tiny_config(max_position_embeddings=163840, rope_parameters={
@@ -248,7 +225,9 @@ class TestDeepseekV32Materialization(unittest.TestCase):
             model = DeepseekV32ForCausalLM(config)
         _apply_materialization_adapter(model)
         model.to_empty(device="cpu")
-        rebuild_materialized_state(model, MaterializationContext(reason="random_init", device=torch.device("cpu")))
+        rebuild_materialized_state(
+            model, MaterializationContext(reason="checkpoint_load", device=torch.device("cpu")),
+        )
         rebuilt = dict(model.model.rotary_emb.named_buffers())
         self.assertEqual(rebuilt.keys(), reference.keys())
         for name, value in reference.items():

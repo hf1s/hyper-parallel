@@ -22,7 +22,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-"${PROJECT_ROOT}/output/training_demo/deepseek_v32"}
 PYTHON_BIN=${PYTHON_BIN:-python}
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 /path/to/DeepSeek-V3.2 /path/to/train.jsonl [trainer overrides...]" >&2
+    echo "Usage: $0 /path/to/DeepSeek-V3.2-crop /path/to/data_prefix [trainer overrides...]" >&2
     exit 1
 fi
 
@@ -31,17 +31,18 @@ MODEL_PATH=$(cd "$1" 2>/dev/null && pwd) || {
     echo "Model directory does not exist: $1" >&2
     exit 1
 }
-DATA_PATH=$2
+DATA_PREFIX=$2
 shift 2
-if [[ ! -s "${DATA_PATH}" ]]; then
-    echo "Text JSONL data is missing or empty: ${DATA_PATH}" >&2
+if [[ "${DATA_PREFIX}" != /* ]]; then
+    DATA_PREFIX="${PWD}/${DATA_PREFIX}"
+fi
+if [[ ! -s "${DATA_PREFIX}.bin" || ! -s "${DATA_PREFIX}.idx" ]]; then
+    echo "Indexed Dataset files are missing: ${DATA_PREFIX}.bin/.idx" >&2
     exit 1
 fi
-if [[ "${DATA_PATH}" != /* ]]; then
-    DATA_PATH="${PWD}/${DATA_PATH}"
-fi
-if [[ ! -s "${MODEL_PATH}/config.json" || ! -s "${MODEL_PATH}/tokenizer.json" ]]; then
-    echo "Local DeepSeek-V3.2 config/tokenizer assets are incomplete: ${MODEL_PATH}" >&2
+if [[ ! -s "${MODEL_PATH}/config.json" || ! -s "${MODEL_PATH}/tokenizer.json" ]] \
+        || ! compgen -G "${MODEL_PATH}/model*.safetensors" > /dev/null; then
+    echo "Cropped DeepSeek-V3.2 checkpoint is incomplete: ${MODEL_PATH}" >&2
     exit 1
 fi
 
@@ -53,9 +54,9 @@ mkdir -p "${OUTPUT_DIR}"
     --nproc_per_node=1 \
     --module examples.training_demo.train_text \
     "${SCRIPT_DIR}/train_single_card.yaml" \
-    --model.config.pretrained_model_name_or_path="${MODEL_PATH}" \
+    --model.pretrained_model_name_or_path="${MODEL_PATH}" \
     --dataset.model_assets.tokenizer.pretrained_model_name_or_path="${MODEL_PATH}" \
-    --dataset.data_path="${DATA_PATH}" \
-    --checkpoint.checkpoint_dir="${OUTPUT_DIR}/checkpoints" \
+    --dataset.data_path="${DATA_PREFIX}" \
+    --checkpoint.checkpoint_dir="${OUTPUT_DIR}/checkpoints_single_card" \
     "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_single_card.log"

@@ -29,7 +29,6 @@ _WORKER = str(Path(__file__).with_name("_test_deepseek_v32_parallel.py"))
     ("case_name", "num_proc"),
     [
         ("test_cp2_dsa", 2),
-        ("test_cp2_dsa_packed", 2),
         ("test_tp2_ep2_dsa_loss_parallel", 2),
         ("test_tp2_cp2_ep4_dsa", 4),
     ],
@@ -39,7 +38,7 @@ _WORKER = str(Path(__file__).with_name("_test_deepseek_v32_parallel.py"))
 def test_deepseek_v32_parallel_parity_gloo(case_name: str, num_proc: int) -> None:
     """
     Feature: DeepSeek-V3.2 parallel integration.
-    Description: Run DSA under CP (with packed documents), TP + loss parallel, TP x CP and EP on CPU ranks
+    Description: Run DSA under CP, TP + loss parallel, TP x CP and EP on CPU ranks
         through the Trainer chain including FSDP2.
     Expectation: The loss and every gradient match the single-process model.
     """

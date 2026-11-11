@@ -1,31 +1,23 @@
-# DeepSeek-V3.2 单卡裁剪示例：from_config 随机初始化，不加载 checkpoint。
+# DeepSeek-V3.2 单卡裁剪示例。
 #
-# 保留官方 config 的 hidden、MLA、indexer 和词表维度，只裁成 2 层（第 0 层 dense、
-# 第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由（n_group=8、topk_group=4、
-# top-8）的最小专家数。共 3.40B 参数，FP32 参数 + FP32 梯度 + AdamW 两个 FP32 动量
-# ≈ 16 B/param，约 51 GiB，再加激活（未实测），面向 64 GB 单卡（如 910B3）。
+# 加载按官方 config 裁剪的 BF16 checkpoint：保留 hidden、MLA、indexer 和词表维度，只有 2 层
+# （第 0 层 dense、第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由（n_group=8、
+# topk_group=4、top-8）的最小专家数。生成方式见 hyper_parallel/models/deepseek_v32/README.md。
+# 共 3.40B 参数，FP32 参数 + FP32 梯度 + AdamW 两个 FP32 动量 ≈ 16 B/param，约 51 GiB，再加激活
+# （未实测）；optimizer.swap 把优化器状态换出到 host，面向 64 GB 单卡（如 910B3）。
 #
-# 模块替换与完整配方 hyper_parallel/models/deepseek_v32/recipes/train.yaml 一致，训练语义
-# 与 Transformers 一致（router bias 不更新、没有负载均衡 loss 和 MTP、indexer KL 默认关闭），
-# 见 hyper_parallel/models/deepseek_v32/README.md。数据用 TokenBatchLoader 把多个文档拼成
-# 4096 token 的行，文档边界由 DeepseekV32PackedSequence 传给 DSA。单卡没有 TP/CP/EP，
-# 所以不带 `when: cp` / `when: ep` 条目。
+# 与 train_8card.yaml 只差 accelerator、fsdp_config 和 optimizer.swap，两者的结果应当自洽：
+# 两边加载同一份 checkpoint；数据是 Megatron .bin/.idx，每个 4096 窗口是一条完整的因果序列，
+# 两边每步读同样的 2 个样本。训练语义与 Transformers 一致（router bias 不更新，没有负载均衡
+# loss 和 MTP，indexer KL 默认关闭），见同一 README。
 #
-# 启动（只读取官方目录里的 config.json 和 tokenizer 文件，不需要权重）：
-#   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2 /path/to/train.jsonl
+# 启动：
+#   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2-crop /path/to/data_prefix
 
 model:
-  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /path/to/DeepSeek-V3.2
-    local_files_only: true
-    num_hidden_layers: 2
-    first_k_dense_replace: 1
-    n_routed_experts: 16
-    # Transformers 按读入时的 61 层推导逐层类型，覆盖层数后不会重新推导，因此一并给出。
-    mlp_layer_types: [dense, sparse]
-    layer_types: [indexed_attention, indexed_attention]
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  # 由启动脚本的第一个参数传入。
+  pretrained_model_name_or_path: /path/to/DeepSeek-V3.2-crop
   torch_dtype: bfloat16
   # DSA 替换不读取稠密 mask；sdpa 让 Transformers 只构建 bool 因果 mask。
   attn_implementation: sdpa
@@ -37,13 +29,13 @@ training:
   train_iters: 10
   train_samples: null
   eval_iters: 0
-  global_batch_size: 1
+  global_batch_size: 2
   micro_batch_size: 1
   backend: hccl
   init_device: meta
   loss_aggregation: token_weighted
   max_grad_norm: 1.0
-  seed: 42
+  seed: 1234
   enable_full_determinism: true
 
 accelerator:
@@ -91,6 +83,24 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+  # cp_size > 1 时生效：本 rank 保留本地 query，all-gather indexer key 与 MLA 压缩 KV。
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+        dense_warmup: null
+  # ep_size > 1 时生效：框架内置的 DeepSeek-V3 EP，路由与 Transformers router 相同；
+  # 只作用于 MoE 层，裁剪后是第 1 层。
+  - match: "model.layers.1.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        use_grouped_gemm: true
+        overlap_shared_expert: true
 
 mixed_precision:
   enabled: false
@@ -107,32 +117,31 @@ dataset:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /path/to/DeepSeek-V3.2
       local_files_only: true
-      use_fast: true
-      trust_remote_code: false
-  data_transform:
-    _target_: hyper_parallel.data.text.text_transform.build_text_transform
-    data_type: plaintext
-    text_keys: text
-    max_seq_len: 4096
-  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  # 由 run_single_card.sh 的第二个参数传入：每行一个 JSON，正文在 text 字段。
-  data_path: /path/to/train.jsonl
+      tokenizer_type: pretokenized
+      vocab_size: 129280
+      eod_token_id: 1
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  # 由启动脚本的第二个参数传入：.bin/.idx 的公共前缀（不带后缀）。
+  data_path: /path/to/dataset/deepseek32_text_document
   data_config:
+    seq_length: 4096
+    split: "100,0,0"
+    low_level_dataset:
+      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
+    simple_blend: "no"
+    skip_data_check: true
     labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
     create_ltor_fields_in_dataloader: false
 
 dataloader:
-  _target_: hyper_parallel.data.batching.TokenBatchLoader
-  min_buffered_samples: 8
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
-    source_type: online
-    # DSA 只检查 attention_mask 的形状、不读内容；文档边界由下面的 runtime adapter 以 cu_seq_lens 传入。
+    source_type: indexed
     attention_mode: compressed
-    runtime_input_adapter:
-      _target_: hyper_parallel.models.deepseek_v32.adapter.data.runtime.DeepseekV32PackedSequence
   sampler_type: single
   data_rearrange_map: null
   data_sharding: false
@@ -152,14 +161,16 @@ optimizer:
     adamw_weight_decay: 0.01
     adamw_betas: [0.9, 0.999]
     adamw_eps: 1.0e-8
+  swap:
+    enabled: true
 
 lr_scheduler:
   _target_: hyper_parallel.components.optim.MultiLRScheduler
   lr_decay_style: cosine
   lr_config:
     lr: 1.0e-5
-    lr_warmup_steps: 1
-    min_lr: 0.0
+    lr_warmup_steps: 0
+    min_lr: 1.0e-7
 
 checkpoint:
   save_ckpt: false

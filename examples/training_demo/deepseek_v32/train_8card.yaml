@@ -1,0 +1,175 @@
+# DeepSeek-V3.2 8 卡裁剪示例：模型、数据和优化器与 train_single_card.yaml 相同，只改并行拓扑。
+#
+# 拓扑：tp 2 × cp 2 × dp 2，FSDP 在 dp 上切分；MoE 层 ep 4 × edp 2（edp = dp*cp*tp/ep），
+# 每个 EP rank 持有 16/4 = 4 个专家，edp 内按 edp_shard 2 切分。loss parallel 按 TP 切词表。
+# 用同一份数据分别跑单卡和 8 卡，逐步比较 foundation_loss 与 grad_norm，检查两者自洽。
+# TP 下不能开启 indexer KL loss，见 hyper_parallel/models/deepseek_v32/README.md。
+#
+# 启动：
+#   bash examples/training_demo/deepseek_v32/run_8card.sh /path/to/DeepSeek-V3.2-crop /path/to/data_prefix
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  # 由启动脚本的第一个参数传入。
+  pretrained_model_name_or_path: /path/to/DeepSeek-V3.2-crop
+  torch_dtype: bfloat16
+  # DSA 替换不读取稠密 mask；sdpa 让 Transformers 只构建 bool 因果 mask。
+  attn_implementation: sdpa
+  validate_placement: false
+
+model_init_dtype: float32
+
+training:
+  train_iters: 10
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 2
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 1234
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 4
+  pp_size: 1
+  # DSA 替换不支持 sequence parallel。
+  sequence_parallel: false
+  loss_parallel: true
+
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 2
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - model.norm
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+  - match: "*.mlp.experts"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+  # cp_size > 1 时生效：本 rank 保留本地 query，all-gather indexer key 与 MLA 压缩 KV。
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+        dense_warmup: null
+  # ep_size > 1 时生效：框架内置的 DeepSeek-V3 EP，路由与 Transformers router 相同；
+  # 只作用于 MoE 层，裁剪后是第 1 层。
+  - match: "model.layers.1.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        use_grouped_gemm: true
+        overlap_shared_expert: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/DeepSeek-V3.2
+      local_files_only: true
+      tokenizer_type: pretokenized
+      vocab_size: 129280
+      eod_token_id: 1
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  # 由启动脚本的第二个参数传入：.bin/.idx 的公共前缀（不带后缀）。
+  data_path: /path/to/dataset/deepseek32_text_document
+  data_config:
+    seq_length: 4096
+    split: "100,0,0"
+    low_level_dataset:
+      _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
+    simple_blend: "no"
+    skip_data_check: true
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: compressed
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 0
+    min_lr: 1.0e-7
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./output/training_demo/deepseek_v32/checkpoints
+  restore_from: null
+
+debug:
+  check_nan_inf: false
+  check_dataset: null

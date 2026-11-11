@@ -47,9 +47,6 @@ from tests.common.dsa_reference_kernels import reference_dsa_kernels
 _ADAPTER = "hyper_parallel.models.deepseek_v32.adapter"
 _SEQ_LEN = 16
 _BATCH = 2
-# Packed documents over the flattened [batch, sequence] stream; two of them
-# straddle the CP2 split of their row (positions 8 and 24).
-_PACKED_BOUNDARIES = (0, 5, 16, 19, 27, 32)
 
 
 class _GlooAllGather(torch.autograd.Function):
@@ -211,17 +208,7 @@ def _compared_gradients(model, reference, source_shard_info):
         yield name, grad, expected
 
 
-def _block_diagonal_mask(boundaries):
-    """Return the causal per-document mask of packed boundaries over [batch, sequence]."""
-    mask = torch.zeros(_BATCH, 1, _SEQ_LEN, _SEQ_LEN, dtype=torch.bool)
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        row, first = divmod(start, _SEQ_LEN)
-        last = end - row * _SEQ_LEN
-        mask[row, 0, first:last, first:last] = torch.ones(last - first, last - first, dtype=torch.bool).tril()
-    return mask
-
-
-def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False, packed=False):
+def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False):
     """Compare one parallel topology against the single-process model."""
     # pylint: disable=import-outside-toplevel
     dist.init_process_group("gloo")
@@ -233,7 +220,6 @@ def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False, packed=False):
                 "hyper_parallel.core.fully_shard.api._get_device_from_mesh", return_value=torch.device("cpu")):
             from hyper_parallel.core.tensor_parallel import loss_parallel as loss_parallel_context
             from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
-            from hyper_parallel.models.deepseek_v32.adapter.data.runtime import DeepseekV32PackedSequence
 
             reference = _reference_model()
             config = _parse_trainer_config(tp, cp, ep, loss_parallel)
@@ -245,17 +231,11 @@ def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False, packed=False):
             tokens = torch.randint(1, 128, (_BATCH, _SEQ_LEN + 1))
             inputs, labels = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
             positions = torch.arange(_SEQ_LEN).unsqueeze(0).expand(_BATCH, -1)
-            reference_mask = {"attention_mask": _block_diagonal_mask(_PACKED_BOUNDARIES)} if packed else {}
             expected = reference(input_ids=inputs, labels=labels, shift_labels=labels,
-                                 position_ids=positions, use_cache=False, **reference_mask)
+                                 position_ids=positions, use_cache=False)
             expected.loss.backward()
 
             local = slice(mesh.cp_rank * _SEQ_LEN // cp, (mesh.cp_rank + 1) * _SEQ_LEN // cp)
-            boundaries = {}
-            if packed:
-                boundaries = DeepseekV32PackedSequence().build_runtime_inputs(
-                    batch={"cu_seq_lens": torch.tensor(_PACKED_BOUNDARIES, dtype=torch.int32)}, context=None,
-                )
             forward_context = (
                 loss_parallel_context(mesh=mesh.device_mesh["tp"]) if loss_parallel else contextlib.nullcontext()
             )
@@ -263,7 +243,7 @@ def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False, packed=False):
                 output = model(
                     input_ids=inputs[:, local].contiguous(), labels=labels[:, local].contiguous(),
                     shift_labels=labels[:, local].contiguous(), position_ids=positions[:, local],
-                    use_cache=False, **boundaries,
+                    use_cache=False,
                 )
                 output.loss.backward()
 
@@ -284,11 +264,6 @@ def _run_case(*, tp=1, cp=1, ep=1, loss_parallel=False, packed=False):
 def test_cp2_dsa():
     """CP2 through the DSA all-gather wrapper."""
     _run_case(cp=2)
-
-
-def test_cp2_dsa_packed():
-    """CP2 with packed documents straddling the CP split, boundaries from the runtime adapter."""
-    _run_case(cp=2, packed=True)
 
 
 def test_tp2_ep2_dsa_loss_parallel():

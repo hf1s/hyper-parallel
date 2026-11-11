@@ -3,8 +3,7 @@
 DeepSeek-V3.2 在 DeepSeek-V3 的 MLA + MoE 结构上加入 DeepSeek Sparse Attention（DSA）：每层由
 lightning indexer 为每个 query 选出 `index_topk` 个 key（官方 config 为 2048），MLA 只在这些 key
 上计算 attention。模型主体直接使用 Transformers 原生的 `DeepseekV32ForCausalLM`，本族不带建模代码；
-本目录是 HyperParallel 的适配层，包括模块替换工厂、CP wrapper、TP 分片规则、RoPE 物化、拼行文档
-边界和训练 recipe。
+本目录是 HyperParallel 的适配层，包括模块替换工厂、CP wrapper、TP 分片规则和 RoPE 物化。
 
 ## 注册身份
 
@@ -22,22 +21,23 @@ models/deepseek_v32/
 ├── __init__.py
 ├── adapter/
 │   ├── registration.py              # ModelAdapterSpec：替换工厂、CP、TP 分片规则、RoPE 物化
-│   ├── materialization.py           # meta 初始化后重建 RoPE 的 inv_freq / original_inv_freq
+│   ├── materialization.py           # 加载权重时重建 RoPE 的 inv_freq / original_inv_freq
 │   ├── conversion/
 │   │   └── module_replacement.py    # RMSNorm、DSA attention、GroupedExperts 的替换工厂
 │   ├── distributed/
 │   │   └── context_parallel.py      # DSA 的 CP wrapper
-│   ├── data/
-│   │   └── runtime.py               # DeepseekV32PackedSequence：把拼行文档边界传给 DSA
 │   └── policies/
 │       └── sharding.py              # MLA 与 indexer 的 TP 分片规则
-├── generated/                       # codegen 生成的模型代码，recipe 不使用
+├── generated/                       # codegen 生成的模型代码，示例不使用
 └── recipes/
-    └── train.yaml                   # 512 卡主线配方
-```
+    └── train.yaml                   # 完整规格的单进程配方（master 已有，未在本目录的验证范围内）
 
-单卡裁剪示例在 `examples/training_demo/deepseek_v32/`（`train_single_card.yaml` 与
-`run_single_card.sh`）。
+examples/training_demo/deepseek_v32/
+├── train_single_card.yaml           # 裁剪模型，单卡
+├── train_8card.yaml                 # 同一裁剪模型，8 卡（TP2 × CP2 × DP2，EP4）
+├── run_single_card.sh
+└── run_8card.sh
+```
 
 ## 训练语义
 
@@ -48,7 +48,7 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
 | 项目 | 本族（与 Transformers 一致） | MindSpeed-LLM 预训练脚本 |
 |---|---|---|
 | 专家选择 | sigmoid 分数加 `e_score_correction_bias` 做分组 top-k（`n_group` 8、`topk_group` 4、top-8），门控值归一化后乘 `routed_scaling_factor` | 相同 |
-| 专家 bias | FP32 buffer，训练中保持 checkpoint 中的值 | `--moe-router-enable-expert-bias`，每步按专家负载 ±1e-3 更新 |
+| 专家 bias | FP32 buffer，训练中保持初始值 | `--moe-router-enable-expert-bias`，每步按专家负载 ±1e-3 更新 |
 | 负载均衡 loss | 无 | `--moe-router-load-balancing-type seq_aux_loss`，系数 1e-4 |
 | MTP | Transformers 加载时忽略第 61 层（`_keys_to_ignore_on_load_unexpected`），不训练 | `--mtp-num-layers 1`，loss 系数 0.3 |
 | indexer KL loss | 默认关闭，indexer 参数不更新；可以开启，见[开启 indexer KL loss](#开启-indexer-kl-loss) | `--indexer-loss-coeff 1.0` |
@@ -67,7 +67,7 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
 
 ## 适配内容
 
-- **模块替换**（`adapter/conversion/module_replacement.py`，由 recipe 的 `plan_overrides` 选用）：
+- **模块替换**（`adapter/conversion/module_replacement.py`，由 YAML 的 `plan_overrides` 选用）：
 
   | 匹配 | 替换为 | 说明 |
   |---|---|---|
@@ -75,27 +75,27 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
   | `*.self_attn` | 框架 `DeepseekV32DSAAttention` | `q_a_proj` 与 `kv_a_proj_with_mqa` 合并为 `linear_qkv`，加载时由替换模块声明的转换拼接权重；indexer 与稀疏 attention 使用 CANN 融合算子；可选的 indexer KL loss |
   | `*.mlp.experts` | 框架 `GroupedExperts` | grouped GEMM |
 
-  DSA 替换支持因果训练和拼行文档，不支持 padding mask、dropout 和 KV cache。DSA 算子的依赖见
+  DSA 替换只按因果关系计算 attention，不读取 `attention_mask` 的内容，不支持 padding mask、dropout
+  和 KV cache。每行数据是一条完整的因果序列，这与 Megatron/MindSpeed 默认（不开
+  `--reset-attention-mask`）的预训练数据一致。DSA 算子的依赖见
   [functional README](../../components/functional/README.md#deepseek-v32-dsa)。
-- **CP**（`adapter/distributed/context_parallel.py`，recipe 中 `when: cp` 的条目）：query 留在本 rank，
-  异步 all-gather indexer key 与 MLA 压缩 KV，每个 rank 只使用到本地 query 结尾的因果前缀；拼行
-  文档边界从全局 `cu_seq_lens` 投影到本地。开启 indexer KL loss 时，CP 下同样计算。
-- **EP**（recipe 中 `when: ep` 的条目）：直接使用框架内置的 `deepseekv3_ep_compute_fn`
-  （`deepseekv3_sigmoid_group_shared` 原型）。它的路由与 Transformers router 相同；token 分发、
-  本地 grouped GEMM 和合并由框架 EP 骨架完成，shared experts 与分发通信重叠计算。条目只匹配
-  MoE 层：官方 config 的 `first_k_dense_replace` 为 3，层 0-2 是 dense MLP，fnmatch 不支持数值区间，
-  所以用 `model.layers.[3-9].mlp.forward` 和 `model.layers.[1-9][0-9].mlp.forward` 两条 glob 覆盖
-  层 3-60；改变 dense 层数时要同步修改。
+- **CP**（`adapter/distributed/context_parallel.py`，YAML 中 `when: cp` 的条目，`cp_size > 1` 时生效）：
+  query 留在本 rank，异步 all-gather indexer key 与 MLA 压缩 KV，每个 rank 只使用到本地 query 结尾的
+  因果前缀。开启 indexer KL loss 时，CP 下同样计算。
+- **EP**（YAML 中 `when: ep` 的条目，`ep_size > 1` 时生效）：直接使用框架内置的
+  `deepseekv3_ep_compute_fn`（`deepseekv3_sigmoid_group_shared` 原型）。它的路由与 Transformers
+  router 相同；token 分发、本地 grouped GEMM 和合并由框架 EP 骨架完成，shared experts 与分发通信
+  重叠计算。条目只能匹配 MoE 层：裁剪模型只有第 1 层，写成 `model.layers.1.mlp.forward`；改变层数
+  或 `first_k_dense_replace` 时要同步修改。
 - **TP 分片规则**（`adapter/policies/sharding.py`）：`linear_qkv`（低秩下投影）复制，`q_b_proj` /
   `kv_b_proj` 按 head 列切，indexer 的 `wq_b` / `wk` / `weights_proj` 复制（indexer 头不切分）。
   MoE 层在 TP 下按 TP-extend-EP 处理，专家只按 EP 切分，所以 `tp_size > 1` 时 `ep_size` 也要大于 1。
 - **RoPE 物化**（`adapter/materialization.py`）：Transformers 的 `inv_freq` / `original_inv_freq` 是
-  非持久 buffer，checkpoint 里没有。模型在 meta 设备上构建、再用 `to_empty` 分配存储后，这两个
-  buffer 是未初始化的内存。materialization provider 按同一个 config 在 CPU 上算出 YaRN 频率，登记为
-  可重建 buffer，构建流程在物化后写回（与 Qwen3.5 的做法相同）。
-- **拼行文档边界**（`adapter/data/runtime.py`）：DSA 只检查 `attention_mask` 的形状，不读内容。
-  `DeepseekV32PackedSequence` 把 batch 中的全局 `cu_seq_lens` 作为 `cu_seq_lens_q` / `cu_seq_lens_k`
-  传给 DSA，文档之间互不可见。不配置它时，每行是一条完整的因果序列。
+  非持久 buffer，checkpoint 里没有。`from_pretrained` 在 meta 设备上建模型、分配存储后直接加载
+  checkpoint，不再执行 Transformers 的权重初始化，这两个 buffer 就停留在未初始化的内存（实测为
+  NaN，loss 随之变成 NaN）。materialization provider 按同一个 config 在 CPU 上算出 YaRN 频率，登记为
+  可重建 buffer，构建流程在加载后写回（与 Qwen3.5 的做法相同）。只要加载权重（官方权重、示例用的
+  裁剪 checkpoint）就需要它；`from_config` 随机初始化时 Transformers 的初始化会算出这两个 buffer。
 
 ## 依赖与权重
 
@@ -109,51 +109,76 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
 
 ## 使用
 
-### 单卡裁剪示例
+### 单卡与 8 卡裁剪示例
 
-`examples/training_demo/deepseek_v32/train_single_card.yaml` 用 `HyperAutoModelForCausalLM.from_config`
-读取官方 `config.json`，随机初始化，不加载权重。它保留官方的 hidden、MLA、indexer 和词表维度，只把
-模型裁成 2 层（第 0 层 dense、第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由的最小专家数。
-共 3.40B 参数，FP32 参数、FP32 梯度和 AdamW 两个 FP32 动量约 51 GiB（估算，不含激活），面向一张
-64 GB 的 NPU（如 910B3）。
+两个 YAML 加载同一份裁剪后的 BF16 checkpoint。它保留官方的 hidden、MLA、indexer 和词表维度，只有
+2 层（第 0 层 dense、第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由的最小专家数。共 3.40B
+参数，FP32 参数、FP32 梯度和 AdamW 两个 FP32 动量约 51 GiB（估算，不含激活）。
 
-```bash
-bash examples/training_demo/deepseek_v32/run_single_card.sh \
-    /path/to/DeepSeek-V3.2 /path/to/train.jsonl
+| | `train_single_card.yaml` | `train_8card.yaml` |
+|---|---|---|
+| 拓扑 | 单卡 | `tp 2 × cp 2 × dp 2`，FSDP 在 dp 上切分；MoE 层 `ep 4 × edp 2`，每个 EP rank 4 个专家 |
+| loss parallel | 关 | 开（按 TP 切词表） |
+| 优化器状态 | `optimizer.swap` 换出到 host，降低单卡显存 | 不换出 |
+
+除上表外两个 YAML 完全相同：`seed: 1234`、`global_batch_size: 2`、序列长度 4096、AdamW lr 1e-5
+cosine 到 1e-7、无 warmup。
+
+**1. 生成裁剪 checkpoint（一次）。** 用 Transformers 按官方 config 裁剪、随机初始化后保存，只需要官方
+目录中的 `config.json` 和 tokenizer 文件：
+
+```python
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+source, target = "/path/to/DeepSeek-V3.2", "/path/to/DeepSeek-V3.2-crop"
+config = AutoConfig.from_pretrained(
+    source, num_hidden_layers=2, first_k_dense_replace=1, n_routed_experts=16,
+    # Transformers 按读入时的 61 层推导逐层类型，覆盖层数后不会重新推导，因此一并给出。
+    mlp_layer_types=["dense", "sparse"], layer_types=["indexed_attention"] * 2,
+)
+del config.quantization_config  # 随机初始化的权重是 BF16，不是官方的 FP8
+torch.manual_seed(1234)
+AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16).save_pretrained(target)
+AutoTokenizer.from_pretrained(source).save_pretrained(target)
 ```
 
-第一个参数是官方模型目录，只读取其中的 `config.json` 和 tokenizer 文件；第二个参数是文本 JSONL，
-每行一个 JSON，正文在 `text` 字段。示例把多个文档拼成 4096 token 的行，文档边界由
-`DeepseekV32PackedSequence` 传给 DSA。更多说明见
-[examples/training_demo/README.md](../../../examples/training_demo/README.md#deepseek-v32-single-card-crop)。
-
-### 512 卡主线配方
-
-`recipes/train.yaml` 面向 64 节点 / 512 卡：dense 区域 `tp 1 × cp 1 × dp 512`，FSDP 在 512 卡上切分；
-专家区域 `ep 64 × edp 8`，每个 EP rank 持有 4 个专家，edp 内按 `edp_shard 4 × 副本 2` 做 HSDP，每张卡
-每个 MoE 层恰好 1 个专家。按 FP32 参数、梯度和两个 AdamW 动量约 16 B/param 估算，专家部分每卡约
-2.55B 参数（约 41 GB），dense 部分约 18B 参数切到 512 卡后每卡约 0.6 GB，激活另计。默认数据是
-wikitext-2（每行一个样本），只用于跑通流程。每个节点执行：
+**2. 准备数据。** 数据是 Megatron `.bin/.idx`。可以直接使用 MindSpeed 的
+`data_convert_deepseek32_pretrain.sh` 生成的数据，也可以用 HyperParallel 的工具从 JSONL 的 `text` 字段
+生成（参数见 [Offline 数据准备指南](../../../docs/guide/data/offline_preparation_guide.md)），输出为
+`/path/to/dataset/deepseek32_text_document.bin/.idx`：
 
 ```bash
-torchrun --nnodes=64 --nproc_per_node=8 --node_rank=${NODE_RANK} \
-    --master_addr=${MASTER_ADDR} --master_port=6000 \
-    scripts/train_lm.py hyper_parallel/models/deepseek_v32/recipes/train.yaml \
-    --model.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2 \
-    --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/DeepSeek-V3.2
+python -m hyper_parallel.data.tools.offline_preparation \
+    --dataset-name-or-path /path/to/train.jsonl \
+    --tokenizer-name-or-path /path/to/DeepSeek-V3.2 \
+    --output-prefix /path/to/dataset/deepseek32
 ```
 
-其它并行维度用命令行覆盖打开：
+**3. 启动。** 第一个参数是裁剪 checkpoint 目录，第二个参数是 `.bin/.idx` 的公共前缀（不带后缀）：
 
-- TP：`--accelerator.tp_size=2 --accelerator.loss_parallel=true --fsdp_config.dp_shard_size=256`
-  （dp 随 TP 减半）。
-- CP：`--accelerator.cp_size=2`，`when: cp` 的条目自动生效。
-- EP：`--accelerator.ep_size` 与 `--fsdp_config.edp_shard_size` 一起调整。
+```bash
+bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2-crop /path/to/dataset/deepseek32_text_document
+bash examples/training_demo/deepseek_v32/run_8card.sh /path/to/DeepSeek-V3.2-crop /path/to/dataset/deepseek32_text_document
+```
 
-修改拓扑时保持：`world_size = tp × cp × dp`；`dp × cp` 能被 `dp_shard_size` 整除；
-`dp × cp × tp / ep` 能被 `edp_shard_size` 整除；256 个专家能被 `ep_size` 整除；`256 / ep_size` 能被
-`edp_shard_size` 整除（否则 FSDP 按第 0 维切专家时会补空数据）；`global_batch_size` 能被
-`micro_batch_size × dp` 整除。
+日志分别写到 `output/training_demo/deepseek_v32/run_single_card.log` 和 `run_8card.log`，末尾追加的
+参数会覆盖 YAML，例如 `--training.train_iters=200`。
+
+### 检查单卡与 8 卡自洽
+
+两次运行从相同的状态出发，因此可以逐步比较：
+
+- **初始权重相同**：两边加载同一份 checkpoint。不要改用 `from_config` 随机初始化：多进程时模型先在
+  meta 设备上切分，再在各自的分片上随机初始化，单卡与 8 卡得到的初始权重不同。
+- **输入相同**：每个 4096 窗口由 seed、split、序列长度和样本数唯一决定，每步的 2 个样本在两种拓扑下
+  一样；8 卡时 dp 的两个 rank 各取 1 个样本，CP 再把序列切成两半。
+
+比较两份日志中每步的 `training/foundation_loss` 与 `training/grad_norm`。并行只改变 BF16 计算的累加
+顺序，第 1 步的差别在舍入量级，之后会随步数缓慢放大。
+[模型接入验证指南](../../../docs/guide/trainer/model_integration_validation.md)的示例把跨拓扑门限设为
+loss 绝对或相对误差不超过 5e-3、grad norm 相对误差不超过 5e-3（或绝对误差不超过 0.125），可以作为
+参考。
 
 ### 开启 indexer KL loss
 
@@ -171,14 +196,22 @@ plan_overrides:
 ```
 
 - KL loss 让 indexer 的打分分布逼近主 attention 在所有 head 上求和后的分布。TP 会把 head 切到不同
-  rank，而 KL 融合算子不做跨 rank 归约，所以 `tp_size > 1` 时开启会在构建阶段报错。
+  rank，而 KL 融合算子不做跨 rank 归约，所以 `tp_size > 1` 时开启会在构建阶段报错。8 卡示例使用
+  TP2，开启 KL 时改用 `--accelerator.tp_size=1 --accelerator.loss_parallel=false
+  --fsdp_config.dp_shard_size=4 --training.global_batch_size=4`，单卡同样改用
+  `--training.global_batch_size=4` 再比较。
 - KL 只有 CANN 实现。
 - Transformers 的 config 不认识 `dsa_loss_coeff`，`config_overrides` 和 `AutoConfig` 的同名参数都会被
   忽略，所以要写在替换条目上。
 
 ### 与 MindSpeed-LLM 做 loss 对比
 
-两边需要使用同一份权重和数据，并统一下面的设置：
+两边从同一份权重开始：HyperParallel 侧直接用单卡示例和上面生成的裁剪 checkpoint，MindSpeed 侧用
+`ckpt_convert_deepseek32_hf2mcore.sh` 转换同一个目录，转换时的并行布局要与训练脚本一致。示例的数据
+读取（同一份 `.bin/.idx`，seed 1234，split 100,0,0，每个窗口一条因果序列）和优化器设置（AdamW lr 1e-5、
+cosine 到 1e-7、无 warmup、weight decay 0.01、betas (0.9, 0.999)、梯度裁剪 1.0）已经与 MindSpeed 脚本
+一致，`global_batch_size` 和 `train_iters` 两边取相同的值。MindSpeed 脚本的 `index_topk` 是 1024，
+HyperParallel 侧在启动命令末尾加 `--model.config_overrides='{index_topk: 1024}'`。其余设置这样统一：
 
 | 项目 | HyperParallel | MindSpeed-LLM |
 |---|---|---|
@@ -186,72 +219,26 @@ plan_overrides:
 | 负载均衡 loss | 无 | `--moe-router-load-balancing-type none`，去掉 `--moe-aux-loss-coeff` |
 | 专家 bias | 用于选择，不更新 | 保留 `--moe-router-enable-expert-bias`，加 `--moe-router-bias-update-rate 0` |
 | indexer KL | 替换条目设 `dsa_loss_coeff: 1.0`（`tp_size=1`） | `--indexer-loss-coeff 1.0` |
-| `index_topk` | `model.config_overrides: {index_topk: 1024}` | `--index-topk 1024` |
+| `index_topk` | `--model.config_overrides='{index_topk: 1024}'` | `--index-topk 1024` |
 | Hadamard 旋转 | 不做 | 加 `--no-use-sparse-c8-indexer`，否则两边只差 BF16 舍入 |
 | norm 权重精度 | 前向使用 BF16 参数 | 去掉 `--init-norm-weight-in-fp32`；它让 MindSpeed 的 `RMSNorm` 与 indexer `k_norm` 的权重保持 FP32 |
-| 优化器 | `lr_scheduler.lr_config.lr_warmup_steps: 0`、`min_lr: 1.0e-7`，其余同 recipe（AdamW lr 1e-5、betas (0.9, 0.999)、weight decay 0.01、梯度裁剪 1.0、cosine） | 脚本原值：`--lr 1.0e-5`、`--min-lr 1.0e-7`、`--lr-decay-style cosine`、`--lr-warmup-iters 0`、`--weight-decay 1e-2`、`--adam-beta2 0.999`、`--clip-grad 1.0` |
-| 随机种子与确定性 | `training.seed: 1234`，`enable_full_determinism: true` | 默认 seed 1234，`--npu-deterministic` 与 `HCCL_DETERMINISTIC=true` |
+| 确定性 | `enable_full_determinism: true` | `--npu-deterministic` 与 `HCCL_DETERMINISTIC=true` |
 
-- **权重**：官方 FP8 权重先反量化成 BF16 一次，两边都使用这一份。MindSpeed 的
-  `ckpt_convert_deepseek32_hf2mcore.sh` 不做反量化；转换时的并行布局要与训练脚本一致。
-- **数据**：用 MindSpeed 的 `data_convert_deepseek32_pretrain.sh` 生成 Megatron `.bin/.idx`，两边读同一个
-  前缀。HyperParallel 侧把 recipe 的 `dataset` 与 `dataloader` 两节换成：
-
-  ```yaml
-  dataset:
-    model_assets:
-      chat_template: null
-      tokenizer:
-        _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
-        pretrained_model_name_or_path: /path/to/DeepSeek-V3.2
-        tokenizer_type: pretokenized
-        vocab_size: 129280
-        eod_token_id: 1
-    _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
-    data_path: /path/to/dataset/deepseek32_text_document   # 不带 .bin/.idx 后缀
-    data_config:
-      seq_length: 4096
-      split: "100,0,0"
-      low_level_dataset:
-        _target_: hyper_parallel.data.indexed.indexed_pretrain_dataset.GPTDataset
-      simple_blend: "no"
-      skip_data_check: true
-      labels_are_shifted: true
-      create_attention_mask_in_dataloader: false
-      create_ltor_fields_in_dataloader: false
-
-  dataloader:
-    _target_: hyper_parallel.data.batching.FixedBatchDataLoader
-    collate_fn:
-      _target_: hyper_parallel.data.batching.build_indexed_collate_fn
-    get_batch:
-      _target_: hyper_parallel.data.batching.TextParallelBatch
-      source_type: indexed
-      attention_mode: compressed
-    sampler_type: single
-    data_sharding: false
-    drop_last: true
-    num_workers: 0
-  ```
-
-  不配置 `runtime_input_adapter`，每个 4096 窗口是一条完整的因果序列，对应 MindSpeed 不开
-  `--reset-attention-mask`。两边由 seed、split、序列长度和总样本数（`train_iters × global_batch_size`）
-  决定样本顺序，这几项要一致；先比较第 1 步的 loss 再跑长程。
-- **日志**：MindSpeed 的 `lm loss` 对应 HyperParallel 的 `foundation_loss`。
+MindSpeed 的 `lm loss` 对应 HyperParallel 的 `foundation_loss`。先比较第 1 步的 loss 再跑长程。
 
 ## 已知边界
 
-- 不支持 PP：Trainer 目前不支持流水线并行，recipe 保持 `pp_size: 1`。
-- 不支持 sequence parallel：DSA 替换不支持 SP，recipe 保持 `sequence_parallel: false`。
+- 不支持 PP：Trainer 目前不支持流水线并行。
+- 不支持 sequence parallel：DSA 替换不支持 SP。
 - indexer KL loss 要求 `tp_size=1`，且只有 CANN 实现。
 - 专家 bias 不更新、没有负载均衡 loss、不训练 MTP（与 Transformers 一致）。
-- 本目录的代码在 CPU/Gloo 上验证（见下表）；NPU 上的融合算子、FSDP 分片、官方 FP8 权重的完整加载、
-  512 卡显存与端到端训练没有在本地验证。
+- 验证范围是 2 层裁剪模型：CPU/Gloo 上的并行一致性见下表；NPU 上的融合算子与单卡、8 卡运行没有
+  在本地验证。完整规格（61 层）和官方 FP8 权重的完整加载不在验证范围内。
 
 ## 测试
 
 | 测试 | 覆盖内容 |
 |---|---|
-| `tests/ut/auto_models/models/deepseek_v32/test_deepseek_v32_adapter_contracts.py` | TP 角色（`linear_qkv` 与 indexer 复制、`q_b_proj` / `kv_b_proj` 列切）；recipe 的 EP glob 只命中 MoE 层；DSA 替换在稀疏选择、稠密选择和拼行文档下的输出与梯度对齐 Transformers attention；KL loss 与 TP 互斥；meta 构建后 RoPE buffer 与 CPU 构建一致 |
-| `tests/torch/auto_models/deepseek_v32/test_deepseek_v32_parallel.py` | CPU/Gloo，经 Trainer 链路（`plan_overrides` → 模块替换 → `ShardingPlanner` → `apply_sharding_plan` → FSDP2）：CP2、CP2 + 跨 CP 切分点的拼行文档、TP2 + EP2 + loss parallel、TP2 × CP2 × EP4，loss 与全部梯度对齐单进程模型 |
+| `tests/ut/auto_models/models/deepseek_v32/test_deepseek_v32_adapter_contracts.py` | TP 角色（`linear_qkv` 与 indexer 复制、`q_b_proj` / `kv_b_proj` 列切）；两个示例的 EP 条目只命中 MoE 层、CP 条目作用于 attention；DSA 替换在稀疏选择和稠密选择下的输出与梯度对齐 Transformers attention；KL loss 与 TP 互斥；加载 checkpoint 时 RoPE buffer 与 CPU 构建一致 |
+| `tests/torch/auto_models/deepseek_v32/test_deepseek_v32_parallel.py` | CPU/Gloo，经 Trainer 链路（`plan_overrides` → 模块替换 → `ShardingPlanner` → `apply_sharding_plan` → FSDP2）：CP2、TP2 + EP2 + loss parallel、TP2 × CP2 × EP4，loss 与全部梯度对齐单进程模型 |
 | `tests/common/dsa_reference_kernels.py` | CPU 参考 DSA kernel（替代 CANN 入口），供上面两个测试使用 |
