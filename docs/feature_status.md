@@ -7,7 +7,7 @@ This document records HyperParallel's supported and planned model and system cap
 ## Supported Models
 
 - [x] Qwen3-30B-A3B
-- [x] DeepSeek-V3.2（Transformers 原生模型 + DSA/MoE 适配，2 层裁剪模型的单卡 / 8 卡示例）
+- [x] DeepSeek-V3.2 (native Transformers model with DSA/MoE integration; single-device and 8-device examples of a 2-layer cropped model)
 
 ## HyperShard
 

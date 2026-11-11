@@ -7,6 +7,7 @@
 ## 支持模型
 
 - [x] Qwen3-30B-A3B
+- [x] DeepSeek-V3.2（Transformers 原生模型 + DSA/MoE 适配，2 层裁剪模型的单卡 / 8 卡示例）
 
 ## HyperShard
 
