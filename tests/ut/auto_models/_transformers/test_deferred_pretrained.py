@@ -20,13 +20,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import BertConfig, BertForSequenceClassification
+from transformers import AutoModelForCausalLM, BertConfig, BertForSequenceClassification
 
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models._transformers.auto_model import (
-    HyperAutoModelForImageTextToText, HyperAutoModelForSequenceClassification,
+    HyperAutoModelForCausalLM, HyperAutoModelForImageTextToText,
+    HyperAutoModelForSequenceClassification,
 )
-from tests.common.mark_utils import arg_mark
 
 
 _TARGET = "hyper_parallel.models._transformers.auto_model"
@@ -54,8 +53,23 @@ def _make_check_callbacks(test_case, events, model, failed):
 class TestDeferredPretrained(unittest.TestCase):
     """Construct unquantized models from config for both finalized HF loaders."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
+    def test_from_config_binds_standard_hf_auto_model_parent(self):
+        """Feature: remote-code lookup uses the standard AutoModel identity.
+
+        Description: Delegate a HyperAutoModel config-only construction to Hugging Face.
+        Expectation: The standard parent receives the config and remote-code switch.
+        """
+        config = object()
+        model = object()
+        with patch.object(AutoModelForCausalLM, "from_config", return_value=model) as parent:
+            result = HyperAutoModelForCausalLM._from_config_parent_class(
+                config,
+                trust_remote_code=True,
+            )
+
+        self.assertIs(result, model)
+        parent.assert_called_once_with(config, trust_remote_code=True)
+
     def test_loader_selects_initial_construction_and_preserves_final_load(self):
         """Feature: automatic deferred HF loading.
 
@@ -63,8 +77,8 @@ class TestDeferredPretrained(unittest.TestCase):
         Expectation: Both loaders construct on meta without a checkpoint path and load after sharding.
         """
         for loader in ("dcp", "legacy"):
-            for is_hf_model, backend in ((True, None), (False, None), (True, ModelingBackend.GEN)):
-                with self.subTest(loader=loader, is_hf_model=is_hf_model, backend=backend):
+            for is_hf_model in (True, False):
+                with self.subTest(loader=loader, is_hf_model=is_hf_model):
                     model = torch.nn.Linear(2, 2)
                     with patch.dict(os.environ, {"HYPER_PARALLEL_HF_LOADER": loader}), \
                             patch(_TARGET + "._init_model", return_value=(None, model)) as initialize, \
@@ -73,7 +87,7 @@ class TestDeferredPretrained(unittest.TestCase):
                             patch("torch.distributed.is_initialized", return_value=False):
                         HyperAutoModelForImageTextToText._build_model(
                             "/weights", is_hf_model=is_hf_model, hf_config=None, mesh=None,
-                            sharding_planner=None, fsdp2_manager=None, backend=backend, peft_config=None,
+                            sharding_planner=None, fsdp2_manager=None, peft_config=None,
                             torch_dtype=torch.float32, attn_implementation="eager", validate_placement=False,
                             load_base_model=True, local_files_only=True, ignore_mismatched_sizes=True)
                     self.assertEqual(initialize.call_args.args[1], None)
@@ -84,8 +98,6 @@ class TestDeferredPretrained(unittest.TestCase):
                     self.assertTrue(infrastructure.call_args.kwargs["load_base_model"])
                     self.assertNotIn("init_from_config", initialize.call_args.kwargs)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_from_config_does_not_enable_checkpoint_loading(self):
         """Feature: random initialization remains independent of HF loader selection.
 
@@ -99,13 +111,11 @@ class TestDeferredPretrained(unittest.TestCase):
                 patch(_TARGET + "._current_device", return_value=torch.device("cpu")):
             HyperAutoModelForImageTextToText._build_model(
                 None, is_hf_model=False, hf_config=None, mesh=None, sharding_planner=None,
-                fsdp2_manager=None, backend=None, peft_config=None, torch_dtype=torch.float32,
+                fsdp2_manager=None, peft_config=None, torch_dtype=torch.float32,
                 attn_implementation="eager", validate_placement=False, load_base_model=False)
         self.assertIsNone(initialize.call_args.args[1])
         self.assertFalse(infrastructure.call_args.kwargs["load_base_model"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_quantized_dcp_fails_before_initial_construction(self):
         """Feature: unsupported quantized DCP initialization.
 
@@ -117,13 +127,11 @@ class TestDeferredPretrained(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "quantized initialization"):
                 HyperAutoModelForImageTextToText._build_model(
                     "/weights", is_hf_model=True, hf_config=None, mesh=None, sharding_planner=None,
-                    fsdp2_manager=None, backend=None, peft_config=None, torch_dtype=torch.float32,
+                    fsdp2_manager=None, peft_config=None, torch_dtype=torch.float32,
                     attn_implementation="eager", validate_placement=False, load_base_model=True,
                     quantization_config=object())
         initialize.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_legacy_quantized_construction_retains_transformers_loading(self):
         """Feature: Transformers-owned quantized initialization.
 
@@ -138,15 +146,13 @@ class TestDeferredPretrained(unittest.TestCase):
                 patch(_TARGET + "._current_device", return_value=torch.device("cpu")):
             HyperAutoModelForImageTextToText._build_model(
                 "/weights", is_hf_model=True, hf_config=None, mesh=None, sharding_planner=None,
-                fsdp2_manager=None, backend=None, peft_config=None, torch_dtype=torch.float32,
+                fsdp2_manager=None, peft_config=None, torch_dtype=torch.float32,
                 attn_implementation="eager", validate_placement=False, load_base_model=True,
                 quantization_config=quantization)
         self.assertEqual(initialize.call_args.args[1], "/weights")
         self.assertIs(initialize.call_args.kwargs["quantization_config"], quantization)
         self.assertFalse(infrastructure.call_args.kwargs["is_meta_device"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_real_single_rank_model_loads_exact_weights_without_transformers_preload(self):
         """Feature: finalized single-rank pretrained loading.
 
@@ -166,15 +172,13 @@ class TestDeferredPretrained(unittest.TestCase):
                             patch(_TARGET + "._current_device", return_value=torch.device("cpu")):
                         model = HyperAutoModelForSequenceClassification._build_model(
                             directory, is_hf_model=True, hf_config=config, mesh=None,
-                            sharding_planner=None, fsdp2_manager=None, backend=None, peft_config=None,
+                            sharding_planner=None, fsdp2_manager=None, peft_config=None,
                             torch_dtype=torch.float32, attn_implementation="eager", validate_placement=False,
                             load_base_model=True, local_files_only=True, ignore_mismatched_sizes=True)
                     self.assertEqual(model._hp_checkpoint_load_report.missing_keys, ())
                     for name, expected in source.state_dict().items():
                         torch.testing.assert_close(model.state_dict()[name], expected, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_public_pretrained_checks_finalized_model_and_propagates_failure(self):
         """Feature: generic weight checking.
 
@@ -203,8 +207,6 @@ class TestDeferredPretrained(unittest.TestCase):
                             self.assertIs(auto_class.from_pretrained("/weights", **options), model)
                         self.assertEqual(verifier.call_count, int(enabled))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_public_pretrained_rejects_check_without_loading(self):
         """Feature: weight-check preconditions.
 

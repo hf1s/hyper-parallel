@@ -39,7 +39,6 @@ from hyper_parallel.distributed_data.balancing_algorithm import (
 )
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.trainer.config.target import Target
-from tests.common.mark_utils import arg_mark
 
 
 build_dataloader_module = importlib.import_module("hyper_parallel.data.batching.build_dataloader")
@@ -100,10 +99,24 @@ def _batch_ids(batch: tuple) -> list[int]:
     return sorted(sample["id"] for sample in batch)
 
 
+def _legacy_loader_state(state: dict, metadata_mode: bool) -> dict:
+    """Build the former Reader-tree checkpoint from the shared native fields."""
+    sampler = copy.deepcopy(state["_index_sampler_state"])
+    payload = dict(state["dataset_state"], epoch=sampler["epoch"])
+    reader = {"epoch": sampler["epoch"], "sampler": sampler,
+              "sample_loader": None if metadata_mode else payload}
+    return {
+        "global_rank": 0, "epoch": sampler["epoch"], "step": sampler["consumed_samples"] // 2,
+        "stopped": state["_iterator_finished"],
+        "dataset_reader": None if metadata_mode else reader,
+        "metadata_reader": reader if metadata_mode else None,
+        "direct_sample_loader": payload if metadata_mode else None,
+    }
+
+
 class TestNativeBatchSampler(unittest.TestCase):
     """Test without process groups or accelerator hardware."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_fixed_membership_without_dynamic_selection(self) -> None:
         """Feature: Fixed native round membership.
         Description: Read short samples with online and offline metadata.
@@ -120,7 +133,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 loader.wait_for_prefetch()
                 self.assertEqual(sorted(dataset.reads), list(range(6)))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_native_mode_does_not_construct_dynamic_selector(self) -> None:
         """Feature: Native sampler ownership.
         Description: Build online and offline native loaders and consume a batch.
@@ -132,7 +144,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
                 self.assertFalse(hasattr(loader, "_step_sample_selector"))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cyclic_order_and_epoch_remain_native(self) -> None:
         """Feature: Cyclic sampler epoch behavior.
         Description: Compare loader output with both native cyclic sharding policies across epochs.
@@ -149,7 +160,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                     expected = [sorted(indices) for indices in reference]
                     self.assertEqual([_batch_ids(batch) for batch in loader], expected)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_duplicate_indices_are_distinct_occurrences(self) -> None:
         """Feature: Independent sampling occurrences.
         Description: Reuse one metadata object for duplicate online or offline sample indices.
@@ -180,7 +190,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                     self.assertEqual(dataset.reads, [3] * 4)
                 self.assertIsNone(shared_metadata.key)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_at_optimizer_boundary_excludes_prefetch(self) -> None:
         """Feature: Native sampler checkpoint replay.
         Description: Restore a complete step with or without legacy version fields in both metadata modes.
@@ -196,16 +205,15 @@ class TestNativeBatchSampler(unittest.TestCase):
                 self.assertEqual(sampler.consumed_samples, 6)
                 state = loader.state_dict()
                 owner = "metadata_reader" if metadata_mode else "dataset_reader"
-                self.assertEqual(state[owner]["sampler"]["consumed_samples"], 4)
-                payload_state = state["direct_sample_loader"] if metadata_mode else state[owner]["sample_loader"]
-                self.assertNotIn("version", state[owner])
-                self.assertNotIn("version", payload_state)
+                self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 4)
+                self.assertNotIn(owner, state)
+                self.assertNotIn("version", state["dataset_state"])
                 original = [_batch_ids(batch) for batch in loader]
                 for reader_key, legacy_version in (
                         ("metadata_reader", None), ("metadata_reader", 0), ("sidecar_reader", 1),
                 ):
                     with self.subTest(reader_key=reader_key, legacy_version=legacy_version):
-                        restored_state = copy.deepcopy(state)
+                        restored_state = _legacy_loader_state(state, metadata_mode)
                         if legacy_version is not None:
                             restored_state[owner]["version"] = legacy_version
                             payload_state = (
@@ -219,7 +227,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                         self.assertEqual([_batch_ids(batch) for batch in resumed], original)
                 self.assertEqual(original[0], [4, 5])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_restore_uses_current_sampler_seed(self) -> None:
         """Feature: Native sampler checkpoint replay.
         Description: Restore the committed cursor with a different sampler seed.
@@ -233,10 +240,9 @@ class TestNativeBatchSampler(unittest.TestCase):
                 ) as loader:
                     next(loader)
                     state = loader.state_dict()
-                owner = "metadata_reader" if metadata_mode else "dataset_reader"
                 reference = _sampler(sampler_type="cyclic", seed=14)
                 reference.enable_source_batch_resume()
-                reference.load_state_dict(state[owner]["sampler"])
+                reference.load_state_dict(state["_index_sampler_state"])
                 with _loader(
                         _TrackedDataset(), sampler=_sampler(sampler_type="cyclic", seed=14),
                         metadata_mode=metadata_mode,
@@ -247,7 +253,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                         "Restored progress must follow the current sampler's seed.",
                     )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_restore_uses_current_tensor_index_mapping(self) -> None:
         """Feature: Native sampler index mapping.
         Description: Restore the committed cursor with a different tensor mapping.
@@ -269,7 +274,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                     resumed.load_state_dict(state)
                     self.assertEqual([_batch_ids(batch) for batch in resumed], [[4, 4]] * 3)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_existing_native_cursor_is_respected(self) -> None:
         """Feature: Restored native sampler progress.
         Description: Build the loader with a sampler that already has a cursor and epoch.
@@ -279,9 +283,8 @@ class TestNativeBatchSampler(unittest.TestCase):
         sampler.epoch = 2
         loader = _loader(_TrackedDataset(), sampler=sampler)
         self.assertEqual(_batch_ids(next(loader)), [4, 5])
-        self.assertEqual(loader.state_dict()["epoch"], 2)
+        self.assertEqual(loader.state_dict()["_index_sampler_state"]["epoch"], 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_failure_does_not_look_like_exhaustion(self) -> None:
         """Feature: Metadata callback error reporting.
         Description: Raise StopIteration while extracting sample metadata.
@@ -300,7 +303,6 @@ class TestNativeBatchSampler(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid metadata callback"):
             next(loader)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_callback_errors_propagate_without_wrapping(self) -> None:
         """Feature: Direct callback error propagation.
         Description: Fail sample metadata extraction with a ValueError.
@@ -317,9 +319,8 @@ class TestNativeBatchSampler(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 next(loader)
         self.assertIs(caught.exception, failure)
-        self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 0)
+        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_native_sampler_options_fail_at_build(self) -> None:
         """Feature: Native sampler input validation.
         Description: Build with incompatible sampler interfaces, DP parameters, or cursors.
@@ -343,7 +344,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 batch_sampler=_sampler(), metadata_fn=_metadata, pack_fn=lambda samples, _: samples,
             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_reader_advances_only_on_complete_commit(self) -> None:
         """Feature: Transactional sampler progress.
         Description: Reject empty or partial commits, repeat preparation, and restore committed progress.
@@ -375,7 +375,6 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertIsNone(reader.prepare_next_step(1))
         self.assertEqual([item.key.dataset_index for item in reader.metadata()], [0, 1])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_reader_uses_explicit_window_size_without_lookahead(self) -> None:
         """Feature: Caller-owned source window sizes.
         Description: Request three then two rounds, followed by a partial epoch tail.
@@ -401,7 +400,6 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertEqual(reader.metadata(), ())
         reader.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_reader_rejects_invalid_window_sizes_before_reading(self) -> None:
         """Feature: Explicit source window validation.
         Description: Request invalid counts before reading the first window.
@@ -419,7 +417,6 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertEqual(reader.metadata(), ())
         reader.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_reader_retains_original_groups_through_split_commit_and_replay(self) -> None:
         """Feature: Original source grouping.
         Description: Read repeated indices with online, offline and split metadata, then commit and restore.
@@ -465,7 +462,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 finally:
                     reader.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_builder_reuses_sampler_and_collator(self) -> None:
         """Feature: Trainer balancing enablement.
         Description: Enable balancing with a configured collator and repeated index mapping.
@@ -487,7 +483,6 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertIs(build.call_args.kwargs["collate_fn"], collator)
         self.assertEqual(next(iter(build.call_args.kwargs["batch_sampler"])), [3, 3])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_forwards_balance_logging_switch(self) -> None:
         """Feature: Trainer repacking, balancing gain and log configuration.
         Description: Omit or set load_balance options, then try invalid values and size overrides.
@@ -537,7 +532,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 with self.subTest(name=name), self.assertRaisesRegex(ValueError, f"cannot override.*{name}"):
                     build({name: value})
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_balance_disabled_preserves_native_loader(self) -> None:
         """Feature: Disabled balancing.
         Description: Construct the Trainer loader without a balancing block.
@@ -558,7 +552,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 self.assertIs(loaders[0].batch_sampler, samplers[0])
                 self.assertEqual(_batch_ids(next(iter(loaders[0]))), [0, 1])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_defaults_to_feasibility_repair(self) -> None:
         """Feature: Default feasibility-repair selection.
         Description: Build a balanced loader without an explicit assignment policy.
@@ -575,7 +568,6 @@ class TestNativeBatchSampler(unittest.TestCase):
             algorithm = resolve_balancing_algorithm(build.call_args.kwargs["balancing_algorithm"])
             self.assertIs(type(algorithm), FeasibleLPTBalancingAlgorithm)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_preserves_explicit_balancing_policies(self) -> None:
         """Feature: Explicit assignment policy selection.
         Description: Supply a policy directly or through a configured target.
@@ -602,7 +594,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 )
                 self.assertIs(resolve_balancing_algorithm(build.call_args.kwargs["balancing_algorithm"]), policy)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_dataset_context_preserves_cache_options(self) -> None:
         """Feature: Standalone Dataset ownership.
         Description: Derive native ownership when no Trainer context is supplied.
@@ -614,7 +605,6 @@ class TestNativeBatchSampler(unittest.TestCase):
             self.assertTrue(build.call_args.kwargs["data_index_cache"])
             self.assertFalse(build.call_args.kwargs["shared_storage"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_balance_block_rejects_scalars_and_old_dataset_options(self) -> None:
         """Feature: Balancing configuration migration.
         Description: Supply scalar blocks or obsolete Dataset balancing options.
@@ -635,7 +625,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                         data_config=data_config,
                     )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_uses_dataset_metadata_for_direct_reads(self) -> None:
         """Feature: Trainer offline metadata loading.
         Description: Consume a Dataset through the Trainer builder with indexed metadata.
@@ -660,7 +649,6 @@ class TestNativeBatchSampler(unittest.TestCase):
         self.assertEqual([sample["id"] for batch in batches for sample in batch], list(range(len(dataset))))
         self.assertEqual(dataset.reads, list(range(len(dataset))))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_online_mode_ignores_dataset_metadata(self) -> None:
         """Feature: Online metadata isolation.
         Description: Supply an unrelated Dataset metadata attribute in online mode.
@@ -678,7 +666,6 @@ class TestNativeBatchSampler(unittest.TestCase):
         with dataloaders[0] as loader:
             self.assertEqual(_batch_ids(next(loader)), [0, 1])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_offline_mode_requires_explicit_metadata(self) -> None:
         """Feature: Explicit offline metadata source.
         Description: Enable offline mode without supplying indexed metadata.
@@ -695,7 +682,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 data_config=data_config,
             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_rejects_dynamic_batch_selection(self) -> None:
         """Feature: Native selection mode validation.
         Description: Enable balancing with a second dynamic batch selector.
@@ -711,7 +697,6 @@ class TestNativeBatchSampler(unittest.TestCase):
                 data_config={"seq_length": 16},
             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_uses_rank_local_payload_device(self) -> None:
         """Feature: Rank-local communication device selection.
         Description: Build a CUDA loader while the current device is rank-local device 3.

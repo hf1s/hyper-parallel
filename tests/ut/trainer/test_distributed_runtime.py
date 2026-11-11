@@ -24,14 +24,11 @@ from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecision
 from hyper_parallel.trainer.config.parallelism import AcceleratorConfig
 from hyper_parallel.trainer.runtime import distributed as runtime
 from hyper_parallel.trainer.runtime.distributed import destroy_process_group
-from tests.common.mark_utils import arg_mark
 
 
 class TestDestroyProcessGroup(unittest.TestCase):
     """Verify process-group teardown clears caches from their current owners."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.trainer.runtime.distributed.dist.is_initialized", return_value=False)
     def test_clears_pipeline_p2p_group_cache(self, mock_is_initialized) -> None:
         """Teardown imports and clears the cache from core pipeline parallel."""
@@ -46,8 +43,6 @@ class TestDestroyProcessGroup(unittest.TestCase):
 class TestFSDPSetup(unittest.TestCase):
     """Verify FSDP configuration reaches the model builder at every DP size."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_strategy_depends_on_initialization_instead_of_parallel_size(self) -> None:
         """Feature: Size-independent Trainer FSDP setup.
         Description: Configure default, global and custom-only precision in single-rank, DP and TP domains.
@@ -71,11 +66,22 @@ class TestFSDPSetup(unittest.TestCase):
                     )
                     with patch.object(runtime.dist, "is_initialized", return_value=initialized), \
                             patch.object(runtime.dist, "get_world_size", return_value=world_size), \
-                            patch.object(runtime, "_build_device_mesh_from_accelerator",
-                                         return_value=(MeshContext(), None)):
+                            patch.object(MeshContext, "build_meshs"):
                         setup = runtime.create_distributed_setup_from_config(config)
 
                     self.assertIs(setup.strategy_config, config.fsdp_config if initialized else None)
+
+    def test_non_positive_parallel_degree_keeps_compatibility_clamp(self) -> None:
+        """Shared topology preserves the Trainer's historical minimum of one."""
+        config = SimpleNamespace(
+            accelerator=AcceleratorConfig(tp_size=0),
+            fsdp_config=FSDP2Config(),
+            optimizer=SimpleNamespace(fp32_main_params=False),
+        )
+
+        setup = runtime.create_distributed_setup_from_config(config)
+
+        self.assertEqual(setup.mesh_context.tp_size, 1)
 
 
 if __name__ == "__main__":

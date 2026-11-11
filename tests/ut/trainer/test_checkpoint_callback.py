@@ -17,15 +17,26 @@
 import os
 import tempfile
 import unittest
+import weakref
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel.core.distributed_checkpoint.async_persist import build_staged_state_dict
+from hyper_parallel.core.optimizer.muon import Muon
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from hyper_parallel.core.optimizer.sharding_category import HSDPGroupAssignment, ParamRecord, build_owner_by_size
 from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
-from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
+from hyper_parallel.trainer.callbacks.checkpoint_callback import (
+    CheckpointerCallback,
+    _cleanup_muon_checkpoint_state,
+    _state_leaf_keys,
+)
 from hyper_parallel.trainer.state import TrainerState
-from tests.common.mark_utils import arg_mark
 
 _CALLBACK_MODULE = "hyper_parallel.trainer.callbacks.checkpoint_callback"
 _SUCCESS_LOG = "Checkpoint loaded successfully"
@@ -127,6 +138,7 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
         """Run the callback's restore hook and return the stubbed module logger."""
         with patch(f"{_CALLBACK_MODULE}.build_checkpointer", return_value=checkpointer), \
                 patch(f"{_CALLBACK_MODULE}.initialize_optimizer_state", return_value=True), \
+                patch(f"{_CALLBACK_MODULE}.get_device_rng_state", return_value=None), \
                 patch(f"{_CALLBACK_MODULE}.logger") as log:
             callback = CheckpointerCallback(trainer)
             callback.on_train_begin(trainer.state)
@@ -144,12 +156,6 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
         emitted = [str(call.args[0])[:40] for call in log.info.call_args_list if call.args]
         raise AssertionError(f"no {_SUCCESS_LOG!r} log was emitted, got={emitted}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_weights_only_restore_reports_a_fresh_position(self) -> None:
         """Load weights without the extra_state bundle and still report a position.
 
@@ -187,12 +193,6 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
             f"weights-only restore must report a fresh position: expected=(0, 0, 0), got={reported}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_train_state_restore_maps_the_step_onto_an_epoch_position(self) -> None:
         """Map a restored global step onto its epoch and offset within that epoch.
 
@@ -236,16 +236,28 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
             f"restore must not carry the resume position on the trainer, got={carried}",
         )
 
+    def test_restore_uses_loader_owned_state_template(self) -> None:
+        """Feature: Loader-owned checkpoint restoration.
+        Description: Supply an optional loading template while toggling loader-state restoration.
+        Expectation: The checkpointer receives the template only when loader restoration is enabled.
+        """
+        for restore_loader in (False, True):
+            with self.subTest(restore_loader=restore_loader), tempfile.TemporaryDirectory() as restore_from:
+                trainer = self._build_trainer(restore_from, restore_train_state=True)
+                trainer.config.checkpoint.restore_dataloader_state = restore_loader
+                template = {"_index_sampler_state": {"consumed_samples": None}}
+                checkpointer = _FakeCheckpointer({"global_step": 1, "epoch": 0})
+                with patch.object(trainer.train_dataloader, "state_dict_for_load", create=True,
+                                  return_value=template) as load_template:
+                    self._restore(trainer, checkpointer)
+                expected = template if restore_loader else trainer.train_dataloader.state_dict()
+                self.assertEqual(checkpointer.skeleton_seen["train_dataloader"], expected)
+                self.assertEqual(load_template.call_count, int(restore_loader))
+
 
 class TestCheckpointerCallbackAsyncFailure(unittest.TestCase):
     """Verify when a failed asynchronous save reaches the training loop."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_step_end_reports_a_failed_async_save_before_the_next_save(self) -> None:
         """Raise a failed async save at the next step, not at the next save.
 
@@ -403,8 +415,6 @@ class TestCheckpointerCallbackExternalValidation(unittest.TestCase):
                 patch(f"{_CALLBACK_MODULE}.build_checkpointer"):
             return CheckpointerCallback(trainer)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_and_peft_checkpointing_are_rejected(self) -> None:
         """Host external state requires synchronous non-PEFT checkpointing."""
         for flag in ({"is_async": True}, {"is_peft": True}):
@@ -412,29 +422,21 @@ class TestCheckpointerCallbackExternalValidation(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "synchronous non-PEFT"):
                     self._build(CheckpointingConfig(**flag))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_partial_save_is_rejected(self) -> None:
         """Host checkpoints must save optimizer and train state together."""
         with self.assertRaisesRegex(ValueError, "requires optimizer and train-state saving"):
             self._build(CheckpointingConfig(save_optimizer=False))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_partial_restore_is_rejected(self) -> None:
         """Host restores must include optimizer and train state together."""
         with self.assertRaisesRegex(ValueError, "restore requires optimizer and train state"):
             self._build(CheckpointingConfig(restore_from="x", restore_train_state=False))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_pp_requires_per_rank_extra_state(self) -> None:
         """Host PP checkpoints must write extra state per rank."""
         with self.assertRaisesRegex(ValueError, "per-rank extra state"):
             self._build(CheckpointingConfig(save_extra_state_per_rank=False), pp_size=2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_compatible_configuration_passes(self) -> None:
         """A synchronous, complete, per-rank configuration is accepted."""
         callback = self._build(CheckpointingConfig())
@@ -444,12 +446,8 @@ class TestCheckpointerCallbackExternalValidation(unittest.TestCase):
 class TestStateLeafKeys(unittest.TestCase):
     """Dense optimizer manifest flattening."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nested_optimizer_state_flattens_to_leaf_keys(self) -> None:
         """DCP traversal lists every persisted dense optimizer leaf."""
-        from hyper_parallel.trainer.callbacks.checkpoint_callback import _state_leaf_keys
-
         keys = _state_leaf_keys({"state": {"w": {"exp_avg": 1}}, "param_groups": []})
         self.assertEqual(keys, frozenset({"state.w.exp_avg", "param_groups"}))
 
@@ -457,8 +455,6 @@ class TestStateLeafKeys(unittest.TestCase):
 class TestModelStateDictExternal(unittest.TestCase):
     """External parameter exclusion from the persisted model state."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_external_parameters_are_stripped(self) -> None:
         """The dense payload drops every external FQN."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -467,8 +463,6 @@ class TestModelStateDictExternal(unittest.TestCase):
             state_dict = callback._model_state_dict()
         self.assertEqual(state_dict, {"dense": 1})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_missing_external_fqn_is_rejected(self) -> None:
         """Every external FQN must exist in the model state dict."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -481,8 +475,6 @@ class TestModelStateDictExternal(unittest.TestCase):
 class TestSaveCheckpointExternal(unittest.TestCase):
     """External sidecar publication during checkpoint save."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_save_publishes_persisted_dense_keys(self) -> None:
         """The external save receives the dense optimizer leaf manifest."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -495,8 +487,6 @@ class TestSaveCheckpointExternal(unittest.TestCase):
         self.assertEqual(external.saved_runtime.persisted_optimizer_keys,
                          frozenset({"state.w"}))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_save_without_optimizer_publishes_an_empty_manifest(self) -> None:
         """A weights-only save reports no persisted dense optimizer keys."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -511,8 +501,6 @@ class TestSaveCheckpointExternal(unittest.TestCase):
 class TestLoadOptimizerPayloadExternal(unittest.TestCase):
     """Dense optimizer restore with external-state priming."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_unpersisted_dense_state_is_dropped(self) -> None:
         """Primed optimizer state outside the manifest is dropped after load."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -522,8 +510,6 @@ class TestLoadOptimizerPayloadExternal(unittest.TestCase):
         optimizer.load_state_dict.assert_called_once_with({"state": {}})
         optimizer.drop_unpersisted_dense_state.assert_called_once_with(frozenset({"state"}))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_weights_only_reload_restores_main_params(self) -> None:
         """Without optimizer leaves, mixed-precision main params are reloaded."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -546,8 +532,6 @@ class TestApplyRestoredPayloadExternal(unittest.TestCase):
                 missing_keys=["host"], unexpected_keys=[]))
         return callback
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dense_keys_must_match_external_exclusions(self) -> None:
         """A dense payload that is not exactly the complement raises."""
         callback = self._ready_callback()
@@ -556,8 +540,6 @@ class TestApplyRestoredPayloadExternal(unittest.TestCase):
             callback._apply_restored_payload(
                 {"model": {"dense": 1}}, [], external, None, "path", None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_load_result_keys_must_match_external_exclusions(self) -> None:
         """Unexpected missing keys from load_state_dict raise."""
         callback = self._ready_callback()
@@ -569,8 +551,6 @@ class TestApplyRestoredPayloadExternal(unittest.TestCase):
             callback._apply_restored_payload(
                 {"model": {"dense": 1}}, [], external, None, "path", None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_weights_only_restore_reloads_mixed_precision_main_params(self) -> None:
         """A weights-only load finishes external state without optimizer moments."""
         callback = self._ready_callback()
@@ -604,8 +584,6 @@ class TestLoadCheckpointExternal(unittest.TestCase):
                 missing_keys=["host"], unexpected_keys=[]))
         return callback
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_no_restore_path_returns_early(self) -> None:
         """Without a restore path the load hook is a no-op."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -613,8 +591,6 @@ class TestLoadCheckpointExternal(unittest.TestCase):
         callback._load_checkpoint()
         callback.checkpointer.load.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_matching_dense_manifest_passes(self) -> None:
         """A load plan whose keys survive the skeleton proceeds to apply."""
         external = _FakeExternalState({"host": object()}, frozenset({"w"}))
@@ -625,8 +601,6 @@ class TestLoadCheckpointExternal(unittest.TestCase):
         self.assertEqual(external.load_runtime.step_dir, "ckpt_dir")
         callback._apply_restored_payload.assert_called_once()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_lost_dense_optimizer_keys_are_rejected(self) -> None:
         """Persisted keys missing from the loaded skeleton raise."""
         external = _FakeExternalState({"host": object()}, frozenset({"w", "lost"}))
@@ -755,6 +729,165 @@ class TestHuggingFaceCheckpointCallback(unittest.TestCase):
                 os.path.join(checkpoint_dir, "global_step_2", "hf_ckpt")
             )
             build_checkpointer.return_value.save.assert_not_called()
+
+
+def _replica_muon(optimizer_type=Muon):
+    """Provide one authoritative and one checkpoint-only momentum copy."""
+    owner = torch.nn.Parameter(torch.ones(2, 2))
+    replica = torch.nn.Parameter(torch.ones(2, 2))
+    optimizer = optimizer_type([owner, replica])
+    records = [ParamRecord(0, owner), ParamRecord(1, replica)]
+    assignment = HSDPGroupAssignment(
+        owned_records=records[:1], all_records=records,
+        owner_by_index={0: (0,), 1: (1,)},
+        replicate_group_ranks=(0,), replicate_sizes=(2,),
+    )
+    optimizer._hsdp_assignment_batches = {
+        0: {"batch_groups": [{"sub_batches": [assignment]}]},
+    }
+    optimizer.state[owner]["momentum_buffer"] = torch.ones_like(owner)
+    optimizer.state[replica]["momentum_buffer"] = torch.full_like(replica, 2)
+    return optimizer, owner, replica, assignment
+
+
+def _callback(optimizer):
+    """Reuse the trainer fixture for optimizer snapshot lifecycle checks."""
+    trainer = _external_trainer(CheckpointingConfig())
+    trainer.optimizer = optimizer
+    callback = _bare_callback(trainer)
+    callback._save_train_state = False
+    callback._last_saved_step = -1
+    callback._model_state_dict = lambda: {"ephemeral": torch.ones(2)}
+    return callback
+
+
+class TestMuonCheckpointState(unittest.TestCase):
+    """Snapshotting separates writer state from live Muon replica cleanup."""
+
+    def test_save_releases_copies_after_snapshotting_without_waiting(self) -> None:
+        """A staged payload survives cleanup and subsequent owner updates."""
+        for save_async in (False, True):
+            with self.subTest(save_async=save_async):
+                self._check_snapshot_cleanup(save_async)
+
+    def _check_snapshot_cleanup(self, save_async: bool) -> None:
+        """Give each save mode its own writer state and callbacks."""
+        optimizer, owner, replica, _ = _replica_muon()
+        callback = _callback(optimizer)
+        callback._is_async = save_async
+        staged, payload_ref = [], []
+
+        def _write(_: str, payload: Dict[str, Any], **_kwargs: Any) -> None:
+            self.assertIn(replica, optimizer.state)
+            payload_ref.append(weakref.ref(payload["model"]["ephemeral"]))
+            staged.append(build_staged_state_dict(payload))
+
+        callback.checkpointer = SimpleNamespace(
+            save=_write, maybe_wait_for_async_save=MagicMock(),
+        )
+        momentum = optimizer.state[owner]["momentum_buffer"]
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=None):
+            callback._save_checkpoint(TrainerState(global_step=3))
+        self.assertIsNone(payload_ref[0]())
+        self.assertNotIn(replica, optimizer.state)
+        self.assertIs(optimizer.state[owner]["momentum_buffer"], momentum)
+        callback.checkpointer.maybe_wait_for_async_save.assert_not_called()
+        momentum.add_(10)
+        for index, expected in ((0, 1), (1, 2)):
+            torch.testing.assert_close(
+                staged[0]["optimizer"]["state"][index]["momentum_buffer"],
+                torch.full_like(owner, expected),
+            )
+
+    def test_failed_save_keeps_live_replica_state(self) -> None:
+        """No successful snapshot handoff occurs when save raises."""
+        optimizer, _, replica, _ = _replica_muon()
+        callback = _callback(optimizer)
+        callback.checkpointer.save.side_effect = OSError("save failed")
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=None):
+            with self.assertRaisesRegex(OSError, "save failed"):
+                callback._save_checkpoint(TrainerState(global_step=3))
+        self.assertIn(replica, optimizer.state)
+
+    def test_restore_cleans_after_apply_and_uses_external_dense_target(self) -> None:
+        """All restore consumers finish before ordinary or external dense cleanup."""
+        for external_state in (False, True):
+            with self.subTest(external_state=external_state):
+                self._check_restore_cleanup(external_state)
+
+    def _check_restore_cleanup(self, external_state: bool) -> None:
+        """Give each restore mode its own optimizer and consumers."""
+        optimizer, owner, replica, _ = _replica_muon()
+        outer = SimpleNamespace() if external_state else optimizer
+        callback = _callback(outer)
+        callback._resolve_restore_path = lambda: "ckpt"
+        callback._build_restore_skeleton = lambda *_args: ({"model": {}}, [outer])
+        callback._resume_position = lambda: (0, 0)
+        external = SimpleNamespace(
+            optimizer_for_dcp=lambda: optimizer,
+            before_checkpoint_load=lambda _runtime: None,
+        ) if external_state else None
+        callback._apply_restored_payload = lambda *_args: self.assertIn(replica, optimizer.state)
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=external), \
+                patch(f"{_CALLBACK_MODULE}.empty_cache"):
+            callback._load_checkpoint()
+        self.assertIn(owner, optimizer.state)
+        self.assertNotIn(replica, optimizer.state)
+
+    def test_external_save_cleans_the_actual_dense_target(self) -> None:
+        """An opaque host coordinator exposes its ordinary dense Muon explicitly."""
+        optimizer, owner, replica, _ = _replica_muon()
+        callback = _callback(SimpleNamespace(state_dict=optimizer.state_dict))
+        external = SimpleNamespace(optimizer_for_dcp=lambda: optimizer, before_checkpoint_save=MagicMock())
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=external):
+            callback._save_checkpoint(TrainerState(global_step=3))
+        self.assertIn(owner, optimizer.state)
+        self.assertNotIn(replica, optimizer.state)
+
+    def test_frozen_parameter_without_an_owner_keeps_restored_momentum(self) -> None:
+        """An absent assignment is not evidence that a frozen state is a replica."""
+        optimizer, frozen, replica, assignment = _replica_muon()
+        frozen.requires_grad_(False)
+        assignment.owner_by_index = build_owner_by_size(assignment.all_records, assignment.replicate_sizes)
+        assignment.replicate_group_ranks = (1,)
+        self.assertNotIn(0, assignment.owner_by_index)
+        self.assertFalse(assignment.is_owned(assignment.all_records[1]))
+        momentum = optimizer.state[frozen]["momentum_buffer"]
+        _cleanup_muon_checkpoint_state(optimizer)
+        self.assertIs(optimizer.state[frozen]["momentum_buffer"], momentum)
+        self.assertNotIn(replica, optimizer.state)
+
+    def test_subclasses_and_unknown_wrappers_keep_their_lifecycle(self) -> None:
+        """Only exact native Muon leaves are cleaned by this helper."""
+        class ExtendedMuon(Muon):
+            """Custom state lifetimes are outside ordinary Muon cleanup."""
+
+        for optimizer_type in (Muon, ExtendedMuon):
+            optimizer, _, replica, _ = _replica_muon(optimizer_type)
+            target = SimpleNamespace(optimizer=optimizer) if optimizer_type is Muon else optimizer
+            _cleanup_muon_checkpoint_state(target)
+            self.assertIn(replica, optimizer.state)
+
+    def test_mixed_precision_chain_preserves_owner_and_adam_state(self) -> None:
+        """Reuse existing wrapper traversal without touching Adam or owner values."""
+        optimizer, owner, replica, _ = _replica_muon()
+        model = torch.nn.Module()
+        model.register_parameter("owner", owner)
+        model.register_parameter("replica", replica)
+        bias = torch.nn.Parameter(torch.ones(1))
+        model.register_parameter("bias", bias)
+        adam = torch.optim.AdamW([bias])
+        adam.state[bias]["exp_avg"] = torch.ones(1)
+        momentum = optimizer.state[owner]["momentum_buffer"]
+        exp_avg = adam.state[bias]["exp_avg"]
+        chain = ChainedOptimizer(model, {"muon": optimizer, "adamw": adam})
+        assignments = optimizer._hsdp_assignment_batches
+        wrapped = Float16OptimizerWithFloat16Params(chain, model)
+        optimizer._hsdp_assignment_batches = assignments
+        _cleanup_muon_checkpoint_state(wrapped)
+        self.assertIs(optimizer.state[owner]["momentum_buffer"], momentum)
+        self.assertNotIn(replica, optimizer.state)
+        self.assertIs(adam.state[bias]["exp_avg"], exp_avg)
 
 
 if __name__ == "__main__":

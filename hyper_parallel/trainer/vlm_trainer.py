@@ -149,16 +149,6 @@ class VLMTrainer:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
         if getattr(config.dataloader.get_batch, "encoder_parallel", None) is not None:
             raise ValueError("encoder_parallel belongs under accelerator, not dataloader.get_batch")
-        get_batch = config.dataloader.get_batch.build(
-            mesh_context=self.base.mesh,
-            dataloader_context=self.base.dataloader_context,
-            device=self.base.device,
-            data_config=getattr(config.dataset, "data_config", {}),
-            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
-        )
-        bind_model = getattr(get_batch, "bind_model", None)
-        if callable(bind_model):
-            bind_model(self.base.model)
         encoder_runtime = build_encoder_parallel_runtime(
             config=config.accelerator.encoder_parallel,
             mesh_context=self.base.mesh,
@@ -166,12 +156,16 @@ class VLMTrainer:
             model_adapter_spec=resolve_model_adapter(self.base.model),
             execution_options={
                 "micro_batch_size": int(config.training.micro_batch_size),
-                "activation_checkpoint": config.activation_checkpoint.mode,
-                "cp_size": self.base.mesh.cp_size,
-                "sequence_parallel": self.base.mesh.sequence_parallel,
                 "compile_enabled": bool(config.compile.enabled),
                 "validate_placement": bool(getattr(config.model, "validate_placement", False)),
             },
+        )
+        get_batch = config.dataloader.get_batch.build(
+            mesh_context=self.base.mesh,
+            dataloader_context=self.base.dataloader_context,
+            device=self.base.device,
+            data_config=getattr(config.dataset, "data_config", {}),
+            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
@@ -222,6 +216,14 @@ class VLMTrainer:
         """
         self.base.on_micro_step_begin(micro_batch)
 
+    def on_micro_step_end(self, loss_dict: dict[str, torch.Tensor]) -> None:
+        """Dispatch the micro-step-end lifecycle hook.
+
+        Args:
+            loss_dict: Named losses and metrics from the completed forward-backward step.
+        """
+        self.base.on_micro_step_end(loss_dict)
+
     def on_step_end(
             self,
             loss: Any = None,
@@ -244,25 +246,20 @@ class VLMTrainer:
     def forward_backward_step(
             self,
             data_iterator: Any,
-            num_micro_steps: int,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Fetch and execute one forward-backward micro-step.
 
         Args:
             data_iterator: Iterator providing one multimodal batch per call.
-            num_micro_steps: Number of FB steps in the current optimizer step.
 
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
         model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
-        self.base.step_token_counts = {
-            name: token_count * num_micro_steps
-            for name, token_count in self.base.current_token_counts.items()
-        }
         self.on_micro_step_begin(model_inputs)
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
+        self.on_micro_step_end(loss_dict)
 
         return loss, loss_dict
 
@@ -277,6 +274,7 @@ class VLMTrainer:
         """
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
+        self.base.begin_loss_step()
 
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
@@ -294,14 +292,13 @@ class VLMTrainer:
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
             loss, loss_dict = self.forward_backward_step(
                 data_iterator,
-                num_micro_steps,
             )
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
-        grad_norm = self.base.prepare_optimizer_step()
+        total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
         self.base.step_optimizers_and_schedulers()
 
         # Checkpoint and logging callbacks observe completed optimizer updates.

@@ -24,7 +24,6 @@ import torch
 
 from hyper_parallel.trainer.config.data import ModelAssetsConfig
 from hyper_parallel.trainer.config.training import DebugConfig
-from tests.common.mark_utils import arg_mark
 from hyper_parallel.trainer.base import BaseTrainer
 
 
@@ -50,8 +49,6 @@ TextTrainer = _load_text_trainer()
 class TestTextTrainer(unittest.TestCase):
     """Verify text training streams prepared batches into callbacks."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_template_logging_is_independent_of_dataset_debug(self) -> None:
         """Feature: Independent template debug configuration.
 
@@ -77,12 +74,6 @@ class TestTextTrainer(unittest.TestCase):
                     chat_template_kwargs={}, log_first_rendered_template=enabled,
                 )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_forward_backward_dispatches_metric_hook_before_forward(self) -> None:
         """Send detached metric inputs before executing the model forward.
 
@@ -133,7 +124,7 @@ class TestTextTrainer(unittest.TestCase):
         trainer = TextTrainer.__new__(TextTrainer)
         trainer.base = base
 
-        loss, loss_dict = trainer.forward_backward_step(iter(()), num_micro_steps=1)
+        loss, loss_dict = trainer.forward_backward_step(iter(()))
 
         self.assertEqual(events, ["hook", "forward", "end"], f"expected lifecycle hook order, got={events}")
         base.on_micro_step_end.assert_called_once_with(loss_dict)
@@ -168,7 +159,7 @@ class TestTextTrainer(unittest.TestCase):
         trainer = TextTrainer.__new__(TextTrainer)
         trainer.base = base
         with self.assertRaisesRegex(RuntimeError, "microstep failed"):
-            trainer.forward_backward_step(iter(()), num_micro_steps=1)
+            trainer.forward_backward_step(iter(()))
         base.on_micro_step_begin.assert_called_once()
         base.on_micro_step_end.assert_not_called()
 

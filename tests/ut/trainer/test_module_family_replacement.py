@@ -16,7 +16,6 @@
 
 import copy
 import unittest
-from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional
 from unittest.mock import patch
 
@@ -26,13 +25,11 @@ from torch import nn
 
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.auto_parallel._layer_census import replacement_specs
-from hyper_parallel.codegen.manager import _apply_generation_replacements
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements, module_replacement
 from hyper_parallel.trainer.config.parallelism import ReplaceAction, entries_to_module_replacements
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_config
 from hyper_parallel.trainer.config.target import Target
-from tests.common.mark_utils import arg_mark
 
 
 @module_replacement
@@ -141,12 +138,6 @@ class TestFamilyReplacement(unittest.TestCase):
             )
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_yaml_real_replacement_and_autograd(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -188,12 +179,6 @@ class TestFamilyReplacement(unittest.TestCase):
                     else:
                         self.assertIsNone(weight.grad)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_public_replace_action_preserves_family_selection(self) -> None:
         """
         Feature: Module Family selection through the public replacement action.
@@ -215,21 +200,6 @@ class TestFamilyReplacement(unittest.TestCase):
         model = _install(nn.Sequential(nn.Linear(4, 3)), roundtrip)
         self.assertIsInstance(model[0], AddmmLinear)
 
-    def test_codegen_records_selected_family_variant(self) -> None:
-        """The generated constructor targets the selected variant, not the baseline."""
-        raw = _raw_config(algorithm="matmul")
-        raw["plan_overrides"][0]["replace"].pop("source_type")
-        raw["plan_overrides"][0]["replace"].pop("exact_type")
-        config = resolve_config(raw)
-        model = nn.Sequential(nn.Linear(4, 3))
-        dims = SimpleNamespace(tp_size=1, cp_size=1, ep_size=1, pp_size=1, sequence_parallel=False)
-        records = _apply_generation_replacements(
-            SimpleNamespace(), config, model, SimpleNamespace(parallel_dims=dims),
-        )
-        self.assertEqual(records[0]["factory"], f"{__name__}.MatmulLinear")
-        self.assertEqual(records[0]["module_type"], "torch.nn.modules.linear.Linear")
-        self.assertIsInstance(model[0], MatmulLinear)
-
     def test_census_uses_selected_family_variant(self) -> None:
         """The cost-model replacement uses the same family selector as training."""
         raw = _raw_config(algorithm="matmul")
@@ -240,12 +210,6 @@ class TestFamilyReplacement(unittest.TestCase):
         apply_module_replacements(model, compile_module_replacements(model, rules))
         self.assertIsInstance(model[0], MatmulLinear)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_aliases_use_one_selected_instance(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -263,12 +227,6 @@ class TestFamilyReplacement(unittest.TestCase):
         self.assertIs(model.left.weight, weight)
         self.assertIsInstance(model.left, MatmulLinear)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_roundtrip_and_copy_keep_explicit_selectors(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -289,12 +247,6 @@ class TestFamilyReplacement(unittest.TestCase):
             self.assertIs(roundtrip.callable, target.callable)
         self.assertEqual(restored.selectors, {"algorithm": "reference", "fused": False})
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_invalid_configuration_fails_before_model_construction(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -310,12 +262,6 @@ class TestFamilyReplacement(unittest.TestCase):
             with self.subTest(selectors=selectors), self.assertRaises(ConfigResolutionError):
                 resolve_config(_raw_config(**selectors))
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_target_overrides_reject_extra_path_segments(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -330,12 +276,6 @@ class TestFamilyReplacement(unittest.TestCase):
         with self.assertRaises(ConfigResolutionError):
             replace_override_path(original, ["fused"], True, path="replace.implementation")
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_ordinary_replacements_keep_original_target_policy(self) -> None:
         """
         Feature: Module Family construction-time selection.
@@ -354,12 +294,6 @@ class TestFamilyReplacement(unittest.TestCase):
         self.assertEqual(model[0].algorithm, "not-a-selector")
         self.assertEqual(model[0].options, {"custom_option": 42, "callback": None})
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_programmatic_target_uses_same_family_selection(self) -> None:
         """
         Feature: Module Family construction-time selection.

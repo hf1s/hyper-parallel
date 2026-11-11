@@ -24,7 +24,6 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from tests.common.mark_utils import arg_mark
 from tests.ut.distributed_data.test_accumulation_window import _GatedDataset, _ids, _loader
 from tests.ut.distributed_data.test_batch_sampler import _TrackedDataset, _loader as _native_loader, _sampler
 
@@ -32,7 +31,6 @@ from tests.ut.distributed_data.test_batch_sampler import _TrackedDataset, _loade
 class TestOptimizerStepPrefetch(unittest.TestCase):
     """Check bounded input buffering and complete-step checkpoint progress."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_prefetch_is_bounded_by_current_and_next_window(self) -> None:
         """Feature: Window-sized double buffering.
         Description: Prefetch with accumulation smaller, larger or not divisible by the configured window.
@@ -68,10 +66,9 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     for batch in loader:
                         delivered.append(_ids(batch))
                         boundary = len(delivered) // accumulation * accumulation
-                        self.assertEqual(loader.state_dict()["step"], boundary)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 2 * boundary)
                     self.assertEqual(delivered, [list(range(i, i + 2)) for i in range(0, len(dataset), 2)])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_restart_without_partial_gradients_replays_optimizer_update(self) -> None:
         """Feature: Training recovery at optimizer boundaries.
         Description: Interrupt the second step after one backward and restore weights, moments, RNG and data.
@@ -125,7 +122,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             for key, value in expected_moments[0].items():
                 torch.testing.assert_close(restored_optimizer.state_dict()["state"][0][key], value, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_short_tail_does_not_advance_optimizer_checkpoint(self) -> None:
         """Feature: Incomplete epoch tails.
         Description: Deliver a full three-round step followed by a two-round tail.
@@ -139,8 +135,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             for _ in range(4):
                 next(loader)
             state = loader.state_dict()
-            self.assertEqual(state["step"], 3)
-            self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 6)
+            self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 6)
             with self.assertRaises(StopIteration):
                 next(loader)
             exhausted = loader.state_dict()
@@ -153,7 +148,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             restored.set_epoch(1)
             self.assertEqual([_ids(batch) for batch in restored], [list(range(i, i + 2)) for i in range(0, 10, 2)])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_full_step_is_ready_and_only_one_successor_is_prefetched(self) -> None:
         """Feature: Complete-step double buffering.
         Description: Finish source reads, packing and staging for two steps before consuming the first.
@@ -178,19 +172,17 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                 self.assertEqual({thread for _, thread in staged}, {loader._prefetch_thread})
                 self.assertIsNot(loader._prefetch_thread, current_thread())
                 state = loader.state_dict()
-                self.assertEqual(state["step"], 0)
-                self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 0)
-                self.assertNotIn("window", state["dataset_reader"])
+                self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 0)
+                self.assertNotIn("dataset_reader", state)
                 self.assertNotIn("optimizer_step_remaining", state)
                 for _ in range(3):
                     loader.prefetch()
                 self.assertEqual(dataset.reads, list(range(12)))
                 self.assertEqual(_ids(next(loader)), [2, 3])
                 self.assertEqual(_ids(next(loader)), [4, 5])
-                self.assertEqual(loader.state_dict()["step"], 3)
+                self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 6)
                 self.assertEqual(dataset.reads, list(range(12)))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_slow_next_window_does_not_block_current_delivery_or_checkpoint(self) -> None:
         """Feature: Independent current and future windows.
         Description: Block the next window in reading, planning, exchange or staging, including inside a step.
@@ -238,7 +230,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             resumed.load_state_dict(state)
             self.assertEqual([_ids(batch) for batch in resumed], [[0, 1], [2, 3], [4, 5], *expected])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_resume_replays_incomplete_steps_across_subwindows(self) -> None:
         """Feature: Checkpointing window speculation at optimizer boundaries.
         Description: Resume online/offline loaders inside and between differently sized balancing windows.
@@ -261,10 +252,9 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     with _loader(**options) as resumed:
                         resumed.load_state_dict(state)
                         boundary = count // accumulation * accumulation
-                        self.assertEqual(state["step"], boundary)
+                        self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 2 * boundary)
                         self.assertEqual([_ids(batch) for batch in resumed], delivered[boundary:])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_prefetch_preserves_three_three_three_one_planning(self) -> None:
         """Feature: Independent optimizer and balancing windows.
         Description: Buffer at most three rounds at a time while accumulating ten rounds per optimizer step.
@@ -284,7 +274,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             self.assertEqual(batches, [list(range(i, i + 2)) for i in range(0, 44, 2)])
             self.assertEqual(counts, [3, 3, 3, 1, 3, 3, 3, 1, 2, 0])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_future_failure_is_deferred_until_current_step_finishes(self) -> None:
         """Feature: Speculative error delivery.
         Description: Fail the next optimizer step while three current batches are ready.
@@ -301,12 +290,11 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             self.assertEqual(_ids(next(loader)), [2, 3])
             self.assertEqual(_ids(next(loader)), [4, 5])
             state = loader.state_dict()
-            self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 6)
+            self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 6)
             with self.assertRaises(ValueError) as caught:
                 next(loader)
             self.assertIs(caught.exception, error)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_host_device_binding_and_training_stream_delivery(self) -> None:
         """Feature: Accelerator micro-batch ownership.
         Description: Prepare CPU-shaped test inputs under a mocked CUDA stream and event API.
@@ -339,7 +327,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             module.synchronize.assert_not_called()
         self.assertEqual(module.Stream.return_value.synchronize.call_count, 1)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_epoch_reset_reuses_producer_and_training_stream(self) -> None:
         """Feature: Loader-owned producer lifetime.
         Description: Consume full, partial and dropped epochs with online or offline metadata.
@@ -365,8 +352,8 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                         self.assertIsNone(loader._future)
                         self.assertIsNone(next(loader, None))
                         loader.set_epoch(epoch)
-                        self.assertEqual(loader.state_dict()["epoch"], epoch)
-                        self.assertEqual(loader.state_dict()["step"], 0)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["epoch"], epoch)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
                         self.assertEqual([_ids(batch) for batch in loader], expected)
                         self.assertIs(loader._prefetch_thread, worker)
                         module.Event.return_value.record.assert_called_with(module.current_stream.return_value)
@@ -381,7 +368,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "closed loader"):
                     loader.set_epoch(3)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_epoch_reset_waits_for_undelivered_prefetch(self) -> None:
         """Feature: Safe epoch changes before first delivery.
         Description: Reset while the initial speculative step is blocked on the producer.
@@ -418,11 +404,10 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     release.set()
                 reset.result(timeout=5)
             self.assertIsNone(loader._future)
-            self.assertEqual(loader.state_dict()["epoch"], 1)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["epoch"], 1)
             self.assertEqual([_ids(batch) for batch in loader], [list(range(i, i + 2)) for i in range(0, 44, 2)])
             self.assertIs(loader._prefetch_thread, worker)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_explicit_prefetch_wait_drains_current_tail_without_a_future(self) -> None:
         """Feature: Explicit device drain at an incomplete epoch tail.
         Description: Deliver a short step that has no successor, then explicitly wait for prefetch.
@@ -443,10 +428,9 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             module.current_stream.return_value.wait_event.assert_not_called()
             loader.wait_for_prefetch()
             event.synchronize.assert_called_once_with()
-            self.assertEqual(loader.state_dict()["step"], 0)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
         self.assertEqual(module.Stream.return_value.synchronize.call_count, 1)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_device_initialization_failure_reaches_consumer(self) -> None:
         """Feature: Failed producer initialization.
         Description: Fail device binding before the background thread reads any source data.
@@ -461,9 +445,8 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 next(loader)
             self.assertIs(caught.exception, error)
-            self.assertEqual(loader.state_dict()["step"], 0)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_initial_sampler_offset_requires_optimizer_boundary(self) -> None:
         """Feature: Complete-step initial cursors.
         Description: Start one round into an optimizer step without saved gradients.
@@ -474,7 +457,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete optimizer step"):
             _native_loader(dataset, sampler=sampler, balance_window_size=3)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_same_epoch_after_prefetch_preserves_undelivered_inputs(self) -> None:
         """Feature: Idempotent initial epoch selection.
         Description: Prefetch a full step before setting the current epoch again.
@@ -493,7 +475,6 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             self.assertEqual(dataset.reads, list(range(6, 12)))
             self.assertEqual([_ids(batch) for batch in loader], [list(range(i, i + 2)) for i in range(6, 18, 2)])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_legacy_checkpoint_requires_complete_optimizer_step(self) -> None:
         """Feature: Legacy checkpoint boundaries.
         Description: Restore complete-step checkpoints and reject every partial-step representation.
@@ -519,21 +500,20 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     invalid = copy.deepcopy(state)
                     owner = "metadata_reader" if metadata_mode else "dataset_reader"
                     if field == "step":
-                        invalid["step"] += 1
+                        invalid["step"] = 1
                     elif field == "remaining":
                         invalid["optimizer_step_remaining"] = 2
                     elif field == "plans":
                         invalid["window_plans"] = (None,)
                     elif field == "window":
-                        invalid[owner]["window"] = {"rounds": 3, "delivered_rounds": 1}
+                        invalid[owner] = {"window": {"rounds": 3, "delivered_rounds": 1}}
                     else:
-                        invalid[owner]["sampler"]["consumed_samples"] += 2
+                        invalid["_index_sampler_state"]["consumed_samples"] += 2
                     with self.subTest(field=field), _native_loader(
                             dataset, sampler=_sampler(total_samples=18, global_batch_size=6), **options,
                     ) as resumed, self.assertRaisesRegex(ValueError, "complete optimizer step"):
                         resumed.load_state_dict(invalid)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_workers_and_epoch_reset_preserve_step_replay(self) -> None:
         """Feature: Reusable source workers on the step producer.
         Description: Read two epochs and restart an incomplete step with persistent or transient workers.

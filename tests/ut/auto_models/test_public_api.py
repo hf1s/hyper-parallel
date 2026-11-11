@@ -32,7 +32,6 @@ from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.trainer import config as trainer_config
 from hyper_parallel.trainer.config import AcceleratorConfig, CompileConfig
-from tests.common.mark_utils import arg_mark
 
 
 def _field_snapshot(cls):
@@ -56,8 +55,6 @@ def _field_snapshot(cls):
 class TestShardingConfigContracts(unittest.TestCase):
     """Sharding spec/plan/template dataclass field snapshots."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_module_sharding_spec_fields(self):
         """ModuleShardingSpec field order and defaults stay unchanged.
 
@@ -78,7 +75,6 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("_tp_local_attr_plan", "None"),
                 ("_deferred_bias_params", "()"),
                 ("is_boundary", "True"),
-                ("skip_source_lowering", "None"),
                 ("region_dispatch", "None"),
                 ("inner_target", "None"),
                 ("inner_wrapper", "None"),
@@ -93,8 +89,6 @@ class TestShardingConfigContracts(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_sharding_plan_fields(self):
         """ShardingPlan field order and defaults stay unchanged.
 
@@ -114,8 +108,6 @@ class TestShardingConfigContracts(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_sharding_template_fields(self):
         """ShardingTemplate field order and defaults stay unchanged.
 
@@ -143,8 +135,6 @@ class TestShardingConfigContracts(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_sharding_planner_signature(self):
         """ShardingPlanner constructor signature stays unchanged.
 
@@ -164,8 +154,6 @@ class TestShardingConfigContracts(unittest.TestCase):
 class TestTrainerConfigContracts(unittest.TestCase):
     """Trainer-facing config dataclass field snapshots."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_accelerator_config_fields(self):
         """AcceleratorConfig field order and defaults stay unchanged.
 
@@ -189,8 +177,6 @@ class TestTrainerConfigContracts(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_compile_config_fields(self):
         """
         Feature: Dynamic joint-graph training.
@@ -215,8 +201,6 @@ class TestTrainerConfigContracts(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_low_precision_config_fields(self):
         """LowPrecisionConfig field order and defaults stay unchanged.
 
@@ -235,8 +219,6 @@ class TestTrainerConfigContracts(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_trainer_config_module_all(self):
         """Check the public configuration exports.
 
@@ -279,8 +261,6 @@ class TestTrainerConfigContracts(unittest.TestCase):
 class TestOptimizerContracts(unittest.TestCase):
     """Optimizer wrapper constructor signature snapshots."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
         """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged.
 
@@ -318,8 +298,6 @@ class TestOptimizerContracts(unittest.TestCase):
             "lr_config: dict) -> None",
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
         """optim package and mixed_precision_optimizer ``__all__`` stay unchanged.
 

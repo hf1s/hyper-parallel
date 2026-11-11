@@ -20,7 +20,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from tests.common.mark_utils import arg_mark
+import torch
+
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
 
@@ -28,7 +31,6 @@ base_module = importlib.import_module("hyper_parallel.trainer.base")
 class TestBaseTrainerCleanup(unittest.TestCase):
     """Tests for cleaning up the data iterator on exceptional exits."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_dataset_ownership_follows_loader_balance_block(self) -> None:
         """Feature: Dataset rank participation.
         Description: Build Dataset splits with absent, empty and populated loader balance settings.
@@ -69,12 +71,6 @@ class TestBaseTrainerCleanup(unittest.TestCase):
         trainer.train_steps = 1
         return trainer
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
     def test_train_stops_data_iterator_when_training_or_callback_raises(self) -> None:
         """
         Feature: BaseTrainer lifecycle cleanup.
@@ -99,12 +95,6 @@ class TestBaseTrainerCleanup(unittest.TestCase):
 class TestHcclDeterminismSetup(unittest.TestCase):
     """Check that HCCL receives its reproducibility flag before group creation."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
     def test_hccl_flag_is_set_before_distributed_initialization(self) -> None:
         """The communicator must read the flag when it is initialized."""
         trainer = MagicMock()
@@ -148,12 +138,6 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         )
         return trainer
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
     def test_build_optimizer_delegates_to_external_state(self) -> None:
         """
         Feature: Host external-state optimizer wiring.
@@ -192,16 +176,10 @@ class TestBaseTrainerExternalState(unittest.TestCase):
                         swap_wrap.assert_not_called()
                     self.assertEqual(wrapped, expected)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
-    def test_prepare_optimizer_step_uses_external_norm(self) -> None:
+    def test_clip_grad_norm_uses_external_norm(self) -> None:
         """
         Feature: Host external-state gradient clipping.
-        Description: Run prepare_optimizer_step with external state present.
+        Description: Run clipping with external state present.
         Expectation: The external preparation drives after_clip and its global norm is returned.
         """
         trainer = MagicMock()
@@ -211,10 +189,81 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         preparation = SimpleNamespace(post_clip_norm=0.5, global_norm=2.0)
         external.prepare_optimizer_step.return_value = preparation
         with patch.object(base_module, "get_model_external_state", return_value=external):
-            result = base_module.BaseTrainer.prepare_optimizer_step(trainer)
+            result = base_module.BaseTrainer.clip_grad_norm(trainer)
         self.assertEqual(result, 2.0)
-        external.prepare_optimizer_step.assert_called_once_with(max_norm=1.0)
+        external.prepare_optimizer_step.assert_called_once_with(max_norm=1.0, gradient_divisor=1.0)
         trainer.model_integration.after_clip.assert_called_once_with(0.5)
+
+
+    def test_main_grad_normalizes_before_clipping(self) -> None:
+        """Feature: FP32 main-gradient normalization.
+
+        Description: Exercise main_grad with absent or stale ordinary gradients.
+        Expectation: Clipping sees the scaled FP32 buffer; diagnostic metrics stay unchanged.
+        """
+        for ordinary_grad in (None, torch.tensor([[99.]], dtype=torch.bfloat16)):
+            trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+            trainer.model = torch.nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+            trainer.model.weight.main_grad = torch.tensor([[1200.]])
+            trainer.model.weight.grad = ordinary_grad
+            trainer.mesh = SimpleNamespace(dp_cp_mesh=None)
+            trainer.loss_names = ("foundation_loss",)
+            trainer.step_token_counts = {"foundation_tokens": torch.tensor(600)}
+            trainer.model.external_weight = torch.nn.Parameter(torch.tensor([0.]))
+            trainer.model.external_weight.grad = torch.tensor([1200.])
+            trainer.model._hp_external_state = SimpleNamespace(  # pylint: disable=protected-access
+                parameters={"external_weight": trainer.model.external_weight},
+            )
+            trainer.clip_grad_norm = MagicMock(
+                side_effect=lambda grad=trainer.model.weight.main_grad, **kwargs: grad.item(),
+            )
+            metrics = {"foundation_loss": 1200.0, "diagnostic": 7.0}
+            self.assertEqual(trainer.prepare_optimizer_step(1200.0, metrics), (2.0, 2.0))
+            self.assertEqual(metrics, {"foundation_loss": 2.0, "diagnostic": 7.0})
+            trainer.clip_grad_norm.assert_called_once_with(gradient_divisor=600)
+            torch.testing.assert_close(trainer.model.external_weight.grad, torch.tensor([1200.]))
+            self.assertIs(trainer.model.weight.grad, ordinary_grad)
+            if ordinary_grad is not None:
+                torch.testing.assert_close(ordinary_grad, torch.tensor([[99.]], dtype=torch.bfloat16))
+
+
+    def test_host_gradients_normalize_before_joint_clipping(self) -> None:
+        """Feature: External gradient normalization.
+
+        Description: Normalize dense and sparse gradients together, then apply joint clipping.
+        Expectation: Normalization precedes the joint norm/clipping and each gradient is scaled once.
+        """
+        table = HostEngramTable(
+            source_weight=torch.nn.Parameter(torch.empty((2, 1), device="meta")), logical_rows=2,
+        )
+        table.bind_planned_shard(ep_rank=0, ep_size=1)
+        table.weight = torch.nn.Parameter(torch.zeros((2, 1)))
+        model = torch.nn.Module()
+        model.register_parameter("dense", torch.nn.Parameter(torch.zeros(1)))
+        model.add_module("embed", table)
+        model.dense.grad = torch.tensor([12.])
+        for value in (4., 12.):
+            table.append_rows(torch.tensor([0]), torch.tensor([[value]]))
+        external = DeepseekV41HostState(model, {"embed": table}, None)
+        external.optimizer = SimpleNamespace(state="ACCUMULATING")
+        model._hp_external_state = external  # pylint: disable=protected-access
+        trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+        trainer.model, trainer.device = model, torch.device("cpu")
+        trainer.mesh = SimpleNamespace(dp_cp_mesh=None)
+        trainer.config = SimpleNamespace(training=SimpleNamespace(max_grad_norm=2.5))
+        trainer.model_integration = MagicMock()
+        trainer.fsdp_runtime_diagnostics = None
+        trainer.loss_names = ("foundation_loss",)
+        trainer.begin_loss_step()
+        trainer.step_token_counts = {"foundation_tokens": torch.tensor(4)}
+        metrics = {"foundation_loss": 28., "diagnostic": 9.}
+        loss, norm = trainer.prepare_optimizer_step(28., metrics)
+        self.assertEqual(loss, 7.)
+        self.assertEqual(metrics, {"foundation_loss": 7., "diagnostic": 9.})
+        torch.testing.assert_close(norm, torch.tensor(5.))
+        scale = (2.5 / (5. + 1.e-6)) / 4
+        torch.testing.assert_close(model.dense.grad, torch.tensor([12. * scale]))
+        torch.testing.assert_close(table.pending.values(), torch.tensor([[16. * scale]]))
 
 
 if __name__ == "__main__":
