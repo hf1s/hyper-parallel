@@ -33,10 +33,9 @@ models/deepseek_v32/
     └── train.yaml                   # 完整规格的单进程配方（master 已有，未在本目录的验证范围内）
 
 examples/training_demo/deepseek_v32/
-├── train_single_card.yaml           # 裁剪模型，单卡
-├── train_8card.yaml                 # 同一裁剪模型，8 卡（TP2 × CP2 × DP2，EP4）
+├── train_single_card.yaml           # 裁剪模型，单卡拓扑；8 卡在它上面用命令行覆盖拓扑
 ├── run_single_card.sh
-└── run_8card.sh
+└── run_8card.sh                     # tp 2 × cp 2 × dp 2，ep 4 × edp 2，loss parallel
 ```
 
 ## 训练语义
@@ -111,18 +110,15 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
 
 ### 单卡与 8 卡裁剪示例
 
-两个 YAML 加载同一份裁剪后的 BF16 checkpoint。它保留官方的 hidden、MLA、indexer 和词表维度，只有
-2 层（第 0 层 dense、第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由的最小专家数。共 3.40B
-参数，FP32 参数、FP32 梯度和 AdamW 两个 FP32 动量约 51 GiB（估算，不含激活）。
+示例加载一份裁剪后的 BF16 checkpoint。它保留官方的 hidden、MLA、indexer 和词表维度，只有 2 层（第 0
+层 dense、第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由的最小专家数。共 3.40B 参数，FP32
+参数、FP32 梯度和 AdamW 两个 FP32 动量约 51 GiB（估算，不含激活），单卡用 `optimizer.swap` 把优化器
+状态换出到 host。
 
-| | `train_single_card.yaml` | `train_8card.yaml` |
-|---|---|---|
-| 拓扑 | 单卡 | `tp 2 × cp 2 × dp 2`，FSDP 在 dp 上切分；MoE 层 `ep 4 × edp 2`，每个 EP rank 4 个专家 |
-| loss parallel | 关 | 开（按 TP 切词表） |
-| 优化器状态 | `optimizer.swap` 换出到 host，降低单卡显存 | 不换出 |
-
-除上表外两个 YAML 完全相同：`seed: 1234`、`global_batch_size: 2`、序列长度 4096、AdamW lr 1e-5
-cosine 到 1e-7、无 warmup。
+单卡和 8 卡共用 `train_single_card.yaml`：`run_single_card.sh` 按 YAML 的单卡拓扑运行；
+`run_8card.sh` 用命令行覆盖成 `tp 2 × cp 2 × dp 2`（FSDP 在 dp 上切分）、MoE 层 `ep 4 × edp 2`（每个
+EP rank 4 个专家）并打开 loss parallel，其余设置完全相同：`seed: 1234`、`global_batch_size: 2`、序列
+长度 4096、AdamW lr 1e-5 cosine 到 1e-7、无 warmup。
 
 **1. 生成裁剪 checkpoint（一次）。** 用 Transformers 按官方 config 裁剪、随机初始化后保存，只需要官方
 目录中的 `config.json` 和 tokenizer 文件：

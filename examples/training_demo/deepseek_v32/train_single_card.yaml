@@ -1,4 +1,4 @@
-# DeepSeek-V3.2 单卡裁剪示例。
+# DeepSeek-V3.2 裁剪示例，单卡和 8 卡共用。
 #
 # 加载按官方 config 裁剪的 BF16 checkpoint：保留 hidden、MLA、indexer 和词表维度，只有 2 层
 # （第 0 层 dense、第 1 层 MoE）和 16 个路由专家；16 是保持官方分组路由（n_group=8、
@@ -6,13 +6,14 @@
 # 共 3.40B 参数，FP32 参数 + FP32 梯度 + AdamW 两个 FP32 动量 ≈ 16 B/param，约 51 GiB，再加激活
 # （未实测）；optimizer.swap 把优化器状态换出到 host，面向 64 GB 单卡（如 910B3）。
 #
-# 与 train_8card.yaml 只差 accelerator、fsdp_config 和 optimizer.swap，两者的结果应当自洽：
-# 两边加载同一份 checkpoint；数据是 Megatron .bin/.idx，每个 4096 窗口是一条完整的因果序列，
-# 两边每步读同样的 2 个样本。训练语义与 Transformers 一致（router bias 不更新，没有负载均衡
-# loss 和 MTP，不训练 indexer），见 hyper_parallel/models/deepseek_v32/README.md。
+# 下面的拓扑是单卡；run_8card.sh 用命令行覆盖成 tp 2 × cp 2 × dp 2、ep 4，其余设置不变，两次运行
+# 的结果应当自洽：两边加载同一份 checkpoint；数据是 Megatron .bin/.idx，每个 4096 窗口是一条完整
+# 的因果序列，两边每步读同样的 2 个样本。训练语义与 Transformers 一致（router bias 不更新，没有
+# 负载均衡 loss 和 MTP，不训练 indexer），见 hyper_parallel/models/deepseek_v32/README.md。
 #
 # 启动：
 #   bash examples/training_demo/deepseek_v32/run_single_card.sh /path/to/DeepSeek-V3.2-crop /path/to/data_prefix
+#   bash examples/training_demo/deepseek_v32/run_8card.sh /path/to/DeepSeek-V3.2-crop /path/to/data_prefix
 
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained

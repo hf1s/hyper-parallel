@@ -116,18 +116,18 @@ overrides may be appended to either command.
 
 ## DeepSeek-V3.2 cropped demos
 
-[`train_single_card.yaml`](deepseek_v32/train_single_card.yaml) and
-[`train_8card.yaml`](deepseek_v32/train_8card.yaml) load the same cropped BF16
-checkpoint: the released hidden, MLA, indexer, and vocabulary dimensions with two
-decoder layers (one dense, one MoE) and 16 routed experts, the fewest that keep
-the released group routing (`n_group=8`, `topk_group=4`, top-8). The model has
-3.40B parameters; FP32 parameters, FP32 gradients and the two FP32 AdamW moments
-take about 51 GiB before activations (estimated, not measured). The single-card
-configuration swaps the optimizer states to host memory for a 64 GB device such
-as 910B3; the eight-device configuration runs TP2 × CP2 × DP2 with EP4 and loss
-parallelism. Everything else is identical, including the seed, the global batch
-of two 4096-token windows from a Megatron `.bin/.idx` dataset, and the optimizer,
-so the two runs can be compared step by step.
+[`train_single_card.yaml`](deepseek_v32/train_single_card.yaml) loads a cropped
+BF16 checkpoint: the released hidden, MLA, indexer, and vocabulary dimensions
+with two decoder layers (one dense, one MoE) and 16 routed experts, the fewest
+that keep the released group routing (`n_group=8`, `topk_group=4`, top-8). The
+model has 3.40B parameters; FP32 parameters, FP32 gradients and the two FP32
+AdamW moments take about 51 GiB before activations (estimated, not measured), and
+the optimizer states are swapped to host memory for a 64 GB device such as 910B3.
+`run_single_card.sh` runs this YAML on one device; `run_8card.sh` runs the same
+YAML with command-line overrides for TP2 × CP2 × DP2, EP4 and loss parallelism.
+Everything else is identical, including the seed, the global batch of two
+4096-token windows from a Megatron `.bin/.idx` dataset, and the optimizer, so the
+two runs can be compared step by step.
 
 Training follows the Transformers model: the router keeps its selection bias
 fixed, there is no balance loss or MTP, and the indexer is not trained. The

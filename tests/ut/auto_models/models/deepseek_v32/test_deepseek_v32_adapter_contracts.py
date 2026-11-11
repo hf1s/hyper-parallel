@@ -119,7 +119,7 @@ class TestDeepseekV32ExampleTopology(unittest.TestCase):
     def test_ep_entries_target_exactly_the_moe_layers(self):
         """Feature: DeepSeek-V3.2 EP plan overrides.
 
-        Description: Activate each example at CP>1 and EP>1 and match its MLP globs against the cropped depth.
+        Description: Activate the example at CP>1 and EP>1 and match its MLP globs against the cropped depth.
         Expectation: Only MoE layers receive the EP compute and attention receives the CP wrapper.
         """
         mlps = [f"model.layers.{index}.mlp" for index in range(len(_CROPPED_MLP_LAYER_TYPES))]
@@ -131,14 +131,12 @@ class TestDeepseekV32ExampleTopology(unittest.TestCase):
             from hyper_parallel.trainer.config.parser import (  # pylint: disable=import-outside-toplevel
                 parse_training_args,
             )
-            for name in ("train_single_card.yaml", "train_8card.yaml"):
-                with self.subTest(example=name):
-                    entries = parse_training_args([str(_EXAMPLES / name)]).plan_overrides
-                    active = entries_to_plan_overrides(entries, cp_size=2, ep_size=4)
-                    ep_globs = [key for key, spec in active.items() if spec.local_compute_fn is not None]
-                    matched = [mlp for mlp in mlps if any(fnmatch.fnmatchcase(mlp, glob) for glob in ep_globs)]
-                    self.assertEqual(matched, sparse)
-                    self.assertIsNotNone(active["*.self_attn"].inner_wrapper)
+            entries = parse_training_args([str(_EXAMPLES / "train_single_card.yaml")]).plan_overrides
+            active = entries_to_plan_overrides(entries, cp_size=2, ep_size=4)
+            ep_globs = [key for key, spec in active.items() if spec.local_compute_fn is not None]
+            matched = [mlp for mlp in mlps if any(fnmatch.fnmatchcase(mlp, glob) for glob in ep_globs)]
+            self.assertEqual(matched, sparse)
+            self.assertIsNotNone(active["*.self_attn"].inner_wrapper)
 
 
 class TestDeepseekV32DSAAttention(unittest.TestCase):

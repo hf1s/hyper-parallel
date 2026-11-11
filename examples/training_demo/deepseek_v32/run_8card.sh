@@ -48,12 +48,19 @@ fi
 
 cd "${PROJECT_ROOT}"
 mkdir -p "${OUTPUT_DIR}"
-# Launch with the YAML settings; trailing Trainer arguments override its defaults.
+# The single-card YAML with an eight-device topology: TP2 x CP2 x DP2 and EP4 x EDP2
+# with loss parallelism. Trailing Trainer arguments override these settings.
 "${PYTHON_BIN}" -m torch.distributed.run \
     --standalone \
     --nproc_per_node=8 \
     --module examples.training_demo.train_text \
-    "${SCRIPT_DIR}/train_8card.yaml" \
+    "${SCRIPT_DIR}/train_single_card.yaml" \
+    --accelerator.tp_size=2 \
+    --accelerator.cp_size=2 \
+    --accelerator.ep_size=4 \
+    --accelerator.loss_parallel=true \
+    --fsdp_config.dp_shard_size=2 \
+    --fsdp_config.edp_shard_size=2 \
     --model.pretrained_model_name_or_path="${MODEL_PATH}" \
     --dataset.model_assets.tokenizer.pretrained_model_name_or_path="${MODEL_PATH}" \
     --dataset.data_path="${DATA_PREFIX}" \
