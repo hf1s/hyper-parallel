@@ -98,8 +98,8 @@ Transformers 实现的语义。它和 MindSpeed-LLM 的 DeepSeek-V3.2 预训练�
 
 ## 依赖与权重
 
-- Transformers 需要包含 `deepseek_v32`（`requirements.txt` 要求 `transformers>=5.11.0`，本地测试使用
-  5.20.2）。RMSNorm、GroupedExperts 和 DSA 替换只能在 Ascend NPU 上运行；DSA 依赖 CANN 与
+- Transformers 需要包含 `deepseek_v32`（`requirements.txt` 要求 `transformers>=5.11.0`，NPU 上用 5.13.1
+  验证）。RMSNorm、GroupedExperts 和 DSA 替换只能在 Ascend NPU 上运行；DSA 依赖 CANN 与
   `cann_ops_transformer`，版本见上面的 functional README。
 - `from_pretrained` 可以直接指向官方 checkpoint。官方权重是 FP8（`quant_method: fp8`，128×128 block，
   `scale_fmt: ue8m0`），默认的 DCP loader 在读取时按 block 反量化后再转换成训练参数
@@ -128,10 +128,14 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 source, target = "/path/to/DeepSeek-V3.2", "/path/to/DeepSeek-V3.2-crop"
+released = AutoConfig.from_pretrained(source)
 config = AutoConfig.from_pretrained(
     source, num_hidden_layers=2, first_k_dense_replace=1, n_routed_experts=16,
-    # Transformers 按读入时的 61 层推导逐层类型，覆盖层数后不会重新推导，因此一并给出。
-    mlp_layer_types=["dense", "sparse"], layer_types=["indexed_attention"] * 2,
+    # 逐层类型按读入时的 61 层生成，覆盖层数后不会重新推导，因此从官方列表里取一个 dense 层和
+    # 一个 MoE 层。类型名随 Transformers 版本不同（如 deepseek_sparse_attention / indexed_attention），
+    # 不要写死。
+    mlp_layer_types=[released.mlp_layer_types[0], released.mlp_layer_types[-1]],
+    layer_types=released.layer_types[:2],
 )
 del config.quantization_config  # 随机初始化的权重是 BF16，不是官方的 FP8
 torch.manual_seed(1234)
