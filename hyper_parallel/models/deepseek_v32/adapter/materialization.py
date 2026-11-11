@@ -16,6 +16,7 @@
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32RotaryEmbedding
 
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 
@@ -29,9 +30,6 @@ def register_rotary_materialization(model: nn.Module) -> None:
     Args:
         model: Constructed DeepSeek-V3.2 model, before sharding.
     """
-    # pylint: disable=import-outside-toplevel
-    from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32RotaryEmbedding
-
     for module in model.modules():
         if not isinstance(module, DeepseekV32RotaryEmbedding):
             continue
