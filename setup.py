@@ -256,6 +256,7 @@ if __name__ == '__main__':
             'hyper_parallel.models.qwen3_moe': [
                 'recipes/*.yaml', 'generated/*.json', 'generated/*.diff',
             ],
+            'hyper_parallel.models.deepseek_v32': ['recipes/*.yaml'],
             'hyper_parallel.models.deepseek_v41': [
                 'generated/*.json', 'generated/*.diff',
             ],
