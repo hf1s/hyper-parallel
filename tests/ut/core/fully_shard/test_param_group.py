@@ -187,7 +187,7 @@ class TestParamGroupHelpers(unittest.TestCase):
         """Reduce-scatter packing should support mixed shard dimensions."""
         dim0_grad = torch.arange(8, dtype=torch.float32).view(4, 2)
         dim1_grad = torch.arange(16, dtype=torch.float32).view(4, 4)
-        reduce_scatter_input = torch.empty(24)
+        reduce_scatter_input = torch.full((2 * 128,), float("nan"))
         params = [
             SimpleNamespace(
                 hsdp_placement=Shard(0),
@@ -209,7 +209,8 @@ class TestParamGroupHelpers(unittest.TestCase):
         packed_rows = reduce_scatter_input.view(2, -1)
         torch.testing.assert_close(packed_rows[:, :4], dim0_grad.view(2, 4))
         expected_dim1 = torch.cat(torch.chunk(dim1_grad, 2, dim=1), dim=0).view(2, 8)
-        torch.testing.assert_close(packed_rows[:, 4:], expected_dim1)
+        torch.testing.assert_close(packed_rows[:, 4:12], expected_dim1)
+        self.assertEqual(torch.count_nonzero(packed_rows[:, 12:]).item(), 0)
 
 
 class TestAllGatherBuckets(unittest.TestCase):
@@ -283,7 +284,7 @@ class TestAllGatherBuckets(unittest.TestCase):
         all_gather_bucket.init_flat_param_buffer(param_group.device)
 
         self.assertTrue(all_gather_bucket.is_flat_buffer_valid())
-        self.assertEqual(all_gather_bucket.flat_param_buffer.numel(), 4)
+        self.assertEqual(all_gather_bucket.flat_param_buffer.numel(), 128)
         flat_storage_ptr = all_gather_bucket.flat_param_buffer.untyped_storage().data_ptr()
         self.assertEqual(param_a._sharded_param_data.untyped_storage().data_ptr(), flat_storage_ptr)
         self.assertEqual(param_b._sharded_param_data.untyped_storage().data_ptr(), flat_storage_ptr)
@@ -507,7 +508,7 @@ class TestReduceBuckets(unittest.TestCase):
             param_group.wait_reduce_scatter_and_issue_all_reduce()
             torch.testing.assert_close(
                 param_group.reduce_partial_outputs[bucket_key],
-                expected_partial,
+                torch.nn.functional.pad(expected_partial, (0, 128 - expected_partial.numel())),
             )
             if parked_output is None:
                 parked_output = param_group.reduce_partial_outputs[bucket_key]
@@ -545,8 +546,8 @@ class TestReduceBuckets(unittest.TestCase):
 
         def reduce_scatter(**collective_args):
             torch.testing.assert_close(
-                collective_args["input"],
-                torch.tensor([0.5, 1.0, 1.5, 2.0]),
+                collective_args["input"].view(2, 128),
+                torch.nn.functional.pad(torch.tensor([[0.5, 1.0], [1.5, 2.0]]), (0, 126)),
             )
             collective_args["output"].copy_(collective_args["input"].view(2, -1).sum(dim=0))
             return MagicMock()
