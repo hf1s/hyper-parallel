@@ -64,6 +64,14 @@ class AllGatherMetadata:
     total_input_numel: int
 
 
+def aligned_numel(numel, dtype):
+    """Round each rank's wire payload to a multiple of 512 bytes."""
+    width = dtype.itemsize
+    assert 512 % width == 0
+    quantum = 512 // width
+    return ((numel + quantum - 1) // quantum) * quantum
+
+
 @dataclass
 class AllGatherResult:
     """Keep one all-gather input, output, and handle alive until copy-out."""
@@ -109,8 +117,8 @@ class AllGatherBucket:
             self.flat_param_buffer = None
             return
 
-        total_numel = sum(hsdp_param._sharded_param_data.numel() for hsdp_param in self.hsdp_params)
-        flat_param_buffer = torch.empty(total_numel, dtype=storage_dtype, device=device)
+        total_numel = self.metadata.total_input_numel
+        flat_param_buffer = torch.zeros(total_numel, dtype=storage_dtype, device=device)
         flat_offset = 0
         for hsdp_param in self.hsdp_params:
             param_numel = hsdp_param._sharded_param_data.numel()
@@ -147,6 +155,41 @@ class AllGatherBucket:
             for hsdp_param in self.hsdp_params
         )
 
+    def supports_direct_output(self) -> bool:
+        """Select uniformly sharded NPU inputs that need no layout or dtype conversion."""
+        return hasattr(self.shard_group, "allgather_into_tensor_coalesced") and all(
+            param.hsdp_placement.dim == 0
+            and param._orig_size[0] % self.shard_world_size == 0
+            and not param.offload_to_cpu
+            and param._sharded_param_data.device.type == "npu"
+            and param._sharded_param_data.dtype == self.dtype
+            and param._sharded_param_data.is_contiguous()
+            and param._sharded_param_data.numel() > 0
+            for param in self.hsdp_params
+        )
+
+    def gather_to_param_buffers(self, async_op: bool) -> None:
+        """Gather each shard into its stable parameter buffer in one batch submission."""
+        inputs = []
+        outputs = []
+        with ExitStack() as stack:
+            for param in self.hsdp_params:
+                shard = param._sharded_param_data
+                param.init_unsharded_param_buffers([shard.numel()], [self.dtype], self.shard_world_size, shard.device)
+                param.alloc_unsharded_param_buffers()
+                output = param.unsharded_param_buffers[0]
+                if not output.is_inference():
+                    stack.enter_context(torch.autograd._unsafe_preserve_version_counter(output))
+                inputs.append(shard)
+                outputs.append(output)
+            handle = self.shard_group.allgather_into_tensor_coalesced(outputs, inputs)
+        if not async_op:
+            handle.wait()
+            handle = None
+        # The parameters own both ends of the transfer. No intermediate flat
+        # allocation is required, but prefetch still needs a pending result.
+        self.all_gather_result = AllGatherResult(None, None, handle)
+
     @torch.no_grad()
     def copy_out(self) -> None:
         """Wait this bucket's all-gather and copy it into stable unsharded buffers.
@@ -156,12 +199,15 @@ class AllGatherBucket:
         before the next bucket runs. No-op when the bucket has no pending result.
         """
         all_gather_result = self.all_gather_result
-        if all_gather_result is None or all_gather_result.all_gather_output is None:
+        if all_gather_result is None:
             return
         if all_gather_result.handle is not None:
             all_gather_result.handle.wait()
             all_gather_result.handle = None
         all_gather_output = all_gather_result.all_gather_output
+        if all_gather_output is None:
+            self.all_gather_result = None
+            return
         metadata = self.metadata
         split_with_sizes_out = []
         for input_numels, input_dtypes, hsdp_param in zip(
@@ -194,9 +240,15 @@ class AllGatherBucket:
                 hsdp_param.hsdp_placement.dim == 0
                 for hsdp_param in self.hsdp_params
             ):
+                split_sizes = metadata.inp_split_sizes
+                padding = gathered_rows.size(1) - sum(split_sizes)
+                if padding:
+                    # Consume the wire padding as a final split to keep the source contiguous.
+                    split_sizes = [*split_sizes, padding]
+                    output_rows.append(gathered_rows.new_empty((self.shard_world_size, padding)))
                 torch.split_with_sizes_copy(
                     gathered_rows,
-                    metadata.inp_split_sizes,
+                    split_sizes,
                     dim=1,
                     out=output_rows,
                 )
@@ -232,7 +284,7 @@ class AllGatherBucket:
                                 out=output_buffer.view(hsdp_param._orig_size),
                             )
                         column_offset += input_numel
-                if column_offset != gathered_rows.size(1):
+                if column_offset != sum(metadata.inp_split_sizes):
                     raise AssertionError(
                         "Fused all-gather copy-out consumed an unexpected number of elements: "
                         f"{column_offset} != {gathered_rows.size(1)}"
@@ -387,7 +439,9 @@ def all_gather_copy_in(
         all_gather_input_numel * rank,
         all_gather_input_numel,
     )
-    copy_destinations = torch.split(all_gather_input, inp_split_sizes)
+    used = sum(inp_split_sizes)
+    all_gather_input[used:].zero_()
+    copy_destinations = torch.split(all_gather_input[:used], inp_split_sizes)
     with torch.no_grad():
         # pylint: disable=W0212
         torch._foreach_copy_(copy_destinations, all_gather_inputs)
@@ -426,7 +480,9 @@ def reduce_scatter_copy_in(
                 packed_grad = torch.cat(grad_chunks, dim=0).contiguous().view(world_size, -1)
                 packed_grad_slot.copy_(packed_grad)
             column_offset += padded_shard_numel
-    if column_offset != packed_rows.size(1):
+    if column_offset < packed_rows.size(1):
+        packed_rows[:, column_offset:].zero_()
+    if aligned_numel(column_offset, packed_rows.dtype) != packed_rows.size(1):
         raise AssertionError(
             "reduce_scatter_copy_in packed an unexpected number of elements: "
             f"{column_offset} != {packed_rows.size(1)}"
@@ -473,11 +529,13 @@ class HSDPParamGroup:
         device: Optional[torch.device] = None,
         enable_zero_copy: bool = True,
         comm_ctx: Optional[ParamGroupCommCtx] = None,
+        direct_all_gather: bool = False,
     ) -> None:
         self.device = device
         self.hsdp_params = hsdp_params
         self.comm_ctx = comm_ctx or ParamGroupCommCtx()
         self.enable_zero_copy = enable_zero_copy
+        self.direct_all_gather = direct_all_gather
         self.gradient_scaling_factor = None
         self.requires_all_reduce = True
         self.all_gather_buckets: list[AllGatherBucket] = []
@@ -516,7 +574,7 @@ class HSDPParamGroup:
                                     param_input_numels=param_input_numels,
                                     dtype=bucket_key[1],
                                     inp_split_sizes=inp_split_sizes,
-                                    total_input_numel=sum(inp_split_sizes),
+                                    total_input_numel=aligned_numel(sum(inp_split_sizes), bucket_key[1]),
                                 )
             self.all_gather_buckets.append(
                 AllGatherBucket(
@@ -549,6 +607,9 @@ class HSDPParamGroup:
                 hsdp_param.unshard(async_op)
         for all_gather_bucket in self.all_gather_buckets:
             if all_gather_bucket.all_gather_result is not None:
+                continue
+            if self.direct_all_gather and all_gather_bucket.supports_direct_output():
+                all_gather_bucket.gather_to_param_buffers(async_op)
                 continue
             if self.enable_zero_copy and not all_gather_bucket.is_flat_buffer_valid():
                 all_gather_bucket.init_flat_param_buffer(self.device)
@@ -652,7 +713,7 @@ class HSDPParamGroup:
                 flat_offset += param_numel
             reduce_scatter_buckets.append(
                 ReduceScatterBucket(
-                    layout=self._build_gradient_bucket_layout_from(hsdp_params),
+                    layout=self._build_gradient_bucket_layout_from(hsdp_params, bucket_key[1]),
                     unsharded_grads=grads_by_bucket[bucket_key],
                     shard_group=shard_group,
                     shard_world_size=shard_world_size,
@@ -664,7 +725,7 @@ class HSDPParamGroup:
         return reduce_scatter_buckets
 
     @staticmethod
-    def _build_gradient_bucket_layout_from(hsdp_params):
+    def _build_gradient_bucket_layout_from(hsdp_params, dtype):
         param_offsets = []
         param_numels = []
         flat_offset = 0
@@ -677,7 +738,7 @@ class HSDPParamGroup:
                 hsdp_params,
                 param_offsets,
                 param_numels,
-                flat_offset
+                aligned_numel(flat_offset, dtype)
                 )
 
     @staticmethod
