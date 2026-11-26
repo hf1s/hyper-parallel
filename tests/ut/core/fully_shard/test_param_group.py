@@ -488,7 +488,8 @@ class TestReduceBuckets(unittest.TestCase):
         group = HSDPParamGroup([param], device=torch.device("cpu"))
         _set_unsharded_grad(param, torch.ones(4))
 
-        def reduce_scatter(**args):
+        def reduce_scatter(**args: torch.Tensor) -> MagicMock:
+            """Emulate the two-rank SUM into the supplied output tensor."""
             args["output"].copy_(args["input"].view(2, -1).sum(dim=0))
             return MagicMock()
 
