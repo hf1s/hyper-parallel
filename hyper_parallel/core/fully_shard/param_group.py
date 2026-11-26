@@ -875,7 +875,7 @@ class HSDPParamGroup:
                 if (
                     hsdp_param.source_shard_info is None
                     and not hsdp_param.offload_to_cpu
-                    and not hsdp_param.mp_policy.apply_grad_on_fp32_main_grad
+                    and not hsdp_param.apply_grad_on_fp32_main_grad
                     and hsdp_param.sharded_param.grad is not None
                 ):
                     hsdp_param.apply_reduced_grad(grad_view)

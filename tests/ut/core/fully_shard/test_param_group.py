@@ -494,7 +494,7 @@ class TestReduceBuckets(unittest.TestCase):
         """An accumulated device grad consumes the final RS view before root cleanup."""
         param = _fake_param([1.0, 2.0])
         param.source_shard_info = None
-        param.mp_policy.apply_grad_on_fp32_main_grad = False
+        param.apply_grad_on_fp32_main_grad = False
         param.sharded_param.grad = torch.tensor([10.0, 20.0])
         param.apply_reduced_grad.side_effect = param.sharded_param.grad.add_
         group = HSDPParamGroup([param], device=torch.device("cpu"))
